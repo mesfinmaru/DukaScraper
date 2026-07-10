@@ -1,0 +1,193 @@
+x-worker-env: &worker-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  REDIS_URL: redis://redis:6379/0
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - elasticsearch
+      - minio
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-duka}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-duka}
+      POSTGRES_DB: ${POSTGRES_DB:-duka_scraper}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  kafka:
+    image: bitnami/kafka:latest
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: 0
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+    ports:
+      - "9200:9200"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+
+  # --- Crawl workers (same image, different entrypoints) ---
+
+  surface-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: surface-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  browser-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: browser-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  deep-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: deep-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  dark-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: dark-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+      DARK_ENABLED: ${DARK_ENABLED:-false}
+      TOR_PROXY_URL: socks5://tor:9050
+    depends_on:
+      - kafka
+      - redis
+      - tor
+    profiles:
+      - dark
+    restart: unless-stopped
+
+  rss-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: rss-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  parser-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: parser-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  exporter-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: exporter-worker
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+      - elasticsearch
+      - minio
+    restart: unless-stopped
+
+  # Tor proxy — only needed for dark-worker (enable with: docker compose --profile dark up)
+  tor:
+    image: dperson/torproxy:latest
+    ports:
+      - "9050:9050"
+    profiles:
+      - dark
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:

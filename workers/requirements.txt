@@ -1,0 +1,7 @@
+git branch -M mainhttpx[socks]>=0.27.0
+aiokafka>=0.10.0
+redis>=5.0.0
+pydantic-settings>=2.2.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+playwright>=1.42.0

@@ -1,0 +1,51 @@
+name: ci
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r workers/requirements.txt
+
+      - name: Lint
+        run: ruff check app/ workers/ tests/
+
+      - name: Test
+        run: pytest tests/ -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker:
+          - surface-worker
+          - browser-worker
+          - deep-worker
+          - dark-worker
+          - rss-worker
+          - parser-worker
+          - exporter-worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.worker }}
+        run: |
+          docker build \
+            -f workers/Dockerfile \
+            --build-arg WORKER_MODULE=${{ matrix.worker }} \
+            -t duka-${{ matrix.worker }}:ci \
+            .
