@@ -33,12 +33,9 @@ jobs:
       matrix:
         worker:
           - surface-worker
-          - browser-worker
           - deep-worker
           - dark-worker
-          - rss-worker
-          - parser-worker
-          - exporter-worker
+    
     steps:
       - uses: actions/checkout@v4
 
