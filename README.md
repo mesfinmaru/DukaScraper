@@ -65,6 +65,16 @@ This starts Postgres, Redis, Kafka, Elasticsearch, MinIO, and all workers.
 | `make docker-dark` | Enable Tor + dark-worker (opt-in) |
 | `make dev` | Run API locally with hot reload |
 | `make lint` / `make test` | Pre-push checks (same as CI) |
+> **Note for Windows Users**: The `make` command is not available on Windows by default. You can either install it (e.g., via Chocolatey) or use the equivalent commands for PowerShell/CMD listed below.
+
+| Command (Linux/macOS) | Equivalent Command (Windows) | What it does |
+|-----------------------|-----------------------------------------------------------------|------------------------------------------|
+| `make docker-up` | `docker compose up -d` | Start full stack (API + infra + workers) |
+| `make docker-workers` | `docker compose up -d surface-worker deep-worker parser-worker` | Start default crawl workers |
+| `make docker-dark` | `docker compose --profile dark up -d tor dark-worker` | Enable Tor + dark-worker (opt-in) |
+| `make dev` | `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` | Run API locally with hot reload |
+| `make lint` | `ruff check app/ workers/ tests/` | Run the linter |
+| `make test` | `pytest tests/` | Run the test suite |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch workflow and PR rules.
 
