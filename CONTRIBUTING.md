@@ -24,17 +24,25 @@
 | `.devcontainer/` | Optional: identical VS Code/Cursor dev environment in a container |
 | `scripts/setup/` | One-command bootstrap so nobody configures manually |
 
+## Development Dependencies
+
+To ensure a consistent development experience, the setup scripts install the following tools for linting, testing, and code quality. These are defined in `requirements.txt` under the `# dev` section.
+
+- **`pytest` & `pytest-asyncio`**: For running unit and integration tests.
+- **`ruff`**: An extremely fast Python linter and code formatter.
+- **`playwright`**: For browser-based tests and development (installed via `playwright install`).
+
+## Data Contracts (Schemas)
+
+All shared data structures, such as API schemas and Kafka message payloads, are defined as Pydantic models in `app/pipeline/schemas.py`. This file is the single source of truth for data exchange between services.
+
 ## Worker ownership (suggested)
 
 | Worker | Folder | Kafka topic (reads → writes) |
 |--------|--------|------------------------------|
 | surface-worker | `workers/surface-worker/` | `crawl.requests` → `crawl.raw` |
-| browser-worker | `workers/browser-worker/` | `crawl.requests` → `crawl.raw` |
 | deep-worker | `workers/deep-worker/` | `crawl.requests` → `crawl.raw` |
 | dark-worker | `workers/dark-worker/` | `crawl.requests` → `crawl.raw` |
-| rss-worker | `workers/rss-worker/` | `rss.poll` → `crawl.requests` |
-| parser-worker | `workers/parser-worker/` | `crawl.raw` → `crawl.parsed` |
-| exporter-worker | `workers/exporter-worker/` | `crawl.parsed` → `crawl.export` |
 
 ## Dark worker safety
 

@@ -81,21 +81,6 @@ services:
       - redis
     restart: unless-stopped
 
-  browser-worker:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: browser-worker
-    env_file:
-      - .env
-    environment:
-      <<: *worker-env
-    depends_on:
-      - kafka
-      - redis
-    restart: unless-stopped
-
   deep-worker:
     build:
       context: .
@@ -129,54 +114,6 @@ services:
       - tor
     profiles:
       - dark
-    restart: unless-stopped
-
-  rss-worker:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: rss-worker
-    env_file:
-      - .env
-    environment:
-      <<: *worker-env
-    depends_on:
-      - kafka
-      - redis
-    restart: unless-stopped
-
-  parser-worker:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: parser-worker
-    env_file:
-      - .env
-    environment:
-      <<: *worker-env
-    depends_on:
-      - kafka
-      - redis
-    restart: unless-stopped
-
-  exporter-worker:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: exporter-worker
-    env_file:
-      - .env
-    environment:
-      <<: *worker-env
-    depends_on:
-      - kafka
-      - redis
-      - postgres
-      - elasticsearch
-      - minio
     restart: unless-stopped
 
   # Tor proxy — only needed for dark-worker (enable with: docker compose --profile dark up)

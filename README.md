@@ -6,7 +6,7 @@ Amharic-focused web scraping and content extraction platform.
 
 - **app/** — FastAPI backend (crawler, scheduler, extractors, Amharic NLP, pipeline, storage)
 - **ui/** — React frontend
-- **workers/** — Independent worker containers (surface, browser, deep, dark, RSS, parser, exporter)
+- **workers/** — Independent worker containers (surface, deep, dark)
 - **lake/** — Data lake layout (bronze / silver / gold via MinIO)
 - **airflow/** — Workflow orchestration
 - **spark/** — Batch processing jobs
@@ -15,16 +15,11 @@ Amharic-focused web scraping and content extraction platform.
 ## Quick Start
 
 ```bash
-# Copy environment config
-cp .env.example .env
+# For a full team setup including all services, run the setup script:
+# Windows: .\scripts\setup\setup.ps1
+# Linux/macOS: ./scripts/setup/setup.sh
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Start infrastructure
-docker compose up -d
-
-# Run API
+# After setup, run the API locally with hot-reloading
 make dev
 ```
 
@@ -78,12 +73,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch workflow and PR rules.
 | Worker | Path | Job |
 |--------|------|-----|
 | surface-worker | `workers/surface-worker/` | Fast HTTP for public pages |
-| browser-worker | `workers/browser-worker/` | Playwright for JS pages |
 | deep-worker | `workers/deep-worker/` | Auth, forms, pagination |
 | dark-worker | `workers/dark-worker/` | Tor/.onion (disabled by default) |
-| rss-worker | `workers/rss-worker/` | Discover URLs from feeds |
-| parser-worker | `workers/parser-worker/` | Extract article from HTML |
-| exporter-worker | `workers/exporter-worker/` | Save to DB / search / lake |
 
 ## Development
 

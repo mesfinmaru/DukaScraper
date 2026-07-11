@@ -20,7 +20,7 @@ docker-up:
 	docker compose up -d
 
 docker-workers:
-	docker compose up -d surface-worker browser-worker deep-worker rss-worker parser-worker exporter-worker
+	docker compose up -d surface-worker deep-worker
 
 docker-dark:
 	docker compose --profile dark up -d tor dark-worker
