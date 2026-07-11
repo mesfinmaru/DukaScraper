@@ -1,9 +1,11 @@
 """Dark-web crawl via Tor proxy (.onion and hidden services)."""
 
+import json
 from urllib.parse import urlparse
 
 import httpx
 
+from app.pipeline.schemas import CrawlRequest, CrawlResult
 from workers.common.base_worker import BaseWorker
 from workers.common.config import WorkerSettings
 
@@ -25,13 +27,15 @@ class DarkWorker(BaseWorker):
         host = urlparse(url).hostname or ""
         return host.lower() in self._allowed
 
-    async def process(self, job: dict) -> dict | None:
+    async def process(self, raw_message: str) -> str | None:
         if not self.settings.dark_enabled:
             raise RuntimeError("Dark worker is disabled. Set DARK_ENABLED=true and configure allowlist.")
 
-        url = job["url"]
-        if not self._is_allowed(url):
-            raise PermissionError(f"URL not in dark allowlist: {url}")
+        # Validate incoming message against the data contract
+        request = CrawlRequest.model_validate_json(raw_message)
+
+        if not self._is_allowed(request.url):
+            raise PermissionError(f"URL not in dark allowlist: {request.url}")
 
         transport = httpx.AsyncHTTPTransport(proxy=self.settings.tor_proxy_url)
         async with httpx.AsyncClient(
@@ -40,17 +44,20 @@ class DarkWorker(BaseWorker):
             headers={"User-Agent": self.settings.user_agent},
             follow_redirects=False,
         ) as client:
-            response = await client.get(url)
+            response = await client.get(request.url)
             response.raise_for_status()
 
-        return {
-            "url": url,
-            "worker": "dark",
-            "status_code": response.status_code,
-            "html": response.text,
-            "source_job_id": job.get("id"),
-            "network": "tor",
-        }
+        # Create a structured result using the data contract
+        result = CrawlResult(
+            source_job_id=request.job_id,
+            url=request.url,
+            worker="dark",
+            html=response.text,
+            status_code=response.status_code,
+            network="tor",
+        )
+
+        return result.model_dump_json()
 
 
 def main() -> None:

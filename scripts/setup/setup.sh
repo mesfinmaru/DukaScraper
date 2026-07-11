@@ -18,7 +18,7 @@ echo "Starting shared infrastructure (Postgres, Redis, Kafka, ES, MinIO)..."
 docker compose up -d postgres redis kafka elasticsearch minio
 
 echo "Starting crawl workers..."
-docker compose up -d surface-worker deep-worker
+docker compose up -d surface-worker deep-worker parser-worker
 
 echo ""
 echo "Setup complete."

@@ -17,7 +17,7 @@ Write-Host "Starting shared infrastructure (Postgres, Redis, Kafka, ES, MinIO)..
 docker compose up -d postgres redis kafka elasticsearch minio
 
 Write-Host "Starting crawl workers..."
-docker compose up -d surface-worker browser-worker deep-worker rss-worker parser-worker exporter-worker
+docker compose up -d surface-worker deep-worker parser-worker
 
 Write-Host ""
 Write-Host "Setup complete."

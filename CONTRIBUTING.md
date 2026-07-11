@@ -1,18 +1,68 @@
 # Contributing to Duka Scraper
 
-## Team workflow
+## Development Workflow
 
-1. **Clone** the repo and run setup:
-   - Windows: `.\scripts\setup\setup.ps1`
-   - Linux/macOS: `./scripts/setup/setup.sh`
-2. **Create a branch** from `develop`: `git checkout -b feature/your-name`
-3. **Make changes** — keep worker logic in `workers/`, API logic in `app/`
-4. **Run checks** before pushing:
-   ```bash
-   make lint
-   make test
-   ```
-5. **Open a PR** to `develop` — CI runs lint, tests, and Docker builds for all workers
+This guide provides the exact steps for contributing code. We follow a standard feature-branch workflow with Pull Requests.
+
+### 1. Setup Your Environment
+
+If this is your first time, clone the repository and run the one-time setup script for your operating system. This will create your `.env` file, install dependencies, and start all the necessary background services in Docker.
+
+- **Windows (PowerShell):** `.\scripts\setup\setup.ps1`
+- **Linux/macOS:** `./scripts\setup\setup.sh`
+
+### 2. Create a Feature Branch
+
+All new work should be done in a feature branch created from the `develop` branch.
+
+```bash
+# Make sure you have the latest version of the develop branch
+git checkout develop
+git pull origin develop
+
+# Create your new branch (e.g., feature/add-user-auth)
+git checkout -b feature/your-descriptive-name
+```
+
+### 3. Write Code
+
+Run the API locally with hot-reloading for a fast development loop. The background services (Kafka, Postgres, etc.) are already running from the setup script.
+
+```bash
+# For Linux/macOS
+make dev
+
+# For Windows (since 'make' is not standard)
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Now you can make your changes to the code in the `app/` or `workers/` directories.
+
+### 4. Test and Lint Your Changes
+
+Before you commit, run the same quality checks that our CI pipeline runs. This prevents broken builds.
+
+```bash
+# Run the linter
+make lint
+# or on Windows: ruff check app/ workers/ tests/
+
+# Run the test suite
+make test
+# or on Windows: pytest tests/
+```
+
+### 5. Open a Pull Request
+
+Once your changes are complete and tested, commit them and push your branch to the remote repository.
+
+```bash
+git add .
+git commit -m "feat: A clear, concise commit message"
+git push origin feature/your-descriptive-name
+```
+
+Finally, go to the project's GitHub page and open a Pull Request (PR) from your branch into the `develop` branch. Write a clear description of what you changed and why, and request a review from your teammates.
 
 ## What runs for everyone
 
@@ -41,11 +91,9 @@ All shared data structures, such as API schemas and Kafka message payloads, are 
 | Worker | Folder | Kafka topic (reads → writes) |
 |--------|--------|------------------------------|
 | surface-worker | `workers/surface-worker/` | `crawl.requests` → `crawl.raw` |
-| deep-worker | `workers/deep-worker/` | `crawl.requests` → `crawl.raw` |
-| dark-worker | `workers/dark-worker/` | `crawl.requests` → `crawl.raw` |
-| rss-worker | `workers/rss-worker/` | `rss.poll` → `crawl.requests` |
-| parser-worker | `workers/parser-worker/` | `crawl.raw` → `crawl.parsed` |
-| exporter-worker | `workers/exporter-worker/` | `crawl.parsed` → `crawl.export` |
+| deep-worker    | `workers/deep-worker/`    | `crawl.requests` → `crawl.raw` |
+| dark-worker    | `workers/dark-worker/`    | `crawl.requests` → `crawl.raw` |
+| parser-worker  | `workers/parser-worker/`  | `crawl.raw` → `None` (for now) |
 
 ## Dark worker safety
 

@@ -7,24 +7,29 @@ from workers.common.config import WorkerSettings
 
 
 class SurfaceWorker(BaseWorker):
-    async def process(self, job: dict) -> dict | None:
-        url = job["url"]
+    async def process(self, raw_message: str) -> str | None:
+        # Validate incoming message against the data contract
+        from app.pipeline.schemas import CrawlRequest, CrawlResult
+        request = CrawlRequest.model_validate_json(raw_message)
+
         async with httpx.AsyncClient(
             timeout=self.settings.request_timeout,
             headers={"User-Agent": self.settings.user_agent},
             follow_redirects=True,
         ) as client:
-            response = await client.get(url)
+            response = await client.get(request.url)
             response.raise_for_status()
 
-        return {
-            "url": url,
-            "worker": "surface",
-            "status_code": response.status_code,
-            "content_type": response.headers.get("content-type", ""),
-            "html": response.text,
-            "source_job_id": job.get("id"),
-        }
+        # Create a structured result using the data contract
+        result = CrawlResult(
+            source_job_id=request.job_id,
+            url=str(response.url),  # Use the final URL after redirects
+            worker="surface",
+            html=response.text,
+            status_code=response.status_code,
+        )
+
+        return result.model_dump_json()
 
 
 def main() -> None:

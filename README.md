@@ -6,7 +6,7 @@ Amharic-focused web scraping and content extraction platform.
 
 - **app/** — FastAPI backend (crawler, scheduler, extractors, Amharic NLP, pipeline, storage)
 - **ui/** — React frontend
-- **workers/** — Independent worker containers (surface, deep, dark)
+- **workers/** — Independent worker containers (surface, deep, dark, parser)
 - **lake/** — Data lake layout (bronze / silver / gold via MinIO)
 - **airflow/** — Workflow orchestration
 - **spark/** — Batch processing jobs
@@ -75,12 +75,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch workflow and PR rules.
 | surface-worker | `workers/surface-worker/` | Fast HTTP for public pages |
 | deep-worker | `workers/deep-worker/` | Auth, forms, pagination |
 | dark-worker | `workers/dark-worker/` | Tor/.onion (disabled by default) |
-
-## Development
-
-```bash
-make install   # Install Python dependencies
-make dev       # Run API with hot reload
-make test      # Run tests
-make lint      # Run linter
-```
+| parser-worker | `workers/parser-worker/` | Extracts content from raw HTML |
