@@ -35,7 +35,9 @@ jobs:
           - surface-worker
           - deep-worker
           - dark-worker
+          - rss-worker
           - parser-worker
+          - exporter-worker
     steps:
       - uses: actions/checkout@v4
 
