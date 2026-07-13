@@ -1,7 +1,8 @@
-import json
 from aiokafka import AIOKafkaProducer
+
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest
+
 
 class KafkaProducer:
     def __init__(self):

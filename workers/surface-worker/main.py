@@ -1,7 +1,6 @@
 """Fast HTTP fetch for public surface-web pages."""
 
 import httpx
-
 from workers.common.base_worker import BaseWorker
 from workers.common.config import WorkerSettings
 
@@ -34,7 +33,11 @@ class SurfaceWorker(BaseWorker):
 
 def main() -> None:
     settings = WorkerSettings(worker_name="surface-worker")
-    worker = SurfaceWorker(settings, input_topic=settings.crawl_request_topic, output_topic=settings.crawl_raw_topic)
+    worker = SurfaceWorker(
+        settings,
+        input_topic=settings.crawl_request_topic,
+        output_topic=settings.crawl_raw_topic,
+    )
     BaseWorker.run(worker)
 
 

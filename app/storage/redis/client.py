@@ -1,6 +1,8 @@
 from redis.asyncio import Redis
-from app.common.logger.logger import logger
+
 from app.common.config.settings import settings
+from app.common.logger.logger import logger
+
 
 class RedisManager:
     """

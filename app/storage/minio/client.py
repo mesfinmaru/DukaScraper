@@ -1,7 +1,9 @@
 from minio import Minio
 from minio.error import S3Error
-from app.common.logger.logger import logger
+
 from app.common.config.settings import settings
+from app.common.logger.logger import logger
+
 
 class MinioManager:
     """

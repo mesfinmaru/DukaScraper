@@ -1,13 +1,12 @@
 """Dark-web crawl via Tor proxy (.onion and hidden services)."""
 
-import json
 from urllib.parse import urlparse
 
 import httpx
-
-from app.pipeline.schemas import CrawlRequest, CrawlResult
 from workers.common.base_worker import BaseWorker
 from workers.common.config import WorkerSettings
+
+from app.pipeline.schemas import CrawlRequest, CrawlResult
 
 
 class DarkWorker(BaseWorker):
@@ -29,7 +28,9 @@ class DarkWorker(BaseWorker):
 
     async def process(self, raw_message: str) -> str | None:
         if not self.settings.dark_enabled:
-            raise RuntimeError("Dark worker is disabled. Set DARK_ENABLED=true and configure allowlist.")
+            raise RuntimeError(
+                "Dark worker is disabled. Set DARK_ENABLED=true and configure allowlist."
+            )
 
         # Validate incoming message against the data contract
         request = CrawlRequest.model_validate_json(raw_message)
@@ -62,7 +63,11 @@ class DarkWorker(BaseWorker):
 
 def main() -> None:
     settings = WorkerSettings(worker_name="dark-worker")
-    worker = DarkWorker(settings, input_topic=settings.crawl_request_topic, output_topic=settings.crawl_raw_topic)
+    worker = DarkWorker(
+        settings,
+        input_topic=settings.crawl_request_topic,
+        output_topic=settings.crawl_raw_topic,
+    )
     BaseWorker.run(worker)
 
 

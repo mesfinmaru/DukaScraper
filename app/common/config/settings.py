@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
     # Project Info
     PROJECT_NAME: str = "DukaScraper"

@@ -1,6 +1,8 @@
 from elasticsearch import AsyncElasticsearch
-from app.common.logger.logger import logger
+
 from app.common.config.settings import settings
+from app.common.logger.logger import logger
+
 
 class ElasticsearchManager:
     """

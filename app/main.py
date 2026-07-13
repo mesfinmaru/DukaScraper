@@ -1,21 +1,21 @@
 import asyncio
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+# Import API routes
+from app.api.routes.api import api_router
 from app.common.config.settings import settings
 from app.common.logger.logger import logger
+from app.pipeline.consumer.kafka_consumer import ThreatEventConsumer
 
 # Import all infrastructure clients (Now including Postgres)
 from app.pipeline.producer.kafka_producer import kafka_producer
-from app.pipeline.consumer.kafka_consumer import ThreatEventConsumer
-from app.storage.minio.client import minio_client
 from app.storage.elasticsearch.client import es_client
-from app.storage.redis.client import redis_client
+from app.storage.minio.client import minio_client
 from app.storage.postgres.client import pg_client
-
-# Import API routes
-from app.api.routes.api import api_router
+from app.storage.redis.client import redis_client
 
 RAW_INTEL_TOPIC = "threat.intel.raw"
 CONSUMER_GROUP = "duka.scraper.processor"

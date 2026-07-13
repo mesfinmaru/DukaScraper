@@ -1,10 +1,10 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel, HttpUrl
 import uuid
 
-from app.pipeline.producer.kafka_producer import kafka_producer
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, HttpUrl
+
 from app.common.logger.logger import logger
-from app.pipeline.schemas import CrawlRequest
+from app.pipeline.producer.kafka_producer import kafka_producer
 
 router = APIRouter()
 RAW_INTEL_TOPIC = "threat.intel.raw"
