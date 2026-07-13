@@ -21,7 +21,7 @@ class WorkerManager:
         if host.endswith(".onion"):
             return WorkerType.DARK
 
-        if job.get("requires_auth") or job.get("form_data"):
+        if job.get("requires_auth") or job.get("form_data") or job.get("render_js"):
             return WorkerType.DEEP
 
         return WorkerType.SURFACE
