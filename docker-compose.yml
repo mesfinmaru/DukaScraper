@@ -18,7 +18,6 @@ services:
       - postgres
       - redis
       - kafka
-      - elasticsearch
       - minio
     restart: unless-stopped
 
@@ -87,11 +86,12 @@ services:
     restart: unless-stopped
 
   ####################################################
-  # Elasticsearch
+  # Elasticsearch (disabled by default to avoid registry TLS issues)
   ####################################################
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
     container_name: elasticsearch
+    profiles: ["full"]
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -103,11 +103,12 @@ services:
     restart: unless-stopped
 
   ####################################################
-  # Kibana
+  # Kibana (disabled by default to avoid registry TLS issues)
   ####################################################
   kibana:
     image: docker.elastic.co/kibana/kibana:8.12.0
     container_name: kibana
+    profiles: ["full"]
     ports:
       - "5601:5601"
     environment:

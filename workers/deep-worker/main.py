@@ -1,10 +1,10 @@
 """Deep-web crawl: login, pagination, and session-aware fetching."""
 
 import httpx
-from app.pipeline.schemas import CrawlRequest, CrawlResult
-
 from workers.common.base_worker import BaseWorker
 from workers.common.config import WorkerSettings
+
+from app.pipeline.schemas import CrawlRequest, CrawlResult
 
 
 class DeepWorker(BaseWorker):
@@ -51,15 +51,26 @@ class DeepWorker(BaseWorker):
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            raise ImportError("Playwright not installed. Run: pip install playwright && playwright install")
+            raise ImportError(
+                "Playwright not installed. Run: pip install playwright && playwright install"
+            )
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             context = await browser.new_context(user_agent=self.settings.user_agent)
             if cookies:
-                await context.add_cookies([{"name": k, "value": v, "url": request.url} for k, v in cookies.items()])
+                await context.add_cookies(
+                    [
+                        {"name": k, "value": v, "url": request.url}
+                        for k, v in cookies.items()
+                    ]
+                )
             page = await context.new_page()
-            await page.goto(request.url, timeout=self.settings.request_timeout * 1000, wait_until="networkidle")
+            await page.goto(
+                request.url,
+                timeout=self.settings.request_timeout * 1000,
+                wait_until="networkidle",
+            )
             html = await page.content()
             final_url = page.url
             await browser.close()
@@ -75,7 +86,11 @@ class DeepWorker(BaseWorker):
 
 def main() -> None:
     settings = WorkerSettings(worker_name="deep-worker")
-    worker = DeepWorker(settings, input_topic=settings.crawl_request_topic, output_topic=settings.crawl_raw_topic)
+    worker = DeepWorker(
+        settings,
+        input_topic=settings.crawl_request_topic,
+        output_topic=settings.crawl_raw_topic,
+    )
     BaseWorker.run(worker)
 
 

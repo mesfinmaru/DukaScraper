@@ -23,7 +23,10 @@ class CrawlRequest(BaseModel):
     job_id: str = Field(..., description="Unique identifier for this crawl job.")
     url: str = Field(..., description="The URL to be crawled.")
     worker_type: str = Field(..., description="The designated worker to handle this job.")
-    job_params: dict[str, Any] = Field(default_factory=dict, description="Worker-specific parameters, e.g., auth tokens, form data.")
+    job_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Worker-specific parameters, e.g., auth tokens, form data.",
+    )
 
 
 class CrawlResult(BaseModel):

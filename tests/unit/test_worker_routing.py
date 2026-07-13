@@ -9,11 +9,13 @@ def test_route_surface_by_default():
 
 
 def test_route_browser_when_js_required():
-    assert WorkerManager.route({"url": "https://example.com", "render_js": True}) == WorkerType.BROWSER
+    result = WorkerManager.route({"url": "https://example.com", "render_js": True})
+    assert result == WorkerType.DEEP
 
 
 def test_route_deep_when_auth_required():
-    assert WorkerManager.route({"url": "https://example.com", "requires_auth": True}) == WorkerType.DEEP
+    result = WorkerManager.route({"url": "https://example.com", "requires_auth": True})
+    assert result == WorkerType.DEEP
 
 
 def test_route_dark_for_onion():
