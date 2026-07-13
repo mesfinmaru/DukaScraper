@@ -4,3 +4,7 @@ redis>=5.0.0
 pydantic-settings>=2.2.0
 beautifulsoup4>=4.12.0
 lxml>=5.1.0
+# updated
+selenium>=4.34.0
+scrapy>=2.11.0
+stem>=1.8.0
