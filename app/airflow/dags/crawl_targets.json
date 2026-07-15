@@ -1,0 +1,27 @@
+[
+    {
+        "id": "hacker_news",
+        "url": "https://news.ycombinator.com",
+        "render_js": false,
+        "enabled": true
+    },
+    {
+        "id": "ethiopian_reporter_am",
+        "url": "https://am.thereporter.et/",
+        "render_js": false,
+        "enabled": true
+    },
+    {
+        "id": "bbc_amharic",
+        "url": "https://www.bbc.com/amharic",
+        "render_js": true,
+        "enabled": true
+    },
+    {
+        "id": "telegram_reuters_public",
+        "url": "https://t.me/s/Reuters",
+        "render_js": true,
+        "enabled": true,
+        "job_params": { "source_type": "telegram" }
+    }
+]

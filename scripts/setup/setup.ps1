@@ -9,22 +9,25 @@ if (-not (Test-Path ".env")) {
 }
 
 python -m venv .venv
-& .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -r workers/requirements.txt
+Write-Host "Installing dependencies into the virtual environment..."
+.\.venv\Scripts\pip.exe install -r requirements.txt
+.\.venv\Scripts\pip.exe install -r workers/requirements.txt
 
-Write-Host "Starting shared infrastructure (Postgres, Redis, Kafka, ES, MinIO)..."
-docker compose up -d postgres redis kafka elasticsearch minio
-
-Write-Host "Starting crawl workers..."
-docker compose up -d surface-worker deep-worker parser-worker
+Write-Host "Starting background services (Postgres, Redis, Kafka, Airflow, MinIO, workers...)"
+docker compose up -d
 
 Write-Host ""
 Write-Host "Setup complete."
-Write-Host "  API:            http://localhost:8000/health"
-Write-Host "  MinIO console:  http://localhost:9001"
-Write-Host "  Elasticsearch:  http://localhost:9200"
+Write-Host "To run the API locally with hot-reloading:"
+Write-Host "  uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
+Write-Host "(Or use 'make dev' if you have Make installed)"
 Write-Host ""
-Write-Host "Run API locally:  make dev"
+Write-Host "The following services are running in Docker:"
+Write-Host "  Airflow UI:     http://localhost:8081"
+Write-Host "  Kafka UI:       http://localhost:8080"
+Write-Host "  MinIO console:  http://localhost:9001"
+Write-Host "  Kibana:         http://localhost:5601"
+Write-Host "  Grafana:        http://localhost:3000"
+Write-Host ""
 Write-Host "Dark worker:      docker compose --profile dark up -d tor dark-worker"
 Write-Host "                  (set DARK_ENABLED=true and DARK_ALLOWED_DOMAINS in .env first)"

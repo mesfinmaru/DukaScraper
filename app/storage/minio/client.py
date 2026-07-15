@@ -17,16 +17,16 @@ class MinioManager:
             secret_key=settings.MINIO_SECRET_KEY,
             secure=settings.MINIO_SECURE
         )
-        self.buckets = ["bronze", "silver", "gold"]
+        # This list should reflect the buckets created by the minio-init service
+        self.buckets = settings.MINIO_BUCKETS.split(',') if settings.MINIO_BUCKETS else []
 
     def connect(self) -> None:
-        """Verifies connection and creates base buckets if missing."""
+        """Verifies connection to the MinIO server."""
         try:
-            for bucket in self.buckets:
-                if not self.client.bucket_exists(bucket):
-                    self.client.make_bucket(bucket)
-                    logger.info(f"Created missing MinIO bucket: {bucket}")
-            logger.info("MinIO Data Lake connected successfully.")
+            # A lightweight check to confirm connectivity.
+            # Bucket creation is handled by the 'minio-init' container.
+            if self.buckets and not self.client.bucket_exists(self.buckets[0]):
+                logger.warning(f"MinIO connected, but bucket '{self.buckets[0]}' not found. Is minio-init running?")
         except S3Error as e:
             logger.error(f"MinIO Connection Error: {e}")
             raise e
