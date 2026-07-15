@@ -14,18 +14,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 pip install -r workers/requirements.txt
 
-echo "Starting shared infrastructure (Postgres, Redis, Kafka, ES, MinIO)..."
-docker compose up -d postgres redis kafka elasticsearch minio
-
-echo "Starting crawl workers..."
-docker compose up -d surface-worker deep-worker parser-worker
+echo "Starting background services (Postgres, Redis, Kafka, Airflow, MinIO, workers...)"
+docker compose up -d
 
 echo ""
 echo "Setup complete."
-echo "  API:            http://localhost:8000/health"
+echo "The following services are running in Docker:"
+echo "To run the API locally with hot-reloading: make dev"
+echo "  Airflow UI:     http://localhost:8081"
+echo "  Kafka UI:       http://localhost:8080"
 echo "  MinIO console:  http://localhost:9001"
-echo "  Elasticsearch:  http://localhost:9200"
+echo "  Kibana:         http://localhost:5601"
+echo "  Grafana:        http://localhost:3000"
 echo ""
-echo "Run API locally:  make dev"
 echo "Dark worker:      docker compose --profile dark up -d tor dark-worker"
 echo "                  (set DARK_ENABLED=true and DARK_ALLOWED_DOMAINS in .env first)"
