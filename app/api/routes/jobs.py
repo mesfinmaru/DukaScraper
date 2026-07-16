@@ -42,12 +42,8 @@ async def trigger_scrape_job(request: ScrapeRequest):
         job_event = CrawlRequest(job_id=job_id, url=str(request.url), worker_type=worker_type.value, job_params=request.job_params)
 
         # Publish the job to the correct Kafka topic for workers to consume
-        await kafka_producer.publish_event(
-            topic=CRAWL_REQUESTS_TOPIC,
-            key=job_id,
-            value=job_event.model_dump(mode="json"),
-        )
-        
+        await kafka_producer.publish_crawl_request(request=job_event)
+
         logger.info(f"Triggered job {job_id} for URL: {request.url} -> worker: {worker_type.value}")
         return {
             "message": "Scraping job submitted successfully",

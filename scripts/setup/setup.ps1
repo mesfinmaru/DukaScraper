@@ -11,7 +11,6 @@ if (-not (Test-Path ".env")) {
 python -m venv .venv
 Write-Host "Installing dependencies into the virtual environment..."
 .\.venv\Scripts\pip.exe install -r requirements.txt
-.\.venv\Scripts\pip.exe install -r workers/requirements.txt
 
 Write-Host "Starting background services (Postgres, Redis, Kafka, Airflow, MinIO, workers...)"
 docker compose up -d

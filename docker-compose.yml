@@ -216,8 +216,9 @@ services:
   # Airflow
   ####################################################
   airflow-init:
-    image: apache/airflow:2.9.3-python3.12
     container_name: airflow-init
+    build:
+      dockerfile: app/airflow/Dockerfile
     depends_on: { postgres: { condition: service_healthy } }
     env_file: [".env"]
     environment:
@@ -227,16 +228,17 @@ services:
     command: >
       bash -c "
         airflow db upgrade &&
-        airflow users create -r Admin -u ${AIRFLOW_USER:-airflow} -p ${AIRFLOW_PASSWORD:-airflow} -f Airflow -l Admin -e admin@example.com
-        airflow users create -r Admin -u ${AIRFLOW_USER:-airflow} -p ${AIRFLOW_PASSWORD:-airflow} -f Airflow -l Admin -e admin@example.com &&
-        airflow connections add 'duka_api' --conn-type 'http' --conn-host 'api' --conn-port 8000
+        (airflow users create -r Admin -u ${AIRFLOW_USER:-airflow} -p ${AIRFLOW_PASSWORD:-airflow} -f Airflow -l Admin -e admin@example.com) || true &&
+        (airflow connections delete 'duka_api' || true) &&
+        airflow connections add 'duka_api' --conn-type 'http' --conn-host 'host.docker.internal' --conn-port ${API_PORT:-8000}
       "
     restart: on-failure
     networks: [backend]
 
   airflow-webserver:
     <<: *deploy-defaults
-    image: apache/airflow:2.9.3-python3.12
+    build:
+      dockerfile: app/airflow/Dockerfile
     deploy:
       resources:
         limits:
@@ -253,6 +255,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-duka}:${POSTGRES_PASSWORD:-duka}@postgres:5432/${POSTGRES_DB:-duka_scraper}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    command: webserver
     networks: [backend]
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
@@ -262,7 +265,8 @@ services:
 
   airflow-scheduler:
     <<: *deploy-defaults
-    image: apache/airflow:2.9.3-python3.12
+    build:
+      dockerfile: app/airflow/Dockerfile
     deploy:
       resources:
         limits:
@@ -283,7 +287,8 @@ services:
 
   airflow-triggerer:
     <<: *deploy-defaults
-    image: apache/airflow:2.9.3-python3.12
+    build:
+      dockerfile: app/airflow/Dockerfile
     deploy:
       resources:
         limits:
