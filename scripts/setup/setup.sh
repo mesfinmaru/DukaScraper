@@ -10,17 +10,16 @@ if [ ! -f .env ]; then
 fi
 
 python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r workers/requirements.txt
+echo "Installing dependencies into the virtual environment..."
+.venv/bin/pip install -r requirements.txt
 
 echo "Starting background services (Postgres, Redis, Kafka, Airflow, MinIO, workers...)"
 docker compose up -d
 
 echo ""
 echo "Setup complete."
-echo "The following services are running in Docker:"
 echo "To run the API locally with hot-reloading: make dev"
+echo "The following services are running in Docker:"
 echo "  Airflow UI:     http://localhost:8081"
 echo "  Kafka UI:       http://localhost:8080"
 echo "  MinIO console:  http://localhost:9001"
