@@ -1,12 +1,13 @@
-import os
-import sys
-import re
 import asyncio
 import json
+import os
+import re
+import sys
 from io import BytesIO
+
 from aiokafka import AIOKafkaConsumer
-from minio import Minio
 from bs4 import BeautifulSoup
+from minio import Minio
 
 print("Initializing Async Parser Worker with Amharic Extraction...", flush=True)
 
@@ -74,7 +75,11 @@ def clean_and_extract_amharic(raw_html_or_text: str) -> str:
     return "\n".join(final_sentences)
 
 async def main():
-    print(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, listening on topic: {KAFKA_INPUT_TOPIC}", flush=True)
+    print(
+        f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, "
+        f"listening on topic: {KAFKA_INPUT_TOPIC}",
+        flush=True,
+    )
     
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
@@ -94,7 +99,11 @@ async def main():
                 # Parse incoming string data package
                 data_package = json.loads(message.value.decode('utf-8'))
                 raw_payload = data_package.get("html") or data_package.get("payload", "")
-                source_site = data_package.get("url") or data_package.get("source", "unknown-source")
+                source_site = (
+                    data_package.get("url")
+                    or data_package.get("source")
+                    or "unknown-source"
+                )
                 
                 print(f"Processing content stream from source: {source_site}", flush=True)
                 
@@ -123,13 +132,26 @@ async def main():
                         len(output_payload),
                         content_type="application/json"
                     )
-                    print(f"Successfully saved parsed payload to MinIO bucket '{MINIO_PARSED_BUCKET}' as {file_name}", flush=True)
+                    print(
+                        f"Successfully saved parsed payload to MinIO "
+                        f"bucket '{MINIO_PARSED_BUCKET}' as {file_name}",
+                        flush=True,
+                    )
                     
                 else:
-                    print("Skipping payload: No meaningful Ethiopic script content detected.", flush=True)
+                    print(
+                        "Skipping payload: No meaningful Ethiopic "
+                        "script content detected.",
+                        flush=True,
+                    )
                     
             except json.JSONDecodeError:
-                print("Failed to decode message package. Skipping invalid JSON format.", file=sys.stderr, flush=True)
+                print(
+                    "Failed to decode message package. "
+                    "Skipping invalid JSON format.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             except Exception as loop_err:
                 print(f"Error handling individual record: {loop_err}", file=sys.stderr, flush=True)
                 

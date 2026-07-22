@@ -1,8 +1,9 @@
+import asyncio
 import os
 import sys
-import asyncio
-from aiokafka import AIOKafkaConsumer
+
 import redis
+from aiokafka import AIOKafkaConsumer
 
 print("Initializing Async Dark Worker...", flush=True)
 

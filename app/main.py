@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -97,7 +97,11 @@ async def full_health_check():
 # --- MinIO File Storage & Parsed Results API Endpoints ---
 
 @app.get("/api/files", tags=["Storage"])
-async def list_crawled_files(bucket: str = Query("parsed-data", description="MinIO bucket name to scan")):
+async def list_crawled_files(
+    bucket: str = Query(
+        "parsed-data", description="MinIO bucket name to scan"
+    )
+):
     """Lists files in the requested MinIO bucket (defaults to parsed-data for Amharic results)."""
     try:
         client = getattr(minio_client, "client", minio_client)
@@ -126,7 +130,9 @@ async def list_crawled_files(bucket: str = Query("parsed-data", description="Min
 
 @app.get("/api/download/{bucket_name}/{file_name:path}", tags=["Storage"])
 async def download_file(bucket_name: str, file_name: str):
-    """Streams file download directly from MinIO object storage (supports downloading JSON parsed results)."""
+    """Streams file download directly from MinIO object storage 
+    (supports downloading JSON parsed results).
+    """
     try:
         client = getattr(minio_client, "client", minio_client)
         response = client.get_object(bucket_name, file_name)
@@ -136,7 +142,11 @@ async def download_file(bucket_name: str, file_name: str):
 
         return Response(
             content=data,
-            media_type="application/json" if file_name.endswith(".json") else "application/octet-stream",
+            media_type=(
+                "application/json"
+                if file_name.endswith(".json")
+                else "application/octet-stream"
+            ),
             headers={"Content-Disposition": f"attachment; filename={file_name}"},
         )
     except Exception as e:
