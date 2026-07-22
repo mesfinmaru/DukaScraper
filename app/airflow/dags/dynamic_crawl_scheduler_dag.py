@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pendulum
-
 from airflow.models.dag import DAG
 from airflow.providers.http.operators.http import SimpleHttpOperator
 
@@ -37,11 +36,11 @@ with DAG(
     for target in targets:
         if target.get("enabled", False):
             task_id = f"trigger_crawl_{target['id']}"
-            
-            # The data payload now includes 'render_js' which the new API endpoint will use for routing
+
+            # Include render_js so the API can route the job to the correct worker.
             payload = {
                 "url": target["url"],
-                "render_js": target.get("render_js", False)
+                "render_js": target.get("render_js", False),
             }
 
             SimpleHttpOperator(

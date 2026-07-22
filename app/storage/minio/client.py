@@ -26,7 +26,10 @@ class MinioManager:
             # A lightweight check to confirm connectivity.
             # Bucket creation is handled by the 'minio-init' container.
             if self.buckets and not self.client.bucket_exists(self.buckets[0]):
-                logger.warning(f"MinIO connected, but bucket '{self.buckets[0]}' not found. Is minio-init running?")
+                logger.warning(
+                    "MinIO connected, but bucket '%s' not found. Is minio-init running?",
+                    self.buckets[0],
+                )
         except S3Error as e:
             logger.error(f"MinIO Connection Error: {e}")
             raise e

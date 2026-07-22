@@ -1,0 +1,4 @@
+﻿httpx
+aiokafka
+pydantic
+minio
