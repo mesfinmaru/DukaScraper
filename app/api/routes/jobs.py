@@ -1,5 +1,5 @@
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
@@ -15,11 +15,25 @@ CRAWL_REQUESTS_TOPIC = "crawl.requests"
 
 class ScrapeRequest(BaseModel):
     """Schema for incoming scraping requests from the UI or external systems."""
+
     url: HttpUrl
-    render_js: bool = Field(False, description="Set to true if the page requires JavaScript rendering (routes to deep-worker).")
-    requires_auth: bool = Field(False, description="Set to true if the page is behind a login (routes to deep-worker).")
-    worker_override: Optional[WorkerType] = Field(None, description="Explicitly specify a worker, bypassing routing rules.")
-    job_params: dict[str, Any] = Field(default_factory=dict, description="Additional key-value parameters for the worker.")
+    render_js: bool = Field(
+        False,
+        description="Route to deep-worker when the page requires JavaScript rendering.",
+    )
+    requires_auth: bool = Field(
+        False,
+        description="Set to true if the page is behind a login (routes to deep-worker).",
+    )
+    worker_override: WorkerType | None = Field(
+        None,
+        description="Explicitly specify a worker, bypassing routing rules.",
+    )
+    job_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional key-value parameters for the worker.",
+    )
+
 
 @router.post("/trigger", status_code=202, response_model=dict)
 async def trigger_scrape_job(request: ScrapeRequest):
@@ -28,7 +42,7 @@ async def trigger_scrape_job(request: ScrapeRequest):
     CrawlRequest job to the Kafka pipeline.
     """
     job_id = str(uuid.uuid4())
-    
+
     try:
         # Use the WorkerManager to determine the correct worker type
         routing_details = request.model_dump()
@@ -39,7 +53,12 @@ async def trigger_scrape_job(request: ScrapeRequest):
         worker_type = WorkerManager.route(job=routing_details)
 
         # Construct the event payload using the official CrawlRequest schema
-        job_event = CrawlRequest(job_id=job_id, url=str(request.url), worker_type=worker_type.value, job_params=request.job_params)
+        job_event = CrawlRequest(
+            job_id=job_id,
+            url=str(request.url),
+            worker_type=worker_type.value,
+            job_params=request.job_params,
+        )
 
         # Publish the job to the correct Kafka topic for workers to consume
         await kafka_producer.publish_crawl_request(request=job_event)

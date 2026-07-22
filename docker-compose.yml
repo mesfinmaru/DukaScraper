@@ -1,6 +1,12 @@
 x-worker-env: &worker-env
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin
+  MINIO_BUCKET: duka-raw-data
+  MINIO_RAW_BUCKET: duka-raw-data
+  PYTHONUNBUFFERED: "1"
 
 x-logging: &logging
   driver: json-file
@@ -19,13 +25,13 @@ x-deploy-defaults: &deploy-defaults
 services:
 
   ####################################################
-  # API
+  # API / Backend
   ####################################################
   api:
     <<: *deploy-defaults
     build: .
     container_name: duka-api
-    profiles: ["api"] # Disabled by default. Run with `docker compose --profile api up` for a containerized API.
+    profiles: ["api"]
     ports:
       - "${API_PORT:-8000}:8000"
     env_file: [".env"]
@@ -41,6 +47,27 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
+
+  backend:
+    build: ./backend
+    container_name: duka-api-backend
+    ports:
+      - "8000:8000"
+    env_file: [".env"]
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_BUCKET=duka-raw-data
+      - MINIO_RAW_BUCKET=duka-raw-data
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      minio: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks:
+      - backend
 
   ####################################################
   # PostgreSQL
@@ -85,14 +112,16 @@ services:
     image: apache/kafka:3.9.1
     container_name: kafka
     hostname: kafka
-    ports: ["${KAFKA_PORT:-9092}:9092"]
+    ports:
+      - "${KAFKA_PORT:-9092}:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -134,7 +163,7 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: "-Xms512m -Xmx512m" # Heap size is 512m, container needs more
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m" 
     ports: ["${ELASTICSEARCH_PORT:-9200}:9200"]
     volumes: [elasticsearch_data:/usr/share/elasticsearch/data]
     ulimits: { memlock: { soft: -1, hard: -1 }, nofile: { soft: 65536, hard: 65536 } }
@@ -308,81 +337,62 @@ services:
     networks: [backend]
 
   ####################################################
-  # Spark (Optional - disabled by default)
-  ####################################################
-  # Uncomment to enable Spark. Note: Apache Spark image requires custom entrypoint.
-  # spark-master:
-  #   <<: *deploy-defaults
-  #   image: apache/spark:3.5.0
-  #   container_name: spark-master
-  #   ports: ["${SPARK_MASTER_WEBUI_PORT:-8082}:8080", "7077:7077"]
-  #   volumes:
-  #     - ./app/spark/jobs:/opt/spark/jobs:ro
-  #     - spark_event_logs:/opt/spark/logs/
-  #   env_file: [".env"]
-  #   networks: [backend]
-  #   command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/submissions"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 30s
-
-  # spark-worker:
-  #   <<: *deploy-defaults
-  #   image: apache/spark:3.5.0
-  #   container_name: spark-worker
-  #   depends_on: { spark-master: { condition: service_started } }
-  #   volumes:
-  #     - ./app/spark/jobs:/opt/spark/jobs:ro
-  #     - spark_event_logs:/opt/spark/logs/
-  #   env_file: [".env"]
-  #   environment:
-  #     - SPARK_MASTER_URL=spark://spark-master:7077
-  #   networks: [backend]
-  #   command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-
-  # spark-history-server:
-  #   <<: *deploy-defaults
-  #   image: apache/spark:3.5.0
-  #   container_name: spark-history-server
-  #   ports: ["${SPARK_HISTORY_SERVER_PORT:-18080}:18080"]
-  #   volumes: [spark_event_logs:/opt/spark/logs/]
-  #   networks: [backend]
-  #   command: /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
-
-  ####################################################
   # Workers
   ####################################################
   surface-worker:
     <<: *deploy-defaults
-    build: { context: ., dockerfile: workers/Dockerfile, args: { WORKER_MODULE: surface-worker } }
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: surface-worker
     container_name: surface-worker
     env_file: [".env"]
-    environment: { <<: *worker-env }
+    environment:
+      <<: *worker-env
     depends_on:
       kafka: { condition: service_healthy }
       redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
     networks: [backend]
 
   deep-worker:
     <<: *deploy-defaults
-    build: { context: ., dockerfile: workers/Dockerfile, args: { WORKER_MODULE: deep-worker } }
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: deep-worker
     container_name: deep-worker
     env_file: [".env"]
-    environment: { <<: *worker-env }
+    environment:
+      <<: *worker-env
     depends_on:
       kafka: { condition: service_healthy }
       redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
     networks: [backend]
 
   parser-worker:
     <<: *deploy-defaults
-    build: { context: ., dockerfile: workers/Dockerfile, args: { WORKER_MODULE: parser-worker } }
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: parser-worker
     container_name: parser-worker
     env_file: [".env"]
-    environment: { <<: *worker-env }
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_BUCKET: parsed-data
+      MINIO_RAW_BUCKET: duka-raw-data
+      KAFKA_INPUT_TOPIC: crawl.raw
+      KAFKA_TOPIC: crawl.raw
+      PYTHONUNBUFFERED: "1"
     depends_on:
       kafka: { condition: service_healthy }
       minio: { condition: service_healthy }
@@ -390,7 +400,11 @@ services:
 
   dark-worker:
     <<: *deploy-defaults
-    build: { context: ., dockerfile: workers/Dockerfile, args: { WORKER_MODULE: dark-worker } }
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: dark-worker
     container_name: dark-worker
     profiles: [dark]
     env_file: [".env"]
@@ -402,6 +416,7 @@ services:
       kafka: { condition: service_healthy }
       redis: { condition: service_healthy }
       tor: { condition: service_started }
+      minio: { condition: service_healthy }
     networks: [backend]
 
   tor:

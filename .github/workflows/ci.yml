@@ -19,7 +19,6 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install -r workers/requirements.txt
 
       - name: Lint
         run: ruff check app/ workers/ tests/
