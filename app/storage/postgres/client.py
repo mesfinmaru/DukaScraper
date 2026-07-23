@@ -11,11 +11,12 @@ class PostgresManager:
     Uses SQLAlchemy and asyncpg for high-performance database operations.
     """
     def __init__(self):
-        # Database URL should be in your .env file (e.g., postgresql+asyncpg://user:pass@localhost:5432/dukascraper)
-        db_url = getattr(settings, "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/dukascraper")
-        
+        # The DATABASE_URL is loaded from .env via Pydantic settings.
+        # If it's missing, the application will fail on startup, which is the desired behavior.
+        if not settings.DATABASE_URL:
+            raise ValueError("DATABASE_URL is not set in the environment.")
         # Create the async engine
-        self.engine = create_async_engine(db_url, echo=False, pool_size=20, max_overflow=10)
+        self.engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_size=20, max_overflow=10)
         
         # Create a session factory
         self.SessionLocal = async_sessionmaker(

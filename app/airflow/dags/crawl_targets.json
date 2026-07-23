@@ -1,27 +1,30 @@
 [
     {
-        "id": "hacker_news",
-        "url": "https://news.ycombinator.com",
+        "id": "fanamc_amharic",
+        "url": "https://www.fanamc.com/%E1%8B%9C%E1%8A%93",
         "render_js": false,
-        "enabled": true
+        "enabled": true,
+        "language": "am"
     },
     {
         "id": "ethiopian_reporter_am",
         "url": "https://am.thereporter.et/",
         "render_js": false,
-        "enabled": true
+        "enabled": true,
+        "language": "am"
     },
     {
         "id": "bbc_amharic",
         "url": "https://www.bbc.com/amharic",
         "render_js": true,
-        "enabled": true
+        "enabled": true,
+        "language": "am"
     },
     {
-        "id": "telegram_reuters_public",
-        "url": "https://t.me/s/Reuters",
+        "id": "ethio_press",
+        "url": "https://press.et/",
         "render_js": true,
         "enabled": true,
-        "job_params": { "source_type": "telegram" }
+        "language": "am"
     }
 ]

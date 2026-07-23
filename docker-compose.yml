@@ -48,27 +48,6 @@ services:
       retries: 3
       start_period: 5s
 
-  backend:
-    build: ./backend
-    container_name: duka-api-backend
-    ports:
-      - "8000:8000"
-    env_file: [".env"]
-    environment:
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
-      - MINIO_BUCKET=duka-raw-data
-      - MINIO_RAW_BUCKET=duka-raw-data
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      minio: { condition: service_healthy }
-      kafka: { condition: service_healthy }
-      redis: { condition: service_healthy }
-    networks:
-      - backend
-
   ####################################################
   # PostgreSQL
   ####################################################
@@ -78,9 +57,9 @@ services:
     container_name: postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-duka}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-duka}
-      POSTGRES_DB: ${POSTGRES_DB:-duka_scraper}
-    ports: ["${POSTGRES_PORT:-5432}:5432"]
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-duka123}
+      POSTGRES_DB: ${POSTGRES_DB:-duka_db}
+    ports: ["${POSTGRES_PORT:-5433}:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
     networks: [backend]
     healthcheck:
@@ -130,9 +109,10 @@ services:
     networks: [backend]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      interval: 15s
+      timeout: 30s
+      retries: 20
+      start_period: 120s
 
   ####################################################
   # Kafka UI
@@ -141,7 +121,7 @@ services:
     <<: *deploy-defaults
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
-    ports: ["${KAFKA_UI_PORT:-8080}:8080"]
+    ports: ["${KAFKA_UI_PORT:-8088}:8080"]
     environment:
       KAFKA_CLUSTERS_0_NAME: Local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -211,7 +191,11 @@ services:
   minio-init:
     build: ./minio-init
     container_name: minio-init
-    env_file: [".env"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET:-duka-raw-data}
+      MINIO_PARSED_BUCKET: ${MINIO_PARSED_BUCKET:-duka-parsed-data}
     depends_on: { minio: { condition: service_healthy } }
     networks: [backend]
     restart: on-failure
@@ -250,8 +234,8 @@ services:
       dockerfile: app/airflow/Dockerfile
     depends_on: { postgres: { condition: service_healthy } }
     env_file: [".env"]
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-duka}:${POSTGRES_PASSWORD:-duka}@postgres:5432/${POSTGRES_DB:-duka_scraper}
+    environment: # Ensure this matches the other airflow services and postgres setup
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
     command: >
@@ -281,7 +265,7 @@ services:
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
     environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-duka}:${POSTGRES_PASSWORD:-duka}@postgres:5432/${POSTGRES_DB:-duka_scraper}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
     command: webserver
@@ -308,7 +292,7 @@ services:
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
     environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-duka}:${POSTGRES_PASSWORD:-duka}@postgres:5432/${POSTGRES_DB:-duka_scraper}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
     command: scheduler
@@ -330,7 +314,7 @@ services:
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
     environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-duka}:${POSTGRES_PASSWORD:-duka}@postgres:5432/${POSTGRES_DB:-duka_scraper}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
     command: triggerer
@@ -383,19 +367,32 @@ services:
     container_name: parser-worker
     env_file: [".env"]
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_URL: redis://redis:6379/0
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_BUCKET: parsed-data
-      MINIO_RAW_BUCKET: duka-raw-data
+      <<: *worker-env
       KAFKA_INPUT_TOPIC: crawl.raw
-      KAFKA_TOPIC: crawl.raw
-      PYTHONUNBUFFERED: "1"
+      KAFKA_OUTPUT_TOPIC: crawl.parsed
+      # This worker's output bucket for parsed JSON files.
+      MINIO_PARSED_BUCKET: ${MINIO_PARSED_BUCKET:-duka-parsed-data}
     depends_on:
       kafka: { condition: service_healthy }
       minio: { condition: service_healthy }
+    networks: [backend]
+
+  exporter-worker:
+    <<: *deploy-defaults
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+      args:
+        WORKER_MODULE: exporter-worker
+    container_name: exporter-worker
+    env_file: [".env"]
+    environment:
+      <<: *worker-env
+      KAFKA_CONSUME_TOPIC: crawl.parsed
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     networks: [backend]
 
   dark-worker:

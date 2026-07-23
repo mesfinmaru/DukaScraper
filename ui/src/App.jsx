@@ -23,7 +23,8 @@ export default function App() {
   const fetchCrawledFiles = async () => {
     setLoadingFiles(true);
     try {
-      const response = await fetch('http://localhost:8000/api/files');
+      // Use the correct, versioned API endpoint for storage
+      const response = await fetch('http://localhost:8000/api/v1/storage/files');
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       
       const data = await response.json();
@@ -90,13 +91,13 @@ export default function App() {
     setCrawlJobs(prev => [newJob, ...prev]);
 
     try {
-      const response = await fetch('http://localhost:8000/crawl', {
+      const response = await fetch('http://localhost:8000/api/v1/jobs/trigger', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url: cleanedUrl,
-          worker_type: workerType
-        })
+          render_js: workerType === 'deep', // Route to deep-worker if JS rendering is needed
+        }),
       });
 
       if (!response.ok) throw new Error(`Server returned status ${response.status}`);
@@ -105,7 +106,7 @@ export default function App() {
       
       setStatusMessage({
         type: 'success',
-        text: `🚀 Success: ${cleanedUrl} queued for ${workerType}-worker! Check raw storage files below.`
+        text: `🚀 Success: Job ${result.job_id} for ${cleanedUrl} queued for ${result.assigned_worker}!`,
       });
 
       // Update local job status
@@ -154,24 +155,39 @@ export default function App() {
       return;
     }
 
-    // Live Download via FastAPI /api/download endpoint
-    const downloadUrl = `http://localhost:8000/api/download/${bucketName}/${encodeURIComponent(fileName)}`;
+    // Live Download via the correct, versioned FastAPI storage endpoint
+    const downloadUrl = `http://localhost:8000/api/v1/storage/download/${bucketName}/${encodeURIComponent(fileName)}`;
     window.open(downloadUrl, '_blank');
   };
 
   // ----------------------------------------------------
   // 4. PREVIEW FILE CONTENT IN MODAL/PANEL
   // ----------------------------------------------------
-  const handlePreviewFile = (fileName) => {
-    setPreviewContent({
-      fileName,
-      data: JSON.stringify({
-        scraped_file: fileName,
-        bucket: bucketName,
-        timestamp: new Date().toISOString(),
-        payload_preview: `<html>\n  <head><title>Scraped Document Preview</title></head>\n  <body>\n    <h1>Harvested Data from worker</h1>\n    <p>URL Content extracted and indexed cleanly.</p>\n  </body>\n</html>`
-      }, null, 2)
-    });
+  const handlePreviewFile = async (fileName) => {
+    const previewUrl = `http://localhost:8000/api/v1/storage/download/${bucketName}/${encodeURIComponent(fileName)}`;
+    
+    // Set loading state for the modal
+    setPreviewContent({ fileName, data: "Loading content..." });
+
+    try {
+      const response = await fetch(previewUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch preview: ${response.status} ${response.statusText}`);
+      }
+      const textContent = await response.text();
+      let formattedContent = textContent;
+      // Try to pretty-print if it's JSON, otherwise show raw text (like HTML)
+      try {
+        const jsonContent = JSON.parse(textContent);
+        formattedContent = JSON.stringify(jsonContent, null, 2);
+      } catch {
+        // Not JSON, do nothing
+      }
+      setPreviewContent({ fileName, data: formattedContent });
+    } catch (err) {
+      console.error("Preview error:", err);
+      setPreviewContent({ fileName, data: `Error fetching file preview:\n\n${err.message}` });
+    }
   };
 
   return (
@@ -234,8 +250,8 @@ export default function App() {
               cursor: 'pointer'
             }}
           >
-            <option value="surface">Surface Worker (AioKafka)</option>
-            <option value="deep">Deep Worker (Tor / Proxy)</option>
+            <option value="surface">Surface Worker (Static HTML)</option>
+            <option value="deep">Deep Worker (JS/Auth)</option>
           </select>
 
           <button

@@ -3,13 +3,16 @@ import json
 import os
 import re
 import sys
+import signal
 from io import BytesIO
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup
 from minio import Minio
 
-print("Initializing Async Parser Worker with Amharic Extraction...", flush=True)
+from app.pipeline.schemas import CrawlResult, ParsedItem
+
+print("Initializing Parser Worker...", flush=True)
 
 KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "crawl.raw")
@@ -17,6 +20,7 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_USER = os.getenv("MINIO_ROOT_USER", "minioadmin")
 MINIO_PASSWORD = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
 MINIO_PARSED_BUCKET = os.getenv("MINIO_PARSED_BUCKET", "parsed-data")
+KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "crawl.parsed")
 
 if "localhost" in MINIO_ENDPOINT:
     MINIO_ENDPOINT = MINIO_ENDPOINT.replace("localhost", "minio")
@@ -74,7 +78,7 @@ def clean_and_extract_amharic(raw_html_or_text: str) -> str:
             
     return "\n".join(final_sentences)
 
-async def main():
+async def consume_and_parse():
     print(
         f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, "
         f"listening on topic: {KAFKA_INPUT_TOPIC}",
@@ -87,8 +91,10 @@ async def main():
         auto_offset_reset='earliest',
         group_id='parser-worker-group'
     )
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKERS)
     
     await consumer.start()
+    await producer.start()
     print("Parser Worker is active and filtering for Amharic script...", flush=True)
     
     try:
@@ -97,53 +103,58 @@ async def main():
             
             try:
                 # Parse incoming string data package
-                data_package = json.loads(message.value.decode('utf-8'))
-                raw_payload = data_package.get("html") or data_package.get("payload", "")
-                source_site = (
-                    data_package.get("url")
-                    or data_package.get("source")
-                    or "unknown-source"
-                )
+                crawl_result = CrawlResult(**json.loads(message.value.decode('utf-8')))
+                raw_payload = crawl_result.html
+                source_site = crawl_result.url
                 
                 print(f"Processing content stream from source: {source_site}", flush=True)
                 
                 # Execute isolation logic
-                pure_amharic_text = clean_and_extract_amharic(raw_payload)
+                pure_amharic_text = await asyncio.to_thread(clean_and_extract_amharic, raw_payload)
                 
-                if pure_amharic_text.strip():
+                if pure_amharic_text and pure_amharic_text.strip():
                     print("--- Extracted Amharic Text Content Fragment ---", flush=True)
                     print("\n".join(pure_amharic_text.splitlines()[:2]) + "\n...", flush=True)
                     print(f"Total character count parsed: {len(pure_amharic_text)}", flush=True)
                     
-                    # Save parsed results to MinIO 'parsed-data' bucket
+                    # Create the structured data payload for the ParsedItem
+                    extracted_data = {
+                        "character_count": len(pure_amharic_text),
+                        "extracted_text": pure_amharic_text,
+                        "original_status_code": crawl_result.status_code,
+                    }
+
+                    # Create the final ParsedItem object using the official schema
+                    parsed_item = ParsedItem(
+                        source_job_id=crawl_result.source_job_id,
+                        url=crawl_result.url,
+                        worker=crawl_result.worker,
+                        language=crawl_result.language,
+                        data=extracted_data,
+                    )
+
+                    # Convert to JSON bytes for Kafka and MinIO
+                    output_payload_bytes = parsed_item.model_dump_json().encode("utf-8")
+
+                    # 1. Produce to Kafka for the exporter-worker
+                    await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes)
+                    print(f"Successfully produced parsed item to Kafka topic '{KAFKA_OUTPUT_TOPIC}'", flush=True)
+
+                    # 2. Save to MinIO for data lake persistence
                     safe_filename_part = re.sub(r'[^a-zA-Z0-9]', '_', source_site)
                     file_name = f"parsed_{safe_filename_part}_{message.offset}.json"
-                    
-                    output_payload = json.dumps({
-                        "source_url": source_site,
-                        "character_count": len(pure_amharic_text),
-                        "extracted_text": pure_amharic_text
-                    }, ensure_ascii=False).encode('utf-8')
                     
                     minio_client.put_object(
                         MINIO_PARSED_BUCKET,
                         file_name,
-                        BytesIO(output_payload),
-                        len(output_payload),
+                        BytesIO(output_payload_bytes),
+                        len(output_payload_bytes),
                         content_type="application/json"
                     )
-                    print(
-                        f"Successfully saved parsed payload to MinIO "
-                        f"bucket '{MINIO_PARSED_BUCKET}' as {file_name}",
-                        flush=True,
-                    )
+                    print(f"Successfully saved parsed payload to MinIO bucket '{MINIO_PARSED_BUCKET}' as {file_name}", flush=True)
                     
                 else:
-                    print(
-                        "Skipping payload: No meaningful Ethiopic "
-                        "script content detected.",
-                        flush=True,
-                    )
+                    print("Skipping payload: No meaningful Ethiopic script content detected.", flush=True)
                     
             except json.JSONDecodeError:
                 print(
@@ -158,7 +169,18 @@ async def main():
     except Exception as e:
         print(f"Fatal error in consumer pipeline loop: {e}", file=sys.stderr, flush=True)
     finally:
+        print("Shutting down parser worker...", flush=True)
         await consumer.stop()
+        await producer.stop()
+
+def handle_shutdown(loop):
+    print("Shutdown signal received. Stopping worker...", flush=True)
+    for task in asyncio.all_tasks(loop=loop):
+        task.cancel()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    signal.signal(signal.SIGTERM, lambda: handle_shutdown(loop))
+    signal.signal(signal.SIGINT, lambda: handle_shutdown(loop))
+    
+    loop.run_until_complete(consume_and_parse())

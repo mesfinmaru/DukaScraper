@@ -24,10 +24,11 @@ echo "MinIO server is up and running!"
 
 # 3. Create your application's default buckets (if they don't already exist)
 # Adjust or add bucket names here depending on what your scraper expects
-DEFAULT_BUCKETS="duka-raw-data duka-parsed-data duka-logs"
+BUCKETS_TO_CREATE="${MINIO_RAW_BUCKET} ${MINIO_PARSED_BUCKET} duka-logs"
 
-for BUCKET in $DEFAULT_BUCKETS; do
-    if ! mc ls myminio/$BUCKET > /dev/null 2>&1; then
+for BUCKET in $BUCKETS_TO_CREATE; do
+    # Check if the bucket variable is not empty before proceeding
+    if [ -n "$BUCKET" ] && ! mc ls myminio/$BUCKET > /dev/null 2>&1; then
         echo "Creating bucket: $BUCKET"
         mc mb myminio/$BUCKET
         # Optional: Set the policy to download/public if needed by your frontend, 

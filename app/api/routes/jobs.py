@@ -21,6 +21,10 @@ class ScrapeRequest(BaseModel):
         False,
         description="Route to deep-worker when the page requires JavaScript rendering.",
     )
+    language: str = Field(
+        "en",
+        description="Language of the content to be scraped ('en', 'am').",
+    )
     requires_auth: bool = Field(
         False,
         description="Set to true if the page is behind a login (routes to deep-worker).",
@@ -57,6 +61,7 @@ async def trigger_scrape_job(request: ScrapeRequest):
             job_id=job_id,
             url=str(request.url),
             worker_type=worker_type.value,
+            language=request.language,
             job_params=request.job_params,
         )
 
