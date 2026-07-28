@@ -9,6 +9,8 @@ from app.api.routes.api import api_router
 from app.common.config.settings import settings
 from app.common.logger.logger import logger
 from app.pipeline.producer.kafka_producer import kafka_producer
+from app.storage.clickhouse.client import ch_client
+from app.storage.elasticsearch.client import es_client
 from app.storage.minio.client import minio_client
 from app.storage.postgres.client import pg_client
 
@@ -24,6 +26,8 @@ async def lifespan(app: FastAPI):
     if kafka_producer:
         await kafka_producer.start()
     minio_client.connect()
+    ch_client.connect()
+    await es_client.connect()
 
     yield
 
@@ -32,6 +36,8 @@ async def lifespan(app: FastAPI):
     await pg_client.close()
     if kafka_producer:
         await kafka_producer.stop()
+    ch_client.close()
+    await es_client.close()
 
 
 app = FastAPI(

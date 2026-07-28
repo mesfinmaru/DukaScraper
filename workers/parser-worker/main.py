@@ -3,46 +3,53 @@ import json
 import os
 import re
 import sys
-import signal
 from io import BytesIO
+import io
+import logging
+import signal
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup
 from minio import Minio
 
+# --- Path Setup ---
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
+# --- Environment-aware settings ---
+APP_ENV = os.getenv("APP_ENV")
+if APP_ENV == "wsl":
+    from app.common.config import wsl_settings  # noqa
+
+from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlResult, ParsedItem
 
-print("Initializing Parser Worker...", flush=True)
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "crawl.raw")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
-MINIO_USER = os.getenv("MINIO_ROOT_USER", "minioadmin")
-MINIO_PASSWORD = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
-MINIO_PARSED_BUCKET = os.getenv("MINIO_PARSED_BUCKET", "parsed-data")
-KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "crawl.parsed")
-
-if "localhost" in MINIO_ENDPOINT:
-    MINIO_ENDPOINT = MINIO_ENDPOINT.replace("localhost", "minio")
+# --- Configuration ---
+KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
+KAFKA_INPUT_TOPIC = settings.crawl_raw_topic
+KAFKA_OUTPUT_TOPIC = settings.crawl_parsed_topic
+MINIO_PARSED_BUCKET = settings.MINIO_PARSED_BUCKET
 
 # 1. Connect to MinIO Client
 try:
     minio_client = Minio(
-        MINIO_ENDPOINT,
-        access_key=MINIO_USER,
-        secret_key=MINIO_PASSWORD,
-        secure=False
+        settings.MINIO_ENDPOINT,
+        access_key=settings.MINIO_ROOT_USER,
+        secret_key=settings.MINIO_ROOT_PASSWORD,
+        secure=settings.MINIO_SECURE,
     )
-    minio_client.list_buckets()
-    
+
     # Ensure the parsed-data bucket exists
     if not minio_client.bucket_exists(MINIO_PARSED_BUCKET):
         minio_client.make_bucket(MINIO_PARSED_BUCKET)
-        print(f"Created MinIO bucket: {MINIO_PARSED_BUCKET}", flush=True)
-        
-    print(f"Successfully connected to MinIO Object Storage at {MINIO_ENDPOINT}!", flush=True)
+        logger.info(f"Created MinIO bucket: {MINIO_PARSED_BUCKET}")
+
+    logger.info(f"Successfully connected to MinIO Object Storage at {settings.MINIO_ENDPOINT}!")
 except Exception as e:
-    print(f"Failed to connect to MinIO ({MINIO_ENDPOINT}): {e}", file=sys.stderr, flush=True)
+    logger.critical(f"Failed to connect to MinIO ({settings.MINIO_ENDPOINT}): {e}", exc_info=True)
     sys.exit(1)
 
 def clean_and_extract_amharic(raw_html_or_text: str) -> str:
@@ -78,44 +85,61 @@ def clean_and_extract_amharic(raw_html_or_text: str) -> str:
             
     return "\n".join(final_sentences)
 
+def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
+    """Synchronously uploads a payload to MinIO in a thread worker."""
+    try:
+        minio_client.put_object(
+            bucket_name=MINIO_PARSED_BUCKET,
+            object_name=object_name,
+            data=io.BytesIO(payload_bytes),
+            length=len(payload_bytes),
+            content_type="application/json",
+        )
+        logger.info(f"Saved {object_name} to MinIO bucket '{MINIO_PARSED_BUCKET}'")
+    except Exception as e:
+        logger.error(f"Failed to upload {object_name} to MinIO: {e}")
+
+
+async def save_to_minio(object_name: str, payload_bytes: bytes):
+    """Async wrapper to prevent blocking the event loop during MinIO uploads."""
+    await asyncio.to_thread(_upload_to_minio_sync, object_name, payload_bytes)
+
 async def consume_and_parse():
-    print(
+    logger.info(
         f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, "
-        f"listening on topic: {KAFKA_INPUT_TOPIC}",
-        flush=True,
+        f"listening on topic: {KAFKA_INPUT_TOPIC}"
     )
     
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BROKERS,
         auto_offset_reset='earliest',
-        group_id='parser-worker-group'
+        group_id='parser-group'
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKERS)
     
     await consumer.start()
     await producer.start()
-    print("Parser Worker is active and filtering for Amharic script...", flush=True)
+    logger.info("Parser Worker is active and filtering for Amharic script...")
     
     try:
         async for message in consumer:
-            print(f"\n[Kafka Offset {message.offset}] Received new ingestion payload.", flush=True)
+            logger.debug(f"[Kafka Offset {message.offset}] Received new ingestion payload.")
             
             try:
                 # Parse incoming string data package
                 crawl_result = CrawlResult(**json.loads(message.value.decode('utf-8')))
                 raw_payload = crawl_result.html
                 source_site = crawl_result.url
-                
-                print(f"Processing content stream from source: {source_site}", flush=True)
+                logger.info(f"Processing content from source: {source_site}")
                 
                 # Execute isolation logic
                 pure_amharic_text = await asyncio.to_thread(clean_and_extract_amharic, raw_payload)
                 
                 if pure_amharic_text and pure_amharic_text.strip():
-                    print("--- Extracted Amharic Text Content Fragment ---", flush=True)
-                    print("\n".join(pure_amharic_text.splitlines()[:2]) + "\n...", flush=True)
-                    print(f"Total character count parsed: {len(pure_amharic_text)}", flush=True)
+                    logger.info(f"Extracted {len(pure_amharic_text)} chars of Amharic text.")
+                    logger.debug("--- Extracted Amharic Text Content Fragment ---")
+                    logger.debug("\n".join(pure_amharic_text.splitlines()[:2]) + "\n...")
                     
                     # Create the structured data payload for the ParsedItem
                     extracted_data = {
@@ -138,43 +162,32 @@ async def consume_and_parse():
 
                     # 1. Produce to Kafka for the exporter-worker
                     await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes)
-                    print(f"Successfully produced parsed item to Kafka topic '{KAFKA_OUTPUT_TOPIC}'", flush=True)
+                    logger.info(f"Produced parsed item to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
 
                     # 2. Save to MinIO for data lake persistence
-                    safe_filename_part = re.sub(r'[^a-zA-Z0-9]', '_', source_site)
-                    file_name = f"parsed_{safe_filename_part}_{message.offset}.json"
-                    
-                    minio_client.put_object(
-                        MINIO_PARSED_BUCKET,
-                        file_name,
-                        BytesIO(output_payload_bytes),
-                        len(output_payload_bytes),
-                        content_type="application/json"
-                    )
-                    print(f"Successfully saved parsed payload to MinIO bucket '{MINIO_PARSED_BUCKET}' as {file_name}", flush=True)
+                    object_name = f"parsed_{crawl_result.source_job_id}.json"
+                    await save_to_minio(object_name, output_payload_bytes)
                     
                 else:
-                    print("Skipping payload: No meaningful Ethiopic script content detected.", flush=True)
+                    logger.info("Skipping payload: No meaningful Ethiopic script content detected.")
                     
             except json.JSONDecodeError:
-                print(
+                logger.warning(
                     "Failed to decode message package. "
-                    "Skipping invalid JSON format.",
-                    file=sys.stderr,
-                    flush=True,
+                    "Skipping invalid JSON format."
                 )
             except Exception as loop_err:
-                print(f"Error handling individual record: {loop_err}", file=sys.stderr, flush=True)
+                logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
                 
     except Exception as e:
-        print(f"Fatal error in consumer pipeline loop: {e}", file=sys.stderr, flush=True)
+        logger.critical(f"Fatal error in consumer pipeline loop: {e}", exc_info=True)
     finally:
-        print("Shutting down parser worker...", flush=True)
+        logger.info("Shutting down parser worker...")
         await consumer.stop()
         await producer.stop()
 
-def handle_shutdown(loop):
-    print("Shutdown signal received. Stopping worker...", flush=True)
+def handle_shutdown(loop: asyncio.AbstractEventLoop):
+    logger.info("Shutdown signal received. Stopping worker...")
     for task in asyncio.all_tasks(loop=loop):
         task.cancel()
 
@@ -183,4 +196,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda: handle_shutdown(loop))
     signal.signal(signal.SIGINT, lambda: handle_shutdown(loop))
     
-    loop.run_until_complete(consume_and_parse())
+    try:
+        loop.run_until_complete(consume_and_parse())
+    except asyncio.CancelledError:
+        logger.info("All tasks cancelled. Worker shutdown complete.")

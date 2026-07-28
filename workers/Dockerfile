@@ -1,16 +1,19 @@
+# Use a slim Python image as the base
 FROM python:3.12-slim
 
+# Set the working directory inside the container
 WORKDIR /app
 
-COPY requirements.txt ./
+# Copy only the requirements file first to leverage Docker layer caching
+COPY requirements.txt .
+
+# Install the dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app/ ./app/
-COPY workers/ ./workers/
+# Copy the rest of the application code
+COPY . .
 
 ARG WORKER_MODULE
-ENV WORKER_MODULE=${WORKER_MODULE}
 
-# Worker directories use hyphens, which are not valid Python module names.
-# String format ensures Docker smoothly interpolates the environment variable with spaces intact.
-CMD python /app/workers/${WORKER_MODULE}/main.py
+# The command to run the worker will be provided by docker-compose
+CMD python workers/${WORKER_MODULE}/main.py

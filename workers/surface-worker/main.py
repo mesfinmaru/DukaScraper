@@ -13,6 +13,11 @@ from pydantic import ValidationError
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
+# --- Environment-aware settings ---
+APP_ENV = os.getenv("APP_ENV")
+if APP_ENV == "wsl":
+    from app.common.config import wsl_settings  # noqa
+
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 
@@ -34,8 +39,8 @@ BUCKET_NAME = settings.MINIO_RAW_BUCKET
 
 minio_client = Minio(
     settings.MINIO_ENDPOINT,
-    access_key=settings.MINIO_ACCESS_KEY,
-    secret_key=settings.MINIO_SECRET_KEY,
+    access_key=settings.MINIO_ROOT_USER,
+    secret_key=settings.MINIO_ROOT_PASSWORD,
     secure=settings.MINIO_SECURE,
 )
 

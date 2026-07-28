@@ -1,7 +1,6 @@
 FROM minio/mc:latest
 
-COPY init.sh /init.sh
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
 
-RUN chmod +x /init.sh
-
-ENTRYPOINT ["/init.sh"]
+ENTRYPOINT ["/run.sh"]

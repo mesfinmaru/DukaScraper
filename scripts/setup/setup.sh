@@ -13,15 +13,16 @@ python -m venv .venv
 echo "Installing dependencies into the virtual environment..."
 .venv/bin/pip install -r requirements.txt
 
-echo "Starting background services (Postgres, Redis, Kafka, Airflow, MinIO, workers...)"
+echo "Starting background infrastructure (Postgres, Redis, Kafka, Airflow, MinIO...)"
 docker compose up -d
 
 echo ""
 echo "Setup complete."
+echo "Run 'docker compose --profile workers up -d' to start the workers."
 echo "To run the API locally with hot-reloading: make dev"
 echo "The following services are running in Docker (use your IP to access from other devices):"
-echo "  Airflow UI:     http://<your-ip-or-localhost>:8081"
-echo "  Kafka UI:       http://<your-ip-or-localhost>:8080"
+echo "  Airflow UI:     http://localhost:8081"
+echo "  Kafka UI:       http://localhost:8088"
 echo "  MinIO console:  http://<your-ip-or-localhost>:9001"
 echo "  Kibana:         http://<your-ip-or-localhost>:5601"
 echo "  Grafana:        http://<your-ip-or-localhost>:3000"

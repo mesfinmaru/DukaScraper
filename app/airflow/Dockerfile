@@ -8,4 +8,4 @@ USER airflow
 
 # Install the Postgres and HTTP providers.
 # These packages include the necessary drivers (psycopg2) and operators (SimpleHttpOperator).
-RUN pip install --no-cache-dir apache-airflow-providers-postgres apache-airflow-providers-http
+RUN pip install --no-cache-dir apache-airflow-providers-postgres apache-airflow-providers-http pydantic

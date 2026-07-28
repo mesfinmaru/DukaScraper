@@ -13,7 +13,7 @@ CRAWL_TARGETS_FILE = DAGS_FOLDER / "crawl_targets.json"
 with DAG(
     dag_id="dynamic_crawl_scheduler",
     start_date=datetime(2023, 1, 1),
-    schedule_interval="@daily",
+    schedule="@daily",  # Updated from schedule_interval for Airflow 3 compatibility
     catchup=False,
     tags=["scraping", "dynamic"],
     doc_md="""
@@ -43,10 +43,10 @@ with DAG(
 
             SimpleHttpOperator(
                 task_id=task_id,
-                http_conn_id="duka_scraper_api",  # This connection must be configured in Airflow UI
+                http_conn_id="duka_api",  # This connection is created by the airflow-init service
                 endpoint="/api/v1/jobs/trigger",
                 method="POST",
-                json=payload,
+                data=json.dumps(payload),  # Fixed: Convert payload dict to JSON string for `data`
                 headers={"Content-Type": "application/json"},
                 response_check=lambda response: response.status_code == 202,
             )

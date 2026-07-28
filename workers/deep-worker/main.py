@@ -1,47 +1,62 @@
 import asyncio
+import json
+import logging
 import os
 import sys
 
-import redis
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from pydantic import ValidationError
 
-print("Initializing Async Deep Worker...", flush=True)
+# --- Path Setup ---
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+# --- Environment-aware settings ---
+APP_ENV = os.getenv("APP_ENV")
+if APP_ENV == "wsl":
+    from app.common.config import wsl_settings  # noqa
 
-# 1. Connect to Redis (Synchronous client is fine for background pings)
-try:
-    r = redis.from_url(REDIS_URL)
-    r.ping()
-    print("Successfully connected to Redis!", flush=True)
-except Exception as e:
-    print(f"Failed to connect to Redis: {e}", file=sys.stderr, flush=True)
-    sys.exit(1)
+from app.common.config.settings import settings
+from app.pipeline.schemas import CrawlRequest
+
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+KAFKA_BOOTSTRAP_SERVERS = settings.KAFKA_BOOTSTRAP_SERVERS
+CONSUME_TOPIC = settings.crawl_request_topic
+WORKER_TYPE = "deep"
+
 
 async def main():
-    print(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}", flush=True)
-    
-    # 2. Configure Asynchronous Kafka Consumer
+    """Main worker lifecycle loop."""
     consumer = AIOKafkaConsumer(
-        'duka-deep-tasks',
-        bootstrap_servers=KAFKA_BROKERS,
-        auto_offset_reset='earliest',
-        group_id='deep-worker-group'
+        CONSUME_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=f"{WORKER_TYPE}-group",
+        auto_offset_reset="earliest",
     )
-    
+
     await consumer.start()
-    print("Deep Worker is active and listening async for events...", flush=True)
-    
+    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}'.")
+
     try:
-        # 3. Async loop over messages
-        async for message in consumer:
-            print(f"Received task: {message.value.decode('utf-8')}", flush=True)
-            # TODO: Insert deep scraping/parsing logic here
-            
+        async for msg in consumer:
+            try:
+                request = CrawlRequest(**json.loads(msg.value))
+                if request.worker_type == WORKER_TYPE:
+                    logger.info(f"Received job {request.job_id} for URL: {request.url}")
+                    # TODO: Implement deep scraping logic using Playwright/Selenium
+            except (ValidationError, json.JSONDecodeError) as e:
+                logger.warning(f"Skipping invalid message: {e}")
+
     except Exception as e:
-        print(f"Error in consumer loop: {e}", file=sys.stderr, flush=True)
+        logger.critical(f"Fatal error in consumer loop: {e}", exc_info=True)
     finally:
+        logger.info("Shutting down worker gracefully...")
         await consumer.stop()
 
 if __name__ == "__main__":

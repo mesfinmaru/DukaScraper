@@ -46,4 +46,4 @@ jobs:
             -f workers/Dockerfile \
             --build-arg WORKER_MODULE=${{ matrix.worker }} \
             -t duka-${{ matrix.worker }}:ci \
-            .
+            ./workers

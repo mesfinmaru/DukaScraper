@@ -2,10 +2,6 @@ x-worker-env: &worker-env
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
   MINIO_ENDPOINT: minio:9000
-  MINIO_ROOT_USER: minioadmin
-  MINIO_ROOT_PASSWORD: minioadmin
-  MINIO_BUCKET: duka-raw-data
-  MINIO_RAW_BUCKET: duka-raw-data
   PYTHONUNBUFFERED: "1"
 
 x-logging: &logging
@@ -63,7 +59,7 @@ services:
     volumes: [postgres_data:/var/lib/postgresql/data]
     networks: [backend]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-duka} -d ${POSTGRES_DB:-duka_scraper}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-duka} -d ${POSTGRES_DB:-duka_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -97,7 +93,7 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -201,6 +197,30 @@ services:
     restart: on-failure
 
   ####################################################
+  # ClickHouse
+  ####################################################
+  clickhouse:
+    <<: *deploy-defaults
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-duka_analytics}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-duka}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-duka123}
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9001}:9000" # Note: MinIO console is on 9001, so native CH is moved
+    volumes: [clickhouse_data:/var/lib/clickhouse]
+    networks: [backend]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ####################################################
   # Prometheus
   ####################################################
   prometheus:
@@ -233,17 +253,21 @@ services:
     build:
       dockerfile: app/airflow/Dockerfile
     depends_on: { postgres: { condition: service_healthy } }
+    volumes:
+      - ./app:/opt/airflow/app
+      - ./app/airflow/dags:/opt/airflow/dags:ro
     env_file: [".env"]
     environment: # Ensure this matches the other airflow services and postgres setup
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - PYTHONPATH=/opt/airflow/app
     command: >
       bash -c "
         airflow db upgrade &&
         (airflow users create -r Admin -u ${AIRFLOW_USER:-airflow} -p ${AIRFLOW_PASSWORD:-airflow} -f Airflow -l Admin -e admin@example.com) || true &&
         (airflow connections delete 'duka_api' || true) &&
-        airflow connections add 'duka_api' --conn-type 'http' --conn-host 'host.docker.internal' --conn-port ${API_PORT:-8000}
+        airflow connections add 'duka_api' --conn-type 'http' --conn-host 'api' --conn-port 8000
       "
     restart: on-failure
     networks: [backend]
@@ -261,6 +285,7 @@ services:
     depends_on: { airflow-init: { condition: service_completed_successfully } }
     ports: ["${AIRFLOW_WEBSERVER_PORT:-8081}:8080"]
     volumes:
+      - ./app:/opt/airflow/app
       - ./app/airflow/dags:/opt/airflow/dags:ro
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
@@ -268,6 +293,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - PYTHONPATH=/opt/airflow/app
     command: webserver
     networks: [backend]
     healthcheck:
@@ -288,6 +314,7 @@ services:
     container_name: airflow-scheduler
     depends_on: { airflow-init: { condition: service_completed_successfully } }
     volumes:
+      - ./app:/opt/airflow/app
       - ./app/airflow/dags:/opt/airflow/dags:ro
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
@@ -295,6 +322,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - PYTHONPATH=/opt/airflow/app
     command: scheduler
     networks: [backend]
 
@@ -310,6 +338,7 @@ services:
     container_name: airflow-triggerer
     depends_on: { airflow-init: { condition: service_completed_successfully } }
     volumes:
+      - ./app:/opt/airflow/app
       - ./app/airflow/dags:/opt/airflow/dags:ro
       - airflow_logs:/opt/airflow/logs
     env_file: [".env"]
@@ -317,6 +346,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - PYTHONPATH=/opt/airflow/app
     command: triggerer
     networks: [backend]
 
@@ -326,11 +356,12 @@ services:
   surface-worker:
     <<: *deploy-defaults
     build:
-      context: .
+      context: ./workers
       dockerfile: workers/Dockerfile
       args:
         WORKER_MODULE: surface-worker
     container_name: surface-worker
+    profiles: ["workers"]
     env_file: [".env"]
     environment:
       <<: *worker-env
@@ -343,11 +374,12 @@ services:
   deep-worker:
     <<: *deploy-defaults
     build:
-      context: .
+      context: ./workers
       dockerfile: workers/Dockerfile
       args:
         WORKER_MODULE: deep-worker
     container_name: deep-worker
+    profiles: ["workers"]
     env_file: [".env"]
     environment:
       <<: *worker-env
@@ -360,18 +392,15 @@ services:
   parser-worker:
     <<: *deploy-defaults
     build:
-      context: .
+      context: ./workers
       dockerfile: workers/Dockerfile
       args:
         WORKER_MODULE: parser-worker
     container_name: parser-worker
+    profiles: ["workers"]
     env_file: [".env"]
     environment:
       <<: *worker-env
-      KAFKA_INPUT_TOPIC: crawl.raw
-      KAFKA_OUTPUT_TOPIC: crawl.parsed
-      # This worker's output bucket for parsed JSON files.
-      MINIO_PARSED_BUCKET: ${MINIO_PARSED_BUCKET:-duka-parsed-data}
     depends_on:
       kafka: { condition: service_healthy }
       minio: { condition: service_healthy }
@@ -380,16 +409,15 @@ services:
   exporter-worker:
     <<: *deploy-defaults
     build:
-      context: .
+      context: ./workers
       dockerfile: workers/Dockerfile
       args:
         WORKER_MODULE: exporter-worker
     container_name: exporter-worker
+    profiles: ["workers"]
     env_file: [".env"]
     environment:
       <<: *worker-env
-      KAFKA_CONSUME_TOPIC: crawl.parsed
-      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
     depends_on:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -398,17 +426,15 @@ services:
   dark-worker:
     <<: *deploy-defaults
     build:
-      context: .
+      context: ./workers
       dockerfile: workers/Dockerfile
       args:
         WORKER_MODULE: dark-worker
     container_name: dark-worker
-    profiles: [dark]
+    profiles: ["dark"]
     env_file: [".env"]
     environment:
       <<: *worker-env
-      DARK_ENABLED: ${DARK_ENABLED:-false}
-      TOR_PROXY_URL: socks5://tor:9050
     depends_on:
       kafka: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -427,6 +453,7 @@ volumes:
   postgres_data:
   minio_data:
   elasticsearch_data:
+  clickhouse_data:
   grafana_data:
   prometheus_data:
   airflow_logs:
