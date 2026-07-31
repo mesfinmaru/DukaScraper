@@ -1,4 +1,4 @@
-[
+﻿[
   {
     "job_id": "fanamc_amharic",
     "url": "https://www.fanamc.com/%E1%8B%9C%E1%8A%93",
@@ -10,10 +10,10 @@
     }
   },
   {
-    "job_id": "ethiopian_reporter_am",
-    "url": "https://am.thereporter.et/",
+    "job_id": "ethiopian_reporter_en",
+    "url": "https://www.thereporterethiopia.com/",
     "worker_type": "surface-worker",
-    "language": "am",
+    "language": "en",
     "job_params": {
       "render_js": false,
       "enabled": true
@@ -30,12 +30,12 @@
     }
   },
   {
-    "job_id": "ethio_press",
-    "url": "https://press.et/",
+    "job_id": "addis_standard_en",
+    "url": "https://addisstandard.com/",
     "worker_type": "surface-worker",
-    "language": "am",
+    "language": "en",
     "job_params": {
-      "render_js": true,
+      "render_js": false,
       "enabled": true
     }
   }

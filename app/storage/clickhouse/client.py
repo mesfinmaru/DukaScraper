@@ -12,15 +12,15 @@ class ClickHouseManager:
     def __init__(self):
         self.client = None
         try:
-            # These settings are read from your .env file via Pydantic settings
+            # Safely pull configuration from Pydantic settings with smart fallbacks
             self.client = clickhouse_connect.get_client(
-                host=getattr(settings, "CLICKHOUSE_HOST", "clickhouse"),
+                host=getattr(settings, "CLICKHOUSE_HOST", "localhost"),
                 port=int(getattr(settings, "CLICKHOUSE_HTTP_PORT", 8123)),
-                user=getattr(settings, "CLICKHOUSE_USER", "duka"),
-                password=getattr(settings, "CLICKHOUSE_PASSWORD", "duka123"),
-                database=getattr(settings, "CLICKHOUSE_DB", "duka_analytics"),
+                user=getattr(settings, "CLICKHOUSE_USER", "default"),
+                password=getattr(settings, "CLICKHOUSE_PASSWORD", ""),
+                database=getattr(settings, "CLICKHOUSE_DB", "duka_scraper"),
             )
-            logger.info("ClickHouse client initialized.")
+            logger.info("ClickHouse client initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize ClickHouse client: {e}", exc_info=True)
             self.client = None

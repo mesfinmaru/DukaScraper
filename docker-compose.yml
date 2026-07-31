@@ -1,466 +1,304 @@
-x-worker-env: &worker-env
-  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-  REDIS_URL: redis://redis:6379/0
-  MINIO_ENDPOINT: minio:9000
-  PYTHONUNBUFFERED: "1"
+networks:
+  duka-net:
+    driver: bridge
 
-x-logging: &logging
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
-
-x-deploy-defaults: &deploy-defaults
-  restart: unless-stopped
-  deploy:
-    resources:
-      limits:
-        cpus: '0.50'
-        memory: '512M'
+volumes:
+  postgres_data:
+  redis_data:
+  es_data:
+  clickhouse_data:
+  minio_data:
+  kafka_data:
+  pgadmin_data:
 
 services:
-
-  ####################################################
-  # API / Backend
-  ####################################################
-  api:
-    <<: *deploy-defaults
-    build: .
-    container_name: duka-api
-    profiles: ["api"]
-    ports:
-      - "${API_PORT:-8000}:8000"
-    env_file: [".env"]
-    depends_on:
-      postgres: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      kafka: { condition: service_healthy }
-      minio: { condition: service_healthy }
-    networks: [backend]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-
-  ####################################################
-  # PostgreSQL
-  ####################################################
   postgres:
-    <<: *deploy-defaults
     image: postgres:16-alpine
     container_name: postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-duka}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-duka123}
-      POSTGRES_DB: ${POSTGRES_DB:-duka_db}
-    ports: ["${POSTGRES_PORT:-5433}:5432"]
-    volumes: [postgres_data:/var/lib/postgresql/data]
-    networks: [backend]
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: duka
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - duka-net
+    restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-duka} -d ${POSTGRES_DB:-duka_db}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U postgres -d duka"]
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  ####################################################
-  # Redis
-  ####################################################
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_servers.json:/pgadmin4/servers.json
+    networks:
+      - duka-net
+    restart: always
+    depends_on:
+      - postgres
+
   redis:
-    <<: *deploy-defaults
     image: redis:7-alpine
     container_name: redis
-    ports: ["${REDIS_PORT:-6379}:6379"]
-    networks: [backend]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - duka-net
+    restart: always
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  ####################################################
-  # Kafka (Apache Official - KRaft)
-  ####################################################
   kafka:
-    <<: *deploy-defaults
     image: apache/kafka:3.9.1
     container_name: kafka
-    hostname: kafka
     ports:
-      - "${KAFKA_PORT:-9092}:29092"
+      - "9092:9092"
     environment:
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    networks: [backend]
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - duka-net
+    restart: always
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "test -f /proc/1/status || exit 1"]
       interval: 15s
-      timeout: 30s
-      retries: 20
-      start_period: 120s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  ####################################################
-  # Kafka UI
-  ####################################################
   kafka-ui:
-    <<: *deploy-defaults
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
-    ports: ["${KAFKA_UI_PORT:-8088}:8080"]
+    ports:
+      - "8088:8080"
     environment:
-      KAFKA_CLUSTERS_0_NAME: Local
+      KAFKA_CLUSTERS_0_NAME: local-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    depends_on: { kafka: { condition: service_healthy } }
-    networks: [backend]
+    networks:
+      - duka-net
+    restart: always
+    depends_on:
+      - kafka
 
-  ####################################################
-  # Elasticsearch
-  ####################################################
   elasticsearch:
-    <<: *deploy-defaults
     image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
     container_name: elasticsearch
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: '1.5G'
     environment:
-      discovery.type: single-node
-      xpack.security.enabled: "false"
-      ES_JAVA_OPTS: "-Xms512m -Xmx512m" 
-    ports: ["${ELASTICSEARCH_PORT:-9200}:9200"]
-    volumes: [elasticsearch_data:/usr/share/elasticsearch/data]
-    ulimits: { memlock: { soft: -1, hard: -1 }, nofile: { soft: 65536, hard: 65536 } }
-    networks: [backend]
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - duka-net
+    restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=10s"]
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/ >/dev/null || exit 1"]
       interval: 30s
-      timeout: 15s
+      timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 40s
 
-  ####################################################
-  # Kibana
-  ####################################################
   kibana:
-    <<: *deploy-defaults
     image: docker.elastic.co/kibana/kibana:8.12.0
     container_name: kibana
-    ports: ["${KIBANA_PORT:-5601}:5601"]
+    ports:
+      - "5601:5601"
     environment:
-      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
-    depends_on: { elasticsearch: { condition: service_healthy } }
-    networks: [backend]
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - duka-net
+    restart: always
+    depends_on:
+      - elasticsearch
 
-  ####################################################
-  # MinIO
-  ####################################################
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    environment:
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - duka-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   minio:
-    <<: *deploy-defaults
     image: minio/minio:latest
     container_name: minio
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    ports: ["${MINIO_PORT:-9000}:9000", "${MINIO_CONSOLE_PORT:-9001}:9001"]
-    volumes: [minio_data:/data]
-    networks: [backend]
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - duka-net
+    restart: always
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   minio-init:
-    build: ./minio-init
+    image: minio/mc
     container_name: minio-init
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET:-duka-raw-data}
-      MINIO_PARSED_BUCKET: ${MINIO_PARSED_BUCKET:-duka-parsed-data}
-    depends_on: { minio: { condition: service_healthy } }
-    networks: [backend]
-    restart: on-failure
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Minio..."
+        until mc alias set minio http://minio:9000 minioadmin minioadmin; do
+          sleep 2;
+        done
+        mc mb minio/duka-raw-data --ignore-existing
+        echo "MinIO bucket initialized successfully."
+    networks:
+      - duka-net
 
-  ####################################################
-  # ClickHouse
-  ####################################################
-  clickhouse:
-    <<: *deploy-defaults
-    image: clickhouse/clickhouse-server:latest
-    container_name: clickhouse
-    environment:
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-duka_analytics}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-duka}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-duka123}
-    ports:
-      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
-      - "${CLICKHOUSE_NATIVE_PORT:-9001}:9000" # Note: MinIO console is on 9001, so native CH is moved
-    volumes: [clickhouse_data:/var/lib/clickhouse]
-    networks: [backend]
-    ulimits:
-      nofile: { soft: 262144, hard: 262144 }
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  ####################################################
-  # Prometheus
-  ####################################################
-  prometheus:
-    <<: *deploy-defaults
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    networks: [backend, monitoring]
-
-  ####################################################
-  # Grafana
-  ####################################################
-  grafana:
-    <<: *deploy-defaults
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports: ["${GRAFANA_PORT:-3000}:3000"]
-    depends_on: [prometheus]
-    volumes: [grafana_data:/var/lib/grafana]
-    networks: [monitoring]
-
-  ####################################################
-  # Airflow
-  ####################################################
-  airflow-init:
-    container_name: airflow-init
-    build:
-      dockerfile: app/airflow/Dockerfile
-    depends_on: { postgres: { condition: service_healthy } }
-    volumes:
-      - ./app:/opt/airflow/app
-      - ./app/airflow/dags:/opt/airflow/dags:ro
-    env_file: [".env"]
-    environment: # Ensure this matches the other airflow services and postgres setup
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - PYTHONPATH=/opt/airflow/app
-    command: >
-      bash -c "
-        airflow db upgrade &&
-        (airflow users create -r Admin -u ${AIRFLOW_USER:-airflow} -p ${AIRFLOW_PASSWORD:-airflow} -f Airflow -l Admin -e admin@example.com) || true &&
-        (airflow connections delete 'duka_api' || true) &&
-        airflow connections add 'duka_api' --conn-type 'http' --conn-host 'api' --conn-port 8000
-      "
-    restart: on-failure
-    networks: [backend]
-
-  airflow-webserver:
-    <<: *deploy-defaults
-    build:
-      dockerfile: app/airflow/Dockerfile
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: '1G'
-    container_name: airflow-webserver
-    depends_on: { airflow-init: { condition: service_completed_successfully } }
-    ports: ["${AIRFLOW_WEBSERVER_PORT:-8081}:8080"]
-    volumes:
-      - ./app:/opt/airflow/app
-      - ./app/airflow/dags:/opt/airflow/dags:ro
-      - airflow_logs:/opt/airflow/logs
-    env_file: [".env"]
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - PYTHONPATH=/opt/airflow/app
-    command: webserver
-    networks: [backend]
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-  airflow-scheduler:
-    <<: *deploy-defaults
-    build:
-      dockerfile: app/airflow/Dockerfile
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: '1G'
-    container_name: airflow-scheduler
-    depends_on: { airflow-init: { condition: service_completed_successfully } }
-    volumes:
-      - ./app:/opt/airflow/app
-      - ./app/airflow/dags:/opt/airflow/dags:ro
-      - airflow_logs:/opt/airflow/logs
-    env_file: [".env"]
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - PYTHONPATH=/opt/airflow/app
-    command: scheduler
-    networks: [backend]
-
-  airflow-triggerer:
-    <<: *deploy-defaults
-    build:
-      dockerfile: app/airflow/Dockerfile
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: '1G'
-    container_name: airflow-triggerer
-    depends_on: { airflow-init: { condition: service_completed_successfully } }
-    volumes:
-      - ./app:/opt/airflow/app
-      - ./app/airflow/dags:/opt/airflow/dags:ro
-      - airflow_logs:/opt/airflow/logs
-    env_file: [".env"]
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - PYTHONPATH=/opt/airflow/app
-    command: triggerer
-    networks: [backend]
-
-  ####################################################
-  # Workers
-  ####################################################
   surface-worker:
-    <<: *deploy-defaults
     build:
-      context: ./workers
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: surface-worker
+      context: .
+      dockerfile: workers/surface-worker/Dockerfile
     container_name: surface-worker
-    profiles: ["workers"]
-    env_file: [".env"]
+    restart: on-failure:5
     environment:
-      <<: *worker-env
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - .:/app
+    networks:
+      - duka-net
     depends_on:
-      kafka: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      minio: { condition: service_healthy }
-    networks: [backend]
-
-  deep-worker:
-    <<: *deploy-defaults
-    build:
-      context: ./workers
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: deep-worker
-    container_name: deep-worker
-    profiles: ["workers"]
-    env_file: [".env"]
-    environment:
-      <<: *worker-env
-    depends_on:
-      kafka: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      minio: { condition: service_healthy }
-    networks: [backend]
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
 
   parser-worker:
-    <<: *deploy-defaults
     build:
-      context: ./workers
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: parser-worker
+      context: .
+      dockerfile: workers/parser-worker/Dockerfile
     container_name: parser-worker
-    profiles: ["workers"]
-    env_file: [".env"]
+    restart: on-failure:5
     environment:
-      <<: *worker-env
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - .:/app
+    networks:
+      - duka-net
     depends_on:
-      kafka: { condition: service_healthy }
-      minio: { condition: service_healthy }
-    networks: [backend]
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  deep-worker:
+    build:
+      context: .
+      dockerfile: workers/deep-worker/Dockerfile
+    container_name: deep-worker
+    restart: on-failure:5
+    environment:
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - .:/app
+    networks:
+      - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
 
   exporter-worker:
-    <<: *deploy-defaults
     build:
-      context: ./workers
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: exporter-worker
+      context: .
+      dockerfile: workers/exporter-worker/Dockerfile
     container_name: exporter-worker
-    profiles: ["workers"]
-    env_file: [".env"]
+    restart: on-failure:5
     environment:
-      <<: *worker-env
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - DATABASE_URL=postgresql://postgres:[REDACTED]@postgres:5432/duka
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - .:/app
+    networks:
+      - duka-net
     depends_on:
-      kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
-    networks: [backend]
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
 
-  dark-worker:
-    <<: *deploy-defaults
-    build:
-      context: ./workers
-      dockerfile: workers/Dockerfile
-      args:
-        WORKER_MODULE: dark-worker
-    container_name: dark-worker
-    profiles: ["dark"]
-    env_file: [".env"]
-    environment:
-      <<: *worker-env
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - duka-net
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - duka-net
+    restart: always
     depends_on:
-      kafka: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      tor: { condition: service_started }
-      minio: { condition: service_healthy }
-    networks: [backend]
-
-  tor:
-    <<: *deploy-defaults
-    image: dperson/torproxy:latest
-    container_name: tor
-    profiles: [dark]
-    networks: [backend]
-
-volumes:
-  postgres_data:
-  minio_data:
-  elasticsearch_data:
-  clickhouse_data:
-  grafana_data:
-  prometheus_data:
-  airflow_logs:
-  spark_event_logs:
-
-networks:
-  backend:
-    driver: bridge
-  monitoring:
-    driver: bridge
+      - prometheus

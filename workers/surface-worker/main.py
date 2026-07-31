@@ -47,11 +47,45 @@ minio_client = Minio(
 MAX_CONCURRENT_TASKS = 50
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
-http_client = httpx.AsyncClient(
-    headers={"User-Agent": "DukaScraper/1.0 (SurfaceWorker; compatible;)"},
-    follow_redirects=True,
-    timeout=30.0,
-)
+
+# --- Rule-Based Proxy Manager ---
+class RuleBasedProxyManager:
+    def __init__(self, proxy_pool_config):
+        """Parses PROXY_POOL string or list from settings."""
+        if isinstance(proxy_pool_config, str):
+            self.proxies = [p.strip() for p in proxy_pool_config.split(",") if p.strip()]
+        elif isinstance(proxy_pool_config, list):
+            self.proxies = proxy_pool_config
+        else:
+            self.proxies = []
+        
+        self._index = 0
+        logger.info(f"Loaded {len(self.proxies)} proxies into the rule-based rotation pool.")
+
+    def get_proxy(self, language: str, url: str) -> str | None:
+        """Determines the appropriate proxy based on rules (language/region/round-robin)."""
+        if not self.proxies:
+            return None
+
+        selected_proxy = None
+
+        # Rule 1: Region/Language-specific routing (e.g., Amharic / local targets)
+        if language == "am":
+            # Try to match an Africa or local regional proxy if available in the pool
+            local_proxies = [p for p in self.proxies if any(k in p.lower() for k in ["africa", "local", "eu"])]
+            if local_proxies:
+                selected_proxy = local_proxies[self._index % len(local_proxies)]
+
+        # Rule 2: Fallback to round-robin rotation across all available country proxies
+        if not selected_proxy:
+            selected_proxy = self.proxies[self._index % len(self.proxies)]
+            self._index += 1
+
+        return selected_proxy
+
+
+# Initialize global proxy manager instance
+proxy_manager = RuleBasedProxyManager(getattr(settings, "PROXY_POOL", ""))
 
 
 def _upload_to_minio_sync(job_id: str, payload_bytes: bytes):
@@ -79,7 +113,7 @@ async def save_to_minio(job_id: str, payload_bytes: bytes):
 
 
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
-    """Processes a single incoming crawl request from Kafka."""
+    """Processes a single incoming crawl request from Kafka using dynamic proxies."""
     try:
         data = json.loads(message_value)
         request = CrawlRequest(**data)
@@ -87,32 +121,44 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if request.worker_type != WORKER_TYPE:
             return
 
-        logger.info(f"Processing job {request.job_id} for URL: {request.url}")
+        logger.info(f"Processing job {request.job_id} [{request.language}] for URL: {request.url}")
 
-        try:
-            response = await http_client.get(request.url)
-            response.raise_for_status()
+        # Select rule-based proxy for this specific request
+        proxy_url = proxy_manager.get_proxy(request.language, request.url)
+        if proxy_url:
+            logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}") # Log domain/ip without credentials
 
-            result = CrawlResult(
-                source_job_id=request.job_id,
-                url=str(response.url),
-                worker=WORKER_TYPE,
-                language=request.language,
-                html=response.text,
-                status_code=response.status_code,
-                network="surface",
-            )
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"HTTP error {e.response.status_code} for {request.url}")
-            result = CrawlResult(
-                source_job_id=request.job_id,
-                url=str(e.request.url),
-                worker=WORKER_TYPE,
-                language=request.language,
-                html="",
-                status_code=e.response.status_code,
-                network="surface",
-            )
+        # Use a dynamic client or pass proxy per request to ensure thread safety
+        async with httpx.AsyncClient(
+            proxy=proxy_url,
+            headers={"User-Agent": "DukaScraper/1.0 (SurfaceWorker; compatible;)"},
+            follow_redirects=True,
+            timeout=30.0,
+        ) as client:
+            try:
+                response = await client.get(request.url)
+                response.raise_for_status()
+
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=str(response.url),
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html=response.text,
+                    status_code=response.status_code,
+                    network="surface",
+                )
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"HTTP error {e.response.status_code} for {request.url} using proxy")
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=str(e.request.url),
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html="",
+                    status_code=e.response.status_code,
+                    network="surface",
+                )
 
         payload_bytes = result.model_dump_json().encode("utf-8")
 
@@ -153,7 +199,7 @@ async def main():
 
     await producer.start()
     await consumer.start()
-    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}'.")
+    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' with rule-based proxy routing.")
 
     try:
         async for msg in consumer:
@@ -162,7 +208,6 @@ async def main():
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()
         await producer.stop()
-        await http_client.aclose()
 
 
 if __name__ == "__main__":

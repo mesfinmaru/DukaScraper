@@ -1,19 +1,26 @@
-# Use a slim Python image as the base
 FROM python:3.12-slim
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Copy only the requirements file first to leverage Docker layer caching
-COPY requirements.txt .
+# Install basic system utilities if required by packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the dependencies
+# Copy and install all dependencies from the root requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy the rest of your project code into the container
 COPY . .
 
-ARG WORKER_MODULE
+# Accept the worker module argument passed from docker-compose.yml
+ARG WORKER_MODULE=surface-worker
+ENV WORKER_MODULE=${WORKER_MODULE}
 
-# The command to run the worker will be provided by docker-compose
-CMD python workers/${WORKER_MODULE}/main.py
+# Ensure Python can find your 'app' package modules
+ENV PYTHONPATH=/app
+
+# Dynamically run the correct worker's main script
+CMD ["sh", "-c", "python workers/${WORKER_MODULE}/main.py"]

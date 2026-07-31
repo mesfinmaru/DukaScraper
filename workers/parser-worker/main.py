@@ -1,11 +1,10 @@
 import asyncio
+import io
 import json
+import logging
 import os
 import re
 import sys
-from io import BytesIO
-import io
-import logging
 import signal
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -52,9 +51,11 @@ except Exception as e:
     logger.critical(f"Failed to connect to MinIO ({settings.MINIO_ENDPOINT}): {e}", exc_info=True)
     sys.exit(1)
 
-def clean_and_extract_amharic(raw_html_or_text: str) -> str:
+def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
     """
-    Strips HTML boilerplate and isolates text containing Ethiopic script characters.
+    Strips HTML boilerplate and extracts clean text based on target language:
+    - For Amharic ('am'): Isolates text containing Ethiopic script characters.
+    - For English ('en'): Extracts clean general article text.
     """
     if not raw_html_or_text:
         return ""
@@ -71,19 +72,22 @@ def clean_and_extract_amharic(raw_html_or_text: str) -> str:
     chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
     clean_text = "\n".join(chunk for chunk in chunks if chunk)
     
-    # Regex matching Ethiopic script characters (\u1200-\u137F) along with numbers/spaces
-    amharic_sentence_pattern = re.compile(r'[\u1200-\u137F\s\d.,!?።፣፤፥፦]+')
+    if language == "am":
+        # Regex matching Ethiopic script characters (\u1200-\u137F) along with numbers/punctuation
+        amharic_sentence_pattern = re.compile(r'[\u1200-\u137F\s\d.,!?።፣፤፥፦]+')
+        extracted_matches = amharic_sentence_pattern.findall(clean_text)
+        
+        final_sentences = []
+        for block in extracted_matches:
+            cleaned_block = re.sub(r'\s+', ' ', block).strip()
+            if len(cleaned_block) > 5 and any('\u1200' <= char <= '\u137F' for char in cleaned_block):
+                final_sentences.append(cleaned_block)
+        return "\n".join(final_sentences)
     
-    extracted_matches = amharic_sentence_pattern.findall(clean_text)
-    
-    # Reassemble valid sentences and drop tiny fragments (less than 5 characters)
-    final_sentences = []
-    for block in extracted_matches:
-        cleaned_block = re.sub(r'\s+', ' ', block).strip()
-        if len(cleaned_block) > 5 and any('\u1200' <= char <= '\u137F' for char in cleaned_block):
-            final_sentences.append(cleaned_block)
-            
-    return "\n".join(final_sentences)
+    else:
+        # Standard English/Latin text cleanup
+        paragraphs = [p.strip() for p in clean_text.split("\n") if len(p.strip()) > 20]
+        return "\n".join(paragraphs) if paragraphs else clean_text
 
 def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
     """Synchronously uploads a payload to MinIO in a thread worker."""
@@ -98,7 +102,6 @@ def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
         logger.info(f"Saved {object_name} to MinIO bucket '{MINIO_PARSED_BUCKET}'")
     except Exception as e:
         logger.error(f"Failed to upload {object_name} to MinIO: {e}")
-
 
 async def save_to_minio(object_name: str, payload_bytes: bytes):
     """Async wrapper to prevent blocking the event loop during MinIO uploads."""
@@ -120,35 +123,34 @@ async def consume_and_parse():
     
     await consumer.start()
     await producer.start()
-    logger.info("Parser Worker is active and filtering for Amharic script...")
+    logger.info("Parser Worker is active and processing multi-language feeds...")
     
     try:
         async for message in consumer:
             logger.debug(f"[Kafka Offset {message.offset}] Received new ingestion payload.")
             
             try:
-                # Parse incoming string data package
                 crawl_result = CrawlResult(**json.loads(message.value.decode('utf-8')))
                 raw_payload = crawl_result.html
                 source_site = crawl_result.url
-                logger.info(f"Processing content from source: {source_site}")
+                target_lang = crawl_result.language or "en"
                 
-                # Execute isolation logic
-                pure_amharic_text = await asyncio.to_thread(clean_and_extract_amharic, raw_payload)
+                logger.info(f"Processing content from source [{target_lang}]: {source_site}")
                 
-                if pure_amharic_text and pure_amharic_text.strip():
-                    logger.info(f"Extracted {len(pure_amharic_text)} chars of Amharic text.")
-                    logger.debug("--- Extracted Amharic Text Content Fragment ---")
-                    logger.debug("\n".join(pure_amharic_text.splitlines()[:2]) + "\n...")
+                # Execute language-aware extraction logic in thread
+                extracted_text = await asyncio.to_thread(
+                    clean_and_extract_text, raw_payload, target_lang
+                )
+                
+                if extracted_text and extracted_text.strip():
+                    logger.info(f"Extracted {len(extracted_text)} chars of text ({target_lang}).")
                     
-                    # Create the structured data payload for the ParsedItem
                     extracted_data = {
-                        "character_count": len(pure_amharic_text),
-                        "extracted_text": pure_amharic_text,
+                        "character_count": len(extracted_text),
+                        "extracted_text": extracted_text,
                         "original_status_code": crawl_result.status_code,
                     }
 
-                    # Create the final ParsedItem object using the official schema
                     parsed_item = ParsedItem(
                         source_job_id=crawl_result.source_job_id,
                         url=crawl_result.url,
@@ -157,25 +159,21 @@ async def consume_and_parse():
                         data=extracted_data,
                     )
 
-                    # Convert to JSON bytes for Kafka and MinIO
                     output_payload_bytes = parsed_item.model_dump_json().encode("utf-8")
 
-                    # 1. Produce to Kafka for the exporter-worker
+                    # 1. Produce to Kafka for the downstream exporter/storage worker
                     await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes)
                     logger.info(f"Produced parsed item to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
 
-                    # 2. Save to MinIO for data lake persistence
+                    # 2. Save structured output to MinIO parsed bucket
                     object_name = f"parsed_{crawl_result.source_job_id}.json"
                     await save_to_minio(object_name, output_payload_bytes)
                     
                 else:
-                    logger.info("Skipping payload: No meaningful Ethiopic script content detected.")
+                    logger.info(f"Skipping payload: No meaningful content extracted for [{target_lang}].")
                     
             except json.JSONDecodeError:
-                logger.warning(
-                    "Failed to decode message package. "
-                    "Skipping invalid JSON format."
-                )
+                logger.warning("Failed to decode message package. Skipping invalid JSON format.")
             except Exception as loop_err:
                 logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
                 
@@ -192,11 +190,7 @@ def handle_shutdown(loop: asyncio.AbstractEventLoop):
         task.cancel()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    signal.signal(signal.SIGTERM, lambda: handle_shutdown(loop))
-    signal.signal(signal.SIGINT, lambda: handle_shutdown(loop))
-    
     try:
-        loop.run_until_complete(consume_and_parse())
-    except asyncio.CancelledError:
-        logger.info("All tasks cancelled. Worker shutdown complete.")
+        asyncio.run(consume_and_parse())
+    except KeyboardInterrupt:
+        logger.info("Worker execution interrupted by user.")

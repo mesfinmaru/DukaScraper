@@ -16,7 +16,7 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
-from app.pipeline.schemas import CrawlRequest
+from app.pipeline.schemas import CrawlRequest, ParsedItem
 
 # --- Logging Setup ---
 logging.basicConfig(

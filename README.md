@@ -193,3 +193,132 @@ The system is divided into two primary flows: the **Write/Crawl Pipeline** (left
     *   The UI requests a download URL from the FastAPI `/exports/{file_id}` endpoint.
     *   FastAPI generates a short-lived, pre-signed URL for the requested object in **MinIO** and returns it to the client.
     *   The user's browser downloads the file directly and securely from MinIO using the pre-signed URL.
+
+
+
+
+    url that matches with our project schema to check by writing in the kafka so sample urls are
+
+    {"job_id":"crawl_amh_001","url":"https://www.bbc.com/amharic","worker_type":"surface","language":"am","job_params":{}}
+
+    {"job_id":"amh_dw_001","url":"https://www.dw.com/am/","worker_type":"surface","language":"am","job_params":{}}
+ 
+    {
+  "job_id": "crawl_amh_sport_002",
+  "url": "https://www.fanamc.com/%E1%88%B5%E1%8D%93%E1%88%AD%E1%89%B5",
+  "worker_type": "surface",
+  "language": "am",
+  "job_params": {}
+}
+
+
+1. Surface-worker (Received):
+docker logs surface-worker 2>&1 | Select-String "Processing job"
+
+2. Parser-worker (Parsed):
+docker logs parser-worker 2>&1 | Select-String "Produced parsed item"
+
+3. Exporter-worker (Exported):
+docker logs exporter-worker 2>&1 | Select-String "Successfully exported" | Select-Object -Last 1
+
+#######to check all the databases########
+
+4. PostgreSQL data:
+
+docker exec postgres psql -U postgres -d duka -c "SELECT source_job_id, url, language, character_count FROM parsed_items LIMIT 5;"
+ 
+
+5. ClickHouse data:
+
+docker exec clickhouse clickhouse-client --query "SELECT job_id, url, language, character_count FROM duka_analytics LIMIT 5;"
+6. Elasticsearch data:
+
+docker exec elasticsearch curl -s http://localhost:9200/duka_articles/_search?size=3
+
+
+######### to see something on the ui #####
+Access your services:
+
+Service	URL
+Kafka UI	http://localhost:8088
+MinIO	http://localhost:9001
+pgAdmin	http://localhost:5050
+Kibana (Elasticsearch)	http://localhost:5601
+ClickHouse	http://localhost:8123
+ pgAdmin login:
+Email: admin@example.com
+Password: admin
+MinIO Login Credentials:
+      Username:minioadmin
+      Password:minioadmin
+
+
+      STARTUP PROCEDURE (Every time you restart)
+Step 1: Navigate to project
+
+cd C:\Users\hp\DukaScraper
+Step 2: Start all services
+
+docker compose up -d
+Step 3: Wait 30 seconds for services to initialize
+
+sleep 30
+Step 4: Verify all services are running
+
+docker ps --format "table {{.Names}}\t{{.Status}}"
+You should see:
+
+✅ postgres (healthy)
+✅ kafka (running)
+✅ elasticsearch (healthy)
+✅ clickhouse (healthy)
+✅ minio (healthy)
+✅ surface-worker (running)
+✅ parser-worker (running)
+✅ exporter-worker (running)
+✅ kafka-ui (running)
+✅ pgadmin (running)
+ACCESSING THE SYSTEM
+Send Messages to Kafka:
+
+echo '{"job_id":"test_001","url":"https://www.bbc.com/amharic","worker_type":"surface","language":"am","job_params":{}}' | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic crawl.requests
+View Data in pgAdmin:
+
+URL: http://localhost:5050 Email: admin@example.com Password: admin Server: postgres / postgres / duka
+Kafka UI:
+
+http://localhost:8088
+MinIO Storage:
+
+http://localhost:9001 minioadmin / minioadmin
+WHAT IS NOW PERMANENT & STABLE
+✅ Auto-restart enabled - If any worker crashes, it restarts automatically ✅ PostgreSQL credentials fixed - postgres:postgres works perfectly ✅ All databases connected - PostgreSQL, ClickHouse, Elasticsearch ✅ MinIO storage working - Raw and parsed data stored ✅ Docker network configured - All services communicate correctly ✅ Restart policy set - restart: always on all services
+
+IF SOMETHING GOES WRONG
+Check worker logs:
+
+docker logs surface-worker | Select-Object -Last 20
+docker logs parser-worker | Select-Object -Last 20
+docker logs exporter-worker | Select-Object -Last 20
+Restart a specific service:
+
+docker compose restart surface-worker
+Restart everything:
+
+docker compose down
+docker compose up -d
+Check database connection:
+
+docker exec postgres psql -U postgres -d duka -c "SELECT COUNT(*) FROM parsed_items;"
+SENDING BATCH URLS
+For 30 Amharic URLs:
+
+cat C:\Users\hp\DukaScraper\batch_amharic_large.txt | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic crawl.requests
+Check progress:
+
+docker logs surface-worker 2>&1 | Select-String "Processing job" | Measure-Object -Line
+View final data:
+
+docker exec postgres psql -U postgres -d duka -c "SELECT COUNT(*) as total FROM parsed_items;"
+docker exec clickhouse clickhouse-client --query "SELECT COUNT(*) as total FROM duka_analytics;"
+docker exec elasticsearch curl -s "http://localhost:9200/duka_articles/_count"
