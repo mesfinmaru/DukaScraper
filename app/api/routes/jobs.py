@@ -13,6 +13,7 @@ from app.pipeline.schemas import CrawlRequest
 router = APIRouter()
 CRAWL_REQUESTS_TOPIC = "crawl.requests"
 
+
 class ScrapeRequest(BaseModel):
     """Schema for incoming scraping requests from the UI or external systems."""
 
@@ -75,7 +76,7 @@ async def trigger_scrape_job(request: ScrapeRequest):
             "assigned_worker": worker_type.value,
             "kafka_topic": CRAWL_REQUESTS_TOPIC,
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to submit scrape job {job_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Pipeline Error")

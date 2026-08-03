@@ -1,60 +1,210 @@
 """
-Pydantic schemas for data contracts within the Duka Scraper platform.
-
-This file serves as the single source of truth for the structure of:
-- API request/response bodies
-- Kafka message payloads
-
-By defining them here, we ensure that the API, workers, and any other
-services agree on the shape of the data they exchange.
+Pydantic schemas for DukaScraper platform
+Data contracts for API, Kafka messages, and databases
+TEXT-ONLY crawling pipeline
 """
 
-from typing import Any
+from datetime import datetime
 
 from pydantic import BaseModel, Field
+
+# ============================================================================
+# KAFKA MESSAGE SCHEMAS
+# ============================================================================
 
 
 class CrawlRequest(BaseModel):
     """
-    Schema for a job request sent to the `crawl.requests` Kafka topic.
-    This is the input for all crawl workers (surface, deep, dark).
+    Schema for crawl.requests Kafka topic
+    Input for all crawl workers (surface, deep, dark)
     """
 
-    job_id: str = Field(..., description="Unique identifier for this crawl job.")
-    url: str = Field(..., description="The URL to be crawled.")
-    worker_type: str = Field(..., description="The designated worker to handle this job.")
-    language: str = Field(
-        default="en",
-        description="The requested language for the crawl (e.g., 'en' for English, 'am' for Amharic).",
-    )
-    job_params: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Worker-specific parameters, e.g., auth tokens, form data.",
-    )
+    job_id: int = Field(..., description="Unique identifier for this crawl job")
+    user_id: int = Field(..., description="User who submitted the job")
+    url: str = Field(..., description="The URL to be crawled")
+    language: str = Field(default="en", description="Language: 'en' or 'am'")
+    worker_type: str = Field(..., description="Worker type: 'surface', 'deep', or 'dark'")
 
 
 class CrawlResult(BaseModel):
     """
-    Schema for a result produced by a crawl worker to the `crawl.raw` topic.
+    Schema for crawl.result Kafka topic
+    Raw output from crawl workers
     """
 
-    source_job_id: str
+    job_id: int
     url: str
-    worker: str
-    language: str = Field(..., description="The language for the crawl, passed through from the original CrawlRequest.")
-    html: str
+    html: str  # Raw HTML content
     status_code: int
-    network: str | None = None  # e.g., 'tor' for dark-worker
+    worker: str  # Which worker produced this
+    language: str
+    fetch_duration: float | None = None  # Crawl time in seconds
+
+
+class ParsedItemData(BaseModel):
+    """
+    Schema for parsed item data field
+    Extracted text and metadata
+    """
+
+    extracted_text: str = Field(..., description="Clean extracted text")
+    character_count: int = Field(..., description="Number of characters")
+    original_status_code: int = Field(..., description="HTTP status code")
 
 
 class ParsedItem(BaseModel):
     """
-    Schema for a message on the `crawl.parsed` topic.
-    This is the structured data extracted by the parser-worker.
+    Schema for crawl.parsed Kafka topic
+    Structured data extracted by parser-worker
     """
 
-    source_job_id: str = Field(..., description="The original job_id this data came from.")
-    url: str = Field(..., description="The source URL of the scraped data.")
-    worker: str = Field(..., description="The name of the worker that produced this data.")
-    language: str = Field(..., description="The detected language of the extracted data (e.g., 'en', 'am').")
-    data: dict[str, Any] = Field(..., description="The structured, extracted data as a JSON object.")
+    job_id: int
+    url: str
+    topic: str  # Title of the article
+    language: str  # 'en' or 'am'
+    extracted_text: str  # Full extracted text for search indexing
+    character_count: int
+    worker: str  # Which worker crawled it
+    status: str = "completed"  # completed or failed
+    parse_duration: float | None = None  # Parse time in seconds
+
+
+# ============================================================================
+# DATABASE SCHEMAS
+# ============================================================================
+
+
+class JobRecord(BaseModel):
+    """
+    Schema for PostgreSQL duka_system.jobs table
+    Tracks all crawl jobs
+    """
+
+    job_id: int | None = None  # Auto-increment
+    user_id: int
+    url: str
+    language: str  # "am" or "en"
+    worker_type: str  # "surface", "deep", or "dark"
+    status: str = "pending"  # pending, running, completed, failed
+    error_message: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ParsedItemRecord(BaseModel):
+    """
+    Schema for PostgreSQL duka_db.parsed_items table
+    METADATA ONLY - NO FULL TEXT
+    """
+
+    parsed_item_id: int | None = None
+    job_id: int
+    topic: str
+    url: str
+    language: str
+    worker: str
+    character_count: int
+    status: str
+    source_domain: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ClickHouseAnalyticsRecord(BaseModel):
+    """
+    Schema for ClickHouse duka_analytics table
+    Analytics and time-series data
+    """
+
+    job_id: str
+    language: str
+    worker: str
+    source_domain: str
+    character_count: int
+    status: str
+    crawl_date: str
+    user_id: int
+    created_at: datetime
+
+
+class ElasticsearchArticle(BaseModel):
+    """
+    Schema for Elasticsearch duka_articles index
+    Full-text indexed documents
+    """
+
+    job_id: str
+    url: str
+    topic: str
+    language: str
+    extracted_text: str  # Full-text indexed
+    character_count: int
+    worker: str
+    status: str
+    source_domain: str
+    created_at: datetime
+
+
+# ============================================================================
+# API SCHEMAS
+# ============================================================================
+
+
+class LoginRequest(BaseModel):
+    """User login request"""
+
+    username: str
+    password: str
+
+
+class Token(BaseModel):
+    """JWT token response"""
+
+    access_token: str
+    token_type: str = "bearer"
+
+
+class CreateJobRequest(BaseModel):
+    """Create new crawl job request"""
+
+    url: str
+    language: str = "en"  # default English
+    worker_type: str = "surface"  # default surface worker
+
+
+class JobResponse(BaseModel):
+    """Job creation response"""
+
+    job_id: int
+    user_id: int
+    url: str
+    language: str
+    worker_type: str
+    status: str
+    created_at: str
+
+
+class SearchResponse(BaseModel):
+    """Full-text search response"""
+
+    query: str
+    total: int
+    limit: int
+    offset: int
+    results: list
+
+
+class AnalyticsResponse(BaseModel):
+    """Analytics query response"""
+
+    metric: str
+    results: list
+
+
+class ExportRequest(BaseModel):
+    """Export job request"""
+
+    job_id: int
+    format: str  # pdf, csv, txt, json

@@ -1,0 +1,5 @@
+{"job_id":"amh_bbc_news_001","url":"https://www.bbc.com/amharic/news","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"amh_bbc_world_001","url":"https://www.bbc.com/amharic","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"amh_dw_001","url":"https://www.dw.com/am/","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"amh_reuters_001","url":"https://www.reuters.com/world/africa/","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"amh_aljazeera_001","url":"https://www.aljazeera.com/news/","worker_type":"surface","language":"am","job_params":{}}

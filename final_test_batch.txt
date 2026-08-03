@@ -1,0 +1,10 @@
+{"job_id":"test_batch_001","url":"https://www.bbc.com/amharic","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_002","url":"https://www.bbc.com/amharic/news","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_003","url":"https://www.dw.com/am","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_004","url":"https://www.bbc.com/world","worker_type":"surface","language":"en","job_params":{}}
+{"job_id":"test_batch_005","url":"https://www.reuters.com/world/africa","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_006","url":"https://www.aljazeera.com/news","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_007","url":"https://www.cnn.com/world","worker_type":"surface","language":"en","job_params":{}}
+{"job_id":"test_batch_008","url":"https://www.bbc.com/amharic/topics","worker_type":"surface","language":"am","job_params":{}}
+{"job_id":"test_batch_009","url":"https://www.theguardian.com/world","worker_type":"surface","language":"en","job_params":{}}
+{"job_id":"test_batch_010","url":"https://www.bbc.com/news","worker_type":"surface","language":"en","job_params":{}}

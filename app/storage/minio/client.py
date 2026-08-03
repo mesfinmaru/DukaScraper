@@ -10,6 +10,7 @@ class MinioManager:
     Manages the connection to MinIO and ensures required buckets are created on startup.
     This service is the source of truth for bucket creation.
     """
+
     # Bucket names are defined here to align with the system architecture.
     RAW_ASSETS_BUCKET = "raw-assets"
     EXPORTS_BUCKET = "exports"
@@ -46,6 +47,7 @@ class MinioManager:
         except S3Error as e:
             logger.error("Could not connect to MinIO or create buckets: %s", e)
             raise e
+
 
 # Global instance
 minio_client = MinioManager()

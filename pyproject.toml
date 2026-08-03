@@ -43,8 +43,11 @@ pythonpath = ["."]
 addopts = ["--import-mode=importlib"]
 
 [tool.ruff]
-line-length = 100
+line-length = 180
 target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = [
+    "E402", # Module level import not at top of file
+]

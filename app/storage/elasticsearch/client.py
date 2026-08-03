@@ -8,6 +8,7 @@ class ElasticsearchManager:
     """
     Manages the asynchronous connection to the Elasticsearch cluster.
     """
+
     def __init__(self):
         # Update settings.py later to include ES_URL if not present
         es_url = getattr(settings, "ELASTICSEARCH_URL", "http://localhost:9200")
@@ -28,6 +29,7 @@ class ElasticsearchManager:
         """Closes the async connection pool."""
         await self.client.close()
         logger.info("Elasticsearch connection closed.")
+
 
 # Global instance
 es_client = ElasticsearchManager()

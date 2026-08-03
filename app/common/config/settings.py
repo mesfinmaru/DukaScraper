@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,24 +20,45 @@ class Settings(BaseSettings):
     crawl_parsed_topic: str = "crawl.parsed"
 
     # MinIO Storage Settings
-    MINIO_ENDPOINT: str = "minio:9000"
+    MINIO_ENDPOINT: str = "localhost:9000"
     MINIO_ROOT_USER: str = "minioadmin"
     MINIO_ROOT_PASSWORD: str = "minioadmin"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
     MINIO_RAW_BUCKET: str = "duka-raw-data"
     MINIO_PARSED_BUCKET: str = "duka-parsed-data"
+
+    # ClickHouse Settings
+    CLICKHOUSE_HOST: str = "localhost"
+    CLICKHOUSE_HTTP_PORT: int = 8123
+    CLICKHOUSE_NATIVE_PORT: int = 9002
+    CLICKHOUSE_USER: str = "default"
+    CLICKHOUSE_PASSWORD: str = ""
+    CLICKHOUSE_DB: str = "duka_scraper"
 
     # Database Credentials (loaded from .env)
     POSTGRES_USER: str
     POSTGRES_PASSWORD: str
     POSTGRES_DB: str
-    POSTGRES_HOST: str = "postgres" # Default to Docker service name
-    POSTGRES_PORT: int = 5433
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
 
     # Infrastructure Connections
-    REDIS_URL: str = "redis://redis:6379/0"
-    KAFKA_BOOTSTRAP_SERVERS: str = "kafka:9092"
-    ELASTICSEARCH_URL: str = "http://elasticsearch:9200"
+    REDIS_URL: str = "redis://localhost:6379/0"
+    KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
+    ELASTICSEARCH_URL: str = "http://localhost:9200"
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Override endpoints if running in Docker
+        if os.getenv("APP_ENV") == "docker":
+            self.MINIO_ENDPOINT = "minio:9000"
+            self.CLICKHOUSE_HOST = "clickhouse"
+            self.POSTGRES_HOST = "postgres"
+            self.REDIS_URL = "redis://redis:6379/0"
+            self.KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
+            self.ELASTICSEARCH_URL = "http://elasticsearch:9200"
 
     @property
     def DATABASE_URL(self) -> str:

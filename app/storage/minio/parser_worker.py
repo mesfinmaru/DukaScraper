@@ -2,18 +2,8 @@
 Worker to consume from `raw.result`, parse data, and fan-out to all data stores.
 """
 
-import json
-from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 # Assume these are implemented elsewhere
-from app.dependencies import (
-    get_kafka_consumer, get_kafka_producer,
-    get_db_session, get_clickhouse_client, get_elasticsearch_client
-)
-from app.storage.minio.client import minio_client
-from app.models.schemas import RawResult, ParsedArticle
-from app.pipeline.topics import topics
 
 
 def run_parser_worker():
