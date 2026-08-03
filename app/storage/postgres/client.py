@@ -24,12 +24,25 @@ duka_db.exports:
 """
 
 import logging
+from datetime import date, datetime
 
 import asyncpg
 
-from app.common.config import settings
+from app.common.config.settings import settings
 
 logger = logging.getLogger("dukascraper")
+
+
+def _coerce_publish_date(value: str | date | datetime | None) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise TypeError(f"Unsupported publish_date value: {type(value)!r}")
 
 
 class PostgreSQLClient:
@@ -107,6 +120,33 @@ class PostgreSQLClient:
             password_hash,
         )
 
+    async def ensure_user(
+        self,
+        user_id: str,
+        full_name: str,
+        username: str,
+        email: str,
+        password_hash: str,
+    ):
+        """Ensure a specific user exists for demo/bootstrap flows."""
+        if not self.system_conn:
+            raise RuntimeError("Database not connected")
+
+        existing = await self.get_user(user_id)
+        if existing:
+            return existing
+
+        return await self.system_conn.fetchrow(
+            """INSERT INTO users (user_id, full_name, username, email, password_hash)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING user_id, full_name, username, email, created_at""",
+            user_id,
+            full_name,
+            username,
+            email,
+            password_hash,
+        )
+
     # ========== duka_system queries (jobs) ==========
 
     async def create_job(self, user_id: str, url: str, worker_type: str, language: str = "am"):
@@ -168,13 +208,15 @@ class PostgreSQLClient:
         parsed_json_path: str,
         language: str = "am",
         title: str | None = None,
-        publish_date: str | None = None,
+        publish_date: str | date | datetime | None = None,
         character_count: int | None = None,
         word_count: int | None = None,
     ):
         """Create parsed item metadata in duka_db.parsed_items. item_id is auto-generated (e.g. ITEM00000001)."""
         if not self.db_conn:
             raise RuntimeError("Database not connected")
+
+        normalized_publish_date = _coerce_publish_date(publish_date)
 
         return await self.db_conn.fetchrow(
             """INSERT INTO parsed_items (
@@ -187,7 +229,7 @@ class PostgreSQLClient:
             source_url,
             language,
             title,
-            publish_date,
+            normalized_publish_date,
             character_count,
             word_count,
             raw_html_path,
@@ -243,6 +285,13 @@ class PostgreSQLClient:
             file_size_mb,
             export_id,
         )
+
+    async def update_export_file_path(self, export_id: str, file_path: str):
+        """Update the stored MinIO path for an export."""
+        if not self.db_conn:
+            raise RuntimeError("Database not connected")
+
+        await self.db_conn.execute("UPDATE exports SET file_path = $1 WHERE export_id = $2", file_path, export_id)
 
     async def get_exports_by_job(self, job_id: str):
         """Get all exports for a job"""

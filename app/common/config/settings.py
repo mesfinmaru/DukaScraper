@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     deep_max_pages_per_job: int = 50
     dark_enabled: bool = False
     tor_proxy_url: str = "socks5://tor:9050"
+    export_batch_size: int = 100
+    export_flush_interval_seconds: int = 60
+    http_timeout_seconds: float = 30.0
+    deep_timeout_seconds: float = 45.0
+    dark_timeout_seconds: float = 60.0
+    tor_max_concurrency: int = 10
 
     # Kafka Topics
     crawl_request_topic: str = "crawl.requests"
@@ -39,7 +45,7 @@ class Settings(BaseSettings):
     CLICKHOUSE_NATIVE_PORT: int = 9002
     CLICKHOUSE_USER: str = "default"
     CLICKHOUSE_PASSWORD: str = ""
-    CLICKHOUSE_DB: str = "duka_scraper"
+    CLICKHOUSE_DB: str = "default"
 
     # Database Credentials (loaded from .env)
     POSTGRES_USER: str = "postgres"

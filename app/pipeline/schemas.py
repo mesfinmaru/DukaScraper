@@ -61,6 +61,9 @@ class ParsedItemData(BaseModel):
     extracted_text: str = Field(..., description="Clean extracted text")
     character_count: int = Field(..., description="Number of characters")
     original_status_code: int = Field(..., description="HTTP status code")
+    title: str | None = Field(default=None, description="Extracted article title")
+    publish_date: str | None = Field(default=None, description="Extracted publish date in ISO format")
+    detected_language: str | None = Field(default=None, description="Detected language from parsed content")
 
 
 class ParsedItem(BaseModel):

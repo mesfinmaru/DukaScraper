@@ -1,33 +1,62 @@
-# One-command setup for new team members (Windows PowerShell)
+# One-command setup for Windows PowerShell
 $ErrorActionPreference = "Stop"
 
-Write-Host "==> Duka Scraper — team dev setup"
+Set-Location (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
+
+Write-Host "=================================================================="
+Write-Host " Duka Scraper - Team Setup"
+Write-Host "=================================================================="
 
 if (-not (Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
     Write-Host "Created .env from .env.example"
 }
 
-python -m venv .venv
-Write-Host "Installing dependencies into the virtual environment..."
-.\.venv\Scripts\pip.exe install -r requirements.txt
-
-Write-Host "Starting background infrastructure (Postgres, Redis, Kafka, Airflow, MinIO...)"
-docker compose up -d
+Write-Host ""
+Write-Host "[1/4] Building images (api + all workers)..."
+docker compose build
 
 Write-Host ""
-Write-Host "Setup complete."
-Write-Host "Run 'docker compose --profile workers up -d' to start the workers."
-Write-Host "To run the API locally with hot-reloading:"
-Write-Host "  uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
-Write-Host "(Or use 'make dev' if you have Make installed)"
+Write-Host "[2/4] Starting infrastructure (Postgres, Kafka, MinIO, Elasticsearch, ClickHouse, Redis)..."
+docker compose up -d postgres redis kafka elasticsearch clickhouse minio pgadmin kafka-ui kibana prometheus grafana
+
+Write-Host "Waiting for core databases to become healthy..."
+Start-Sleep -Seconds 15
+
 Write-Host ""
-Write-Host "The following services are running in Docker:"
-Write-Host "  Airflow UI:     http://localhost:8081"
-Write-Host "  Kafka UI:       http://localhost:8088"
-Write-Host "  MinIO console:  http://localhost:9001"
-Write-Host "  Kibana:         http://localhost:5601"
-Write-Host "  Grafana:        http://localhost:3000"
+Write-Host "[3/4] Creating Kafka topics (crawl.requests, crawl.raw, crawl.parsed, ...)..."
+docker compose up kafka-topics-init
+
 Write-Host ""
-Write-Host "Dark worker:      docker compose --profile dark up -d tor dark-worker"
-Write-Host "                  (set DARK_ENABLED=true and DARK_ALLOWED_DOMAINS in .env first)"
+Write-Host "[4/4] Starting API + surface/deep/parser/exporter workers..."
+docker compose up -d api surface-worker parser-worker deep-worker exporter-worker
+
+Write-Host ""
+Write-Host "=================================================================="
+Write-Host " Setup complete!"
+Write-Host "=================================================================="
+Write-Host ""
+Write-Host "PostgreSQL databases (duka_system, duka_db) were auto-created from"
+Write-Host "database/01_duka_system.sql and database/02_duka_db.sql on first boot."
+Write-Host ""
+Write-Host "Services:"
+Write-Host "  API (Swagger docs): http://localhost:8000/docs"
+Write-Host "  Kafka UI:            http://localhost:8088"
+Write-Host "  MinIO console:        http://localhost:9001   (minioadmin / minioadmin)"
+Write-Host "  pgAdmin:              http://localhost:5050   (admin@example.com / admin)"
+Write-Host "  Kibana:               http://localhost:5601"
+Write-Host "  Grafana:              http://localhost:3000"
+Write-Host "  Prometheus:           http://localhost:9090"
+Write-Host "  Kafka external port:  localhost:29092 (WSL/native clients)"
+Write-Host ""
+Write-Host "Try it: submit a crawl job"
+Write-Host '  curl -X POST http://localhost:8000/api/v1/jobs/trigger -H "Content-Type: application/json" -d ''{"url":"https://example.com","user_id":"USR12345"}'''
+Write-Host ""
+Write-Host "WSL usage: set APP_ENV=wsl before running API/workers natively in Ubuntu WSL."
+Write-Host ""
+Write-Host "Dark web worker (opt-in, disabled by default):"
+Write-Host "  1. Set DARK_ENABLED=true in .env"
+Write-Host "  2. docker compose --profile dark up -d tor dark-worker"
+Write-Host ""
+Write-Host "Check status: docker compose ps"
+Write-Host "View logs:    docker compose logs -f surface-worker parser-worker exporter-worker"

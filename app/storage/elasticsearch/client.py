@@ -1,3 +1,6 @@
+import asyncio
+from typing import Any
+
 from elasticsearch import AsyncElasticsearch
 
 from app.common.config.settings import settings
@@ -14,16 +17,79 @@ class ElasticsearchManager:
         es_url = getattr(settings, "ELASTICSEARCH_URL", "http://localhost:9200")
         self.client = AsyncElasticsearch(hosts=[es_url])
 
-    async def connect(self) -> None:
-        """Pings the Elasticsearch cluster to ensure it is healthy."""
-        try:
-            if await self.client.ping():
-                logger.info("Elasticsearch cluster connected successfully.")
-            else:
-                raise ConnectionError("Elasticsearch ping failed.")
-        except Exception as e:
-            logger.error(f"Elasticsearch Connection Error: {e}")
-            raise e
+    async def connect(self, retries: int = 10, delay_seconds: float = 2.0) -> None:
+        """Pings the Elasticsearch cluster until it is healthy."""
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                if await self.client.ping():
+                    logger.info("Elasticsearch cluster connected successfully.")
+                    return
+                last_error = ConnectionError("Elasticsearch ping failed.")
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Elasticsearch connection attempt %s/%s failed: %s", attempt, retries, exc)
+
+            if attempt < retries:
+                await asyncio.sleep(delay_seconds)
+
+        logger.error("Elasticsearch Connection Error: %s", last_error)
+        if last_error is not None:
+            raise last_error
+        raise ConnectionError("Elasticsearch connection failed.")
+
+    async def ensure_index(
+        self,
+        index_name: str,
+        mappings: dict[str, Any] | None = None,
+        retries: int = 10,
+        delay_seconds: float = 2.0,
+    ) -> None:
+        """Wait for Elasticsearch and create the target index if it is missing."""
+        await self.connect(retries=retries, delay_seconds=delay_seconds)
+
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                if await self.client.indices.exists(index=index_name):
+                    logger.info("Elasticsearch index '%s' is ready.", index_name)
+                    return
+
+                create_kwargs = {"index": index_name}
+                if mappings:
+                    create_kwargs["mappings"] = mappings
+                await self.client.indices.create(**create_kwargs)
+                logger.info("Created Elasticsearch index '%s'.", index_name)
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Elasticsearch index setup attempt %s/%s failed: %s", attempt, retries, exc)
+                if attempt < retries:
+                    await asyncio.sleep(delay_seconds)
+
+        logger.error("Failed to ensure Elasticsearch index '%s': %s", index_name, last_error)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Failed to ensure Elasticsearch index '{index_name}'")
+
+    async def ensure_articles_index(self) -> None:
+        """Create the shared parsed-articles index if it does not exist."""
+        await self.ensure_index(
+            "duka_articles",
+            mappings={
+                "properties": {
+                    "job_id": {"type": "keyword"},
+                    "url": {"type": "keyword"},
+                    "worker": {"type": "keyword"},
+                    "language": {"type": "keyword"},
+                    "character_count": {"type": "integer"},
+                    "extracted_text": {"type": "text"},
+                    "title": {"type": "text"},
+                    "publish_date": {"type": "date", "ignore_malformed": True},
+                    "status": {"type": "keyword"},
+                }
+            },
+        )
 
     async def close(self) -> None:
         """Closes the async connection pool."""

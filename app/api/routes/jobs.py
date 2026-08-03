@@ -3,12 +3,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
-from app.common.constants.worker_types import WorkerType
 from app.common.logger.logger import logger
-from app.crawler.worker_manager import WorkerManager
-from app.pipeline.producer.kafka_producer import kafka_producer
-from app.pipeline.schemas import CrawlRequest
-from app.pipeline.topics import topics
+from app.pipeline.main import submit_crawl_job
 from app.storage.postgres.client import pg_client
 
 router = APIRouter()
@@ -31,7 +27,7 @@ class ScrapeRequest(BaseModel):
         False,
         description="Set to true if the page is behind a login (routes to deep-worker).",
     )
-    worker_override: WorkerType | None = Field(
+    worker_override: str | None = Field(
         None,
         description="Explicitly specify a worker, bypassing routing rules.",
     )
@@ -43,47 +39,19 @@ class ScrapeRequest(BaseModel):
 
 @router.post("/trigger", status_code=202, response_model=dict)
 async def trigger_scrape_job(request: ScrapeRequest):
-    """
-    Persists a new job row in PostgreSQL (duka_system.jobs), then publishes
-    a CrawlRequest event to Kafka using the DB-generated job_id.
-    """
+    """Persist a new job row and publish the matching CrawlRequest."""
     try:
-        # Use the WorkerManager to determine the correct worker type
-        routing_details = request.model_dump()
-        routing_details["url"] = str(request.url)  # WorkerManager expects a string URL
-        if request.worker_override:
-            routing_details["worker"] = request.worker_override.value
-
-        worker_type = WorkerManager.route(job=routing_details)
-
-        # 1. Persist job in PostgreSQL first -> get the real, DB-generated job_id (e.g. JOB00000001)
-        job_row = await pg_client.create_job(
+        result = await submit_crawl_job(
             user_id=request.user_id,
             url=str(request.url),
-            worker_type=worker_type.value,
             language=request.language,
-        )
-        job_id = job_row["job_id"]
-
-        # 2. Construct the event payload using the official CrawlRequest schema
-        job_event = CrawlRequest(
-            job_id=job_id,
-            url=str(request.url),
-            worker_type=worker_type.value,
-            language=request.language,
+            render_js=request.render_js,
+            requires_auth=request.requires_auth,
+            worker_override=request.worker_override,
             job_params=request.job_params,
         )
-
-        # 3. Publish the job to the correct Kafka topic for workers to consume
-        await kafka_producer.publish_crawl_request(request=job_event)
-
-        logger.info(f"Triggered job {job_id} for URL: {request.url} -> worker: {worker_type.value}")
-        return {
-            "message": "Scraping job submitted successfully",
-            "job_id": job_id,
-            "assigned_worker": worker_type.value,
-            "kafka_topic": topics.CRAWL_REQUESTS,
-        }
+        logger.info("Triggered job %s for URL: %s -> worker: %s", result["job_id"], request.url, result["assigned_worker"])
+        return result
 
     except Exception as e:
         logger.error(f"Failed to submit scrape job: {e}", exc_info=True)

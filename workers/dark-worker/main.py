@@ -1,10 +1,15 @@
 import asyncio
+import io
 import json
 import logging
 import os
+import signal
+from urllib.parse import urlparse
 import sys
 
-from aiokafka import AIOKafkaConsumer
+import httpx
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from minio import Minio
 from pydantic import ValidationError
 
 # --- Path Setup ---
@@ -16,7 +21,7 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
-from app.pipeline.schemas import CrawlRequest
+from app.pipeline.schemas import CrawlRequest, CrawlResult
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -28,7 +33,140 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 KAFKA_BOOTSTRAP_SERVERS = settings.KAFKA_BOOTSTRAP_SERVERS
 CONSUME_TOPIC = settings.crawl_request_topic
+PRODUCE_TOPIC = settings.crawl_raw_topic
 WORKER_TYPE = "dark"
+TOR_PROXY_URL = settings.tor_proxy_url  # e.g. socks5://tor:9050
+
+# --- MinIO Setup ---
+BUCKET_NAME = settings.MINIO_RAW_BUCKET
+
+minio_client = Minio(
+    settings.MINIO_ENDPOINT,
+    access_key=settings.MINIO_ROOT_USER,
+    secret_key=settings.MINIO_ROOT_PASSWORD,
+    secure=settings.MINIO_SECURE,
+)
+
+MAX_CONCURRENT_TASKS = 10  # Tor is slower/more fragile than clearnet - keep this low
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,am;q=0.8",
+}
+
+
+def _upload_to_minio_sync(job_id: str, payload_bytes: bytes):
+    """Synchronously uploads scraped raw payload to MinIO in a thread worker."""
+    try:
+        if not minio_client.bucket_exists(BUCKET_NAME):
+            minio_client.make_bucket(BUCKET_NAME)
+
+        filename = f"crawl_{job_id}.json"
+        minio_client.put_object(
+            bucket_name=BUCKET_NAME,
+            object_name=filename,
+            data=io.BytesIO(payload_bytes),
+            length=len(payload_bytes),
+            content_type="application/json",
+        )
+        logger.info(f"Saved {filename} to MinIO bucket '{BUCKET_NAME}'")
+    except Exception as e:
+        logger.error(f"Failed to upload {job_id} to MinIO: {e}")
+
+
+async def save_to_minio(job_id: str, payload_bytes: bytes):
+    """Async wrapper to prevent blocking the event loop during MinIO uploads."""
+    await asyncio.to_thread(_upload_to_minio_sync, job_id, payload_bytes)
+
+
+async def process_request(producer: AIOKafkaProducer, message_value: bytes):
+    """Processes a single incoming crawl request from Kafka, routed through the Tor SOCKS5 proxy."""
+    try:
+        data = json.loads(message_value)
+        request = CrawlRequest(**data)
+
+        if request.worker_type != WORKER_TYPE:
+            return
+
+        if not settings.dark_enabled:
+            logger.warning(f"Dark worker received job {request.job_id} but dark_enabled=False. Skipping.")
+            return
+
+        hostname = (urlparse(request.url).hostname or "").lower()
+        if not hostname.endswith(".onion"):
+            logger.warning(f"Dark worker skipping non-.onion URL for job {request.job_id}: {request.url}")
+            return
+
+        logger.info(f"Processing job {request.job_id} [{request.language}] for .onion URL: {request.url}")
+
+        async with httpx.AsyncClient(
+            proxy=TOR_PROXY_URL,
+            headers=DEFAULT_HEADERS,
+            follow_redirects=True,
+            timeout=settings.dark_timeout_seconds,
+        ) as client:
+            try:
+                response = await client.get(request.url)
+                response.raise_for_status()
+
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=str(response.url),
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html=response.text,
+                    status_code=response.status_code,
+                    network="dark",
+                )
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"HTTP error {e.response.status_code} for {request.url} via Tor")
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=str(e.request.url),
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html=e.response.text if e.response is not None else "",
+                    status_code=e.response.status_code,
+                    network="dark",
+                )
+            except httpx.RequestError as e:
+                logger.warning(f"Request error for {request.url} via Tor: {e}")
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=request.url,
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html="",
+                    status_code=599,
+                    network="dark",
+                )
+
+        payload_bytes = result.model_dump_json().encode("utf-8")
+
+        # 1. Save directly to MinIO
+        await save_to_minio(request.job_id, payload_bytes)
+
+        # 2. Publish output to downstream raw Kafka topic
+        await producer.send_and_wait(
+            PRODUCE_TOPIC,
+            value=payload_bytes,
+            key=request.job_id.encode("utf-8"),
+        )
+        logger.info(f"Published raw result for {request.url}")
+
+    except ValidationError as e:
+        logger.error(f"Invalid message format: {e}")
+    except json.JSONDecodeError:
+        logger.error(f"Malformed JSON in Kafka message: {message_value[:200]}")
+    except Exception as e:
+        logger.error(f"Unexpected error processing job: {e}", exc_info=True)
+
+
+async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes):
+    """Enforces concurrency limits using asyncio.Semaphore."""
+    async with semaphore:
+        await process_request(producer, message_value)
 
 
 async def main():
@@ -39,26 +177,40 @@ async def main():
         group_id=f"{WORKER_TYPE}-group",
         auto_offset_reset="earliest",
     )
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
+    await producer.start()
     await consumer.start()
-    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}'.")
+    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' (Tor proxy: {TOR_PROXY_URL}).")
+
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task()
+
+    def _stop() -> None:
+        if current_task:
+            current_task.cancel()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                loop.add_signal_handler(sig, _stop)
+            except NotImplementedError:
+                pass
 
     try:
         async for msg in consumer:
-            try:
-                request = CrawlRequest(**json.loads(msg.value))
-                if request.worker_type == WORKER_TYPE:
-                    logger.info(f"Received job {request.job_id} for URL: {request.url}")
-                    # TODO: Implement Tor-proxied scraping logic here
-            except (ValidationError, json.JSONDecodeError) as e:
-                logger.warning(f"Skipping invalid message: {e}")
-
-    except Exception as e:
-        logger.critical(f"Fatal error in consumer loop: {e}", exc_info=True)
+            asyncio.create_task(process_message_safely(producer, msg.value))
+    except asyncio.CancelledError:
+        logger.info("Dark worker cancellation requested.")
     finally:
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()
+        await producer.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Worker execution interrupted by user.")

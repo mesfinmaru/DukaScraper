@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import signal
 import sys
 
 import httpx
@@ -46,6 +47,13 @@ minio_client = Minio(
 
 MAX_CONCURRENT_TASKS = 50
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,am;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
 # --- Rule-Based Proxy Manager ---
@@ -131,9 +139,9 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         # Use a dynamic client or pass proxy per request to ensure thread safety
         async with httpx.AsyncClient(
             proxy=proxy_url,
-            headers={"User-Agent": "DukaScraper/1.0 (SurfaceWorker; compatible;)"},
+            headers=DEFAULT_HEADERS,
             follow_redirects=True,
-            timeout=30.0,
+            timeout=settings.http_timeout_seconds,
         ) as client:
             try:
                 response = await client.get(request.url)
@@ -155,8 +163,19 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
                     url=str(e.request.url),
                     worker=WORKER_TYPE,
                     language=request.language,
-                    html="",
+                    html=e.response.text if e.response is not None else "",
                     status_code=e.response.status_code,
+                    network="surface",
+                )
+            except httpx.RequestError as e:
+                logger.warning(f"Request error for {request.url}: {e}")
+                result = CrawlResult(
+                    source_job_id=request.job_id,
+                    url=request.url,
+                    worker=WORKER_TYPE,
+                    language=request.language,
+                    html="",
+                    status_code=599,
                     network="surface",
                 )
 
@@ -201,9 +220,26 @@ async def main():
     await consumer.start()
     logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' with rule-based proxy routing.")
 
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task()
+
+    def _stop() -> None:
+        if current_task:
+            current_task.cancel()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                loop.add_signal_handler(sig, _stop)
+            except NotImplementedError:
+                pass
+
     try:
         async for msg in consumer:
             asyncio.create_task(process_message_safely(producer, msg.value))
+    except asyncio.CancelledError:
+        logger.info("Surface worker cancellation requested.")
     finally:
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()

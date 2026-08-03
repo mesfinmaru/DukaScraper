@@ -1,14 +1,21 @@
 import asyncio
+import csv
+import gzip
 import io
 import json
 import logging
 import os
+import signal
 import sys
+from collections.abc import Sequence
+from datetime import datetime, timezone
+from typing import Any
 
 import clickhouse_connect
 from aiokafka import AIOKafkaConsumer
 from elasticsearch import AsyncElasticsearch
 from minio import Minio
+from pydantic import ValidationError
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -30,12 +37,10 @@ logger = logging.getLogger(__name__)
 # --- Configuration & Clients ---
 KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
 KAFKA_INPUT_TOPIC = topics.CRAWL_PARSED
+EXPORTS_BUCKET = "duka-exports"
 
-# Elasticsearch
-es_client = AsyncElasticsearch(hosts=[settings.ELASTICSEARCH_URL])
 ES_INDEX = "duka_articles"
 
-# MinIO (for parsed JSON archival, matches parser-worker's bucket)
 minio_client = Minio(
     settings.MINIO_ENDPOINT,
     access_key=settings.MINIO_ROOT_USER,
@@ -43,20 +48,30 @@ minio_client = Minio(
     secure=settings.MINIO_SECURE,
 )
 
-# ClickHouse
-ch_client = None  # Lazy init, set in init_databases()
+es_client = AsyncElasticsearch(hosts=[settings.ELASTICSEARCH_URL])
+ch_client = None
+
+
+def _minio_put_object_sync(bucket_name: str, object_name: str, payload_bytes: bytes, content_type: str):
+    if not minio_client.bucket_exists(bucket_name):
+        minio_client.make_bucket(bucket_name)
+    minio_client.put_object(
+        bucket_name=bucket_name,
+        object_name=object_name,
+        data=io.BytesIO(payload_bytes),
+        length=len(payload_bytes),
+        content_type=content_type,
+    )
+
+
+async def upload_bytes_to_minio(bucket_name: str, object_name: str, payload_bytes: bytes, content_type: str):
+    await asyncio.to_thread(_minio_put_object_sync, bucket_name, object_name, payload_bytes, content_type)
 
 
 async def init_databases():
-    """Initializes ClickHouse table and PostgreSQL connections. PostgreSQL
-    schema (duka_system, duka_db) is NOT modified here - only connected to;
-    it is created ahead of time via database/01_duka_system.sql and
-    database/02_duka_db.sql."""
     global ch_client
 
     logger.info(f"Attempting ClickHouse connection to {settings.CLICKHOUSE_HOST}:{settings.CLICKHOUSE_HTTP_PORT}")
-
-    # Initialize ClickHouse with retries
     for attempt in range(5):
         try:
             ch_client = clickhouse_connect.get_client(
@@ -74,12 +89,11 @@ async def init_databases():
             if attempt < 4:
                 await asyncio.sleep(2)
             else:
-                logger.error("Failed to connect to ClickHouse after 5 attempts")
                 raise
 
-    # ClickHouse analytics table (time-series metrics only, no full text)
     try:
-        ch_client.command("""
+        ch_client.command(
+            """
             CREATE TABLE IF NOT EXISTS duka_analytics (
                 job_id String,
                 url String,
@@ -88,107 +102,203 @@ async def init_databases():
                 character_count Int32,
                 created_at DateTime DEFAULT now()
             ) ENGINE = MergeTree() ORDER BY job_id;
-        """)
+            """
+        )
         logger.info("ClickHouse table 'duka_analytics' verified/created.")
     except Exception as e:
         logger.error(f"Failed to initialize ClickHouse table: {e}")
 
-    # PostgreSQL - connect using the existing pg_client (duka_system + duka_db)
+    await pg_client.connect()
+    logger.info("PostgreSQL connections established (duka_system + duka_db).")
+
     try:
-        await pg_client.connect()
-        logger.info("PostgreSQL connections established (duka_system + duka_db).")
+        if not await es_client.indices.exists(index=ES_INDEX):
+            await es_client.indices.create(
+                index=ES_INDEX,
+                mappings={
+                    "properties": {
+                        "job_id": {"type": "keyword"},
+                        "url": {"type": "keyword"},
+                        "worker": {"type": "keyword"},
+                        "language": {"type": "keyword"},
+                        "character_count": {"type": "integer"},
+                        "extracted_text": {"type": "text"},
+                        "title": {"type": "text"},
+                        "publish_date": {"type": "date", "ignore_malformed": True},
+                        "status": {"type": "keyword"},
+                    }
+                },
+            )
+            logger.info(f"Created Elasticsearch index '{ES_INDEX}'.")
     except Exception as e:
-        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        logger.error(f"Failed to ensure Elasticsearch index '{ES_INDEX}': {e}")
 
 
-def _upload_parsed_json_sync(object_name: str, payload_bytes: bytes) -> str:
-    """Uploads the parsed JSON to MinIO's parsed-data bucket. Returns the object path."""
-    bucket = settings.MINIO_PARSED_BUCKET
-    if not minio_client.bucket_exists(bucket):
-        minio_client.make_bucket(bucket)
-
-    minio_client.put_object(
-        bucket_name=bucket,
-        object_name=object_name,
-        data=io.BytesIO(payload_bytes),
-        length=len(payload_bytes),
-        content_type="application/json",
-    )
-    return f"s3://{bucket}/{object_name}"
-
-
-async def export_to_all_sinks(parsed_item: ParsedItem):
-    """
-    Fan-out a single ParsedItem to all storage sinks with ZERO field
-    duplication across systems:
-      - PostgreSQL (duka_db.parsed_items): metadata + MinIO path references only
-      - MinIO (duka-parsed-data):          the actual extracted text (JSON)
-      - Elasticsearch (duka_articles):     full-text search index
-      - ClickHouse (duka_analytics):       time-series performance metrics only
-    """
-    job_id = parsed_item.source_job_id
-    url = parsed_item.url
-    worker = parsed_item.worker
-    language = parsed_item.language
+def _normalize_item_data(parsed_item: ParsedItem) -> dict[str, Any]:
     data = parsed_item.data if isinstance(parsed_item.data, dict) else parsed_item.data.model_dump()
-    char_count = data.get("character_count", 0)
-    text = data.get("extracted_text", "")
+    return {
+        "job_id": parsed_item.source_job_id,
+        "url": parsed_item.url,
+        "worker": parsed_item.worker,
+        "language": parsed_item.language,
+        "status": parsed_item.status,
+        "parse_duration": parsed_item.parse_duration,
+        "character_count": int(data.get("character_count", 0) or 0),
+        "extracted_text": data.get("extracted_text", "") or "",
+        "title": data.get("title"),
+        "publish_date": data.get("publish_date"),
+        "original_status_code": int(data.get("original_status_code", 0) or 0),
+    }
 
-    logger.info(f"Exporting Job ID: {job_id} [{language}] -> MinIO, Postgres, Elasticsearch & ClickHouse...")
 
-    # 1. MinIO: persist the parsed JSON payload (source of truth for full text)
-    parsed_json_path = None
+async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
+    data = _normalize_item_data(parsed_item)
+    job_id = data["job_id"]
+
+    parsed_payload = parsed_item.model_dump()
+    parsed_payload["data"] = data
+    payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
+    parsed_json_path = f"s3://{settings.MINIO_PARSED_BUCKET}/{job_id}.json"
+    raw_html_path = f"s3://{settings.MINIO_RAW_BUCKET}/crawl_{job_id}.json"
+
+    await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, f"{job_id}.json", payload_bytes, "application/json")
+    logger.info(f"Saved parsed JSON for {job_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
+
     try:
-        object_name = f"{job_id}/parsed.json"
-        payload_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        parsed_json_path = _upload_parsed_json_sync(object_name, payload_bytes)
-        logger.info(f"Saved parsed JSON to {parsed_json_path}")
-    except Exception as e:
-        logger.error(f"MinIO Export Error [{job_id}]: {e}")
-
-    # 2. Elasticsearch: index full text for search
-    try:
-        doc = {
-            "job_id": job_id,
-            "url": url,
-            "worker": worker,
-            "language": language,
-            "character_count": char_count,
-            "extracted_text": text,
-        }
-        await es_client.index(index=ES_INDEX, id=job_id, document=doc)
+        await es_client.index(
+            index=ES_INDEX,
+            id=job_id,
+            document={
+                "job_id": job_id,
+                "url": data["url"],
+                "worker": data["worker"],
+                "language": data["language"],
+                "character_count": data["character_count"],
+                "extracted_text": data["extracted_text"],
+                "title": data["title"],
+                "publish_date": data["publish_date"],
+                "status": data["status"],
+            },
+        )
         logger.info(f"Indexed {job_id} into Elasticsearch")
     except Exception as e:
         logger.error(f"Elasticsearch Export Error [{job_id}]: {e}")
 
-    # 3. PostgreSQL (duka_db.parsed_items): metadata + path references ONLY (no full text)
     try:
-        raw_html_path = f"s3://{settings.MINIO_RAW_BUCKET}/crawl_{job_id}.json"
-        await pg_client.create_parsed_item(
+        record = await pg_client.create_parsed_item(
             job_id=job_id,
-            source_url=url,
+            source_url=data["url"],
             raw_html_path=raw_html_path,
-            parsed_json_path=parsed_json_path or "",
-            language=language,
-            character_count=char_count,
-            word_count=len(text.split()) if text else 0,
+            parsed_json_path=parsed_json_path,
+            language=data["language"],
+            title=data["title"],
+            publish_date=data["publish_date"],
+            character_count=data["character_count"],
+            word_count=len(data["extracted_text"].split()) if data["extracted_text"] else 0,
         )
+        if record and record.get("item_id"):
+            await pg_client.mark_item_exported(record["item_id"])
         logger.info(f"Inserted metadata for {job_id} into duka_db.parsed_items")
     except Exception as e:
         logger.error(f"PostgreSQL Export Error [{job_id}]: {e}")
 
-    # 4. ClickHouse: metrics only (no full text, no duplication)
     try:
-        ch_client.insert(
+        await asyncio.to_thread(
+            ch_client.insert,
             "duka_analytics",
-            [[job_id, url, worker, language, char_count]],
+            [[job_id, data["url"], data["worker"], data["language"], data["character_count"]]],
             column_names=["job_id", "url", "worker", "language", "character_count"],
         )
         logger.info(f"Inserted metrics for {job_id} into ClickHouse")
     except Exception as e:
         logger.error(f"ClickHouse Export Error [{job_id}]: {e}")
 
-    logger.info(f"Successfully exported {job_id} across all data sinks!")
+    return data
+
+
+def _batch_to_csv_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
+    buffer = io.StringIO()
+    fieldnames = ["job_id", "url", "worker", "language", "character_count", "status", "title", "publish_date", "extracted_text"]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for item in batch:
+        writer.writerow({name: item.get(name) for name in fieldnames})
+    return buffer.getvalue().encode("utf-8")
+
+
+def _batch_to_json_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
+    return json.dumps(list(batch), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+class BatchExportManager:
+    def __init__(self, batch_size: int, flush_interval_seconds: int):
+        self.batch_size = batch_size
+        self.flush_interval_seconds = flush_interval_seconds
+        self._buffer: list[dict[str, Any]] = []
+        self._lock = asyncio.Lock()
+
+    async def add(self, item: dict[str, Any]):
+        should_flush = False
+        async with self._lock:
+            self._buffer.append(item)
+            should_flush = len(self._buffer) >= self.batch_size
+        if should_flush:
+            await self.flush()
+
+    async def flush(self):
+        async with self._lock:
+            if not self._buffer:
+                return
+            batch = self._buffer
+            self._buffer = []
+
+        await self._export_batch(batch)
+
+    async def periodic_flush(self, stop_event: asyncio.Event):
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.flush_interval_seconds)
+            except asyncio.TimeoutError:
+                await self.flush()
+        await self.flush()
+
+    async def _export_batch(self, batch: list[dict[str, Any]]):
+        batch_job_id = batch[0]["job_id"]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        for export_type in ("csv", "json"):
+            export_row = None
+            export_id = None
+            try:
+                export_row = await pg_client.create_export(
+                    job_id=batch_job_id,
+                    export_type=export_type,
+                    file_path="",
+                    item_count=len(batch),
+                )
+                export_id = export_row["export_id"]
+                if export_type == "csv":
+                    raw_bytes = _batch_to_csv_bytes(batch)
+                    object_name = f"{export_id}/{batch_job_id}_{timestamp}.csv.gz"
+                    content_type = "text/csv"
+                else:
+                    raw_bytes = _batch_to_json_bytes(batch)
+                    object_name = f"{export_id}/{batch_job_id}_{timestamp}.json.gz"
+                    content_type = "application/json"
+
+                gzipped_bytes = gzip.compress(raw_bytes)
+                await upload_bytes_to_minio(EXPORTS_BUCKET, object_name, gzipped_bytes, content_type)
+                file_path = f"s3://{EXPORTS_BUCKET}/{object_name}"
+                await pg_client.update_export_file_path(export_id, file_path)
+                await pg_client.update_export_status(export_id, "completed", round(len(gzipped_bytes) / (1024 * 1024), 2))
+                logger.info(f"Exported batch {export_id} ({export_type}) with {len(batch)} items")
+            except Exception as e:
+                logger.error(f"Batch export failure for {export_type} export: {e}", exc_info=True)
+                if export_id:
+                    try:
+                        await pg_client.update_export_status(export_id, "failed")
+                    except Exception:
+                        logger.exception("Failed to mark export as failed")
 
 
 async def consume_and_export():
@@ -203,23 +313,53 @@ async def consume_and_export():
         auto_offset_reset="earliest",
         group_id="exporter-group",
     )
-
     await consumer.start()
     logger.info(f"Multi-Sink Exporter Worker is online, listening on '{KAFKA_INPUT_TOPIC}'...")
+
+    stop_event = asyncio.Event()
+    batch_manager = BatchExportManager(settings.export_batch_size, settings.export_flush_interval_seconds)
+    flush_task = asyncio.create_task(batch_manager.periodic_flush(stop_event))
+
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task()
+
+    def _stop() -> None:
+        stop_event.set()
+        if current_task:
+            current_task.cancel()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                loop.add_signal_handler(sig, _stop)
+            except NotImplementedError:
+                pass
 
     try:
         async for message in consumer:
             try:
                 parsed_item = ParsedItem(**json.loads(message.value.decode("utf-8")))
-                await export_to_all_sinks(parsed_item)
+                normalized = await store_single_item(parsed_item)
+                await batch_manager.add(normalized)
             except json.JSONDecodeError:
                 logger.warning("Failed to decode message package. Skipping invalid JSON format.")
+            except ValidationError as e:
+                logger.warning(f"Skipping invalid parsed item payload: {e}")
             except Exception as item_err:
                 logger.error(f"Error handling individual export record: {item_err}", exc_info=True)
-
+    except asyncio.CancelledError:
+        logger.info("Exporter worker cancellation requested.")
     except Exception as e:
         logger.critical(f"Fatal error in exporter consumer loop: {e}", exc_info=True)
     finally:
+        stop_event.set()
+        flush_task.cancel()
+        try:
+            await flush_task
+        except Exception:
+            pass
+        await batch_manager.flush()
         logger.info("Shutting down exporter worker...")
         await consumer.stop()
         await es_client.close()

@@ -194,6 +194,15 @@ The system is divided into two primary flows: the **Write/Crawl Pipeline** (left
     *   FastAPI generates a short-lived, pre-signed URL for the requested object in **MinIO** and returns it to the client.
     *   The user's browser downloads the file directly and securely from MinIO using the pre-signed URL.
 
+## Section 12. Docker + WSL Connectivity
+
+This project is configured so Docker containers handle the primary pipeline while an Ubuntu WSL shell can connect as a second client node.
+
+*   Containers continue to use Docker DNS names: `kafka:9092`, `postgres:5432`, `minio:9000`, `elasticsearch:9200`, `clickhouse:8123`.
+*   Native WSL processes should use the host-facing ports published by Compose: `localhost:29092` for Kafka, `localhost:5432` for PostgreSQL, `localhost:9000` for MinIO, `localhost:9200` for Elasticsearch, `localhost:8123` for ClickHouse, and `localhost:6379` for Redis.
+*   Set `APP_ENV=wsl` in the WSL shell before starting the API or workers natively. The shared settings module switches those clients to the host-facing ports.
+*   Kafka now advertises both an internal listener for containers and an external listener for WSL/native clients, so the same topics can be consumed from either environment.
+
 
 
 

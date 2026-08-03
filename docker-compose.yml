@@ -50,35 +50,20 @@ services:
     depends_on:
       - postgres
 
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - duka-net
-    restart: always
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   kafka:
     image: apache/kafka:3.9.1
     container_name: kafka
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: 'broker,controller'
-      KAFKA_LISTENERS: 'PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://kafka:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092'
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT'
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -203,26 +188,6 @@ services:
       timeout: 5s
       retries: 5
 
-  minio-init:
-    image: minio/mc
-    container_name: minio-init
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        echo "Waiting for Minio..."
-        until mc alias set minio http://minio:9000 minioadmin minioadmin; do
-          sleep 2;
-        done
-        mc mb minio/duka-raw-data --ignore-existing
-        mc mb minio/duka-parsed-data --ignore-existing
-        mc mb minio/duka-exports --ignore-existing
-        echo "MinIO buckets initialized successfully."
-    networks:
-      - duka-net
-
   api:
     build:
       context: .
@@ -236,6 +201,8 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - duka-net
     depends_on:
@@ -257,6 +224,8 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - duka-net
     depends_on:
@@ -276,6 +245,8 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - duka-net
     depends_on:
@@ -295,11 +266,47 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - duka-net
     depends_on:
       kafka:
         condition: service_healthy
+
+  tor:
+    image: dperson/torproxy:latest
+    container_name: tor
+    profiles: ["dark"]
+    ports:
+      - "9050:9050"
+    networks:
+      - duka-net
+    restart: always
+
+  dark-worker:
+    build:
+      context: .
+      dockerfile: workers/dark-worker/Dockerfile
+    container_name: dark-worker
+    profiles: ["dark"]
+    restart: on-failure:5
+    environment:
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      tor:
+        condition: service_started
 
   exporter-worker:
     build:
@@ -312,6 +319,8 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - duka-net
     depends_on:
