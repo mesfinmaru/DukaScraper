@@ -3,12 +3,11 @@ import json
 import logging
 import os
 import sys
-import signal
 
-from aiokafka import AIOKafkaConsumer
-from elasticsearch import AsyncElasticsearch
 import asyncpg
 import clickhouse_connect
+from aiokafka import AIOKafkaConsumer
+from elasticsearch import AsyncElasticsearch
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -36,7 +35,12 @@ es_client = AsyncElasticsearch(hosts=[ES_HOST])
 
 # PostgreSQL - Fix for [REDACTED] placeholder
 RAW_DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@postgres:5432/duka"
-DATABASE_URL = RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://").replace("postgres+asyncpg://", "postgresql://").replace("localhost", "postgres").replace("[REDACTED]", "postgres")
+DATABASE_URL = (
+    RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    .replace("postgres+asyncpg://", "postgresql://")
+    .replace("localhost", "postgres")
+    .replace("[REDACTED]", "postgres")
+)
 logger.info(f"PostgreSQL URL: {DATABASE_URL}")
 
 # ClickHouse
@@ -50,13 +54,20 @@ ch_client = None  # Lazy init
 async def init_databases():
     """Initializes tables/indices across all databases if they don't already exist."""
     global ch_client
-    
+
     logger.info(f"Attempting ClickHouse connection to {CH_HOST}:{CH_PORT}")
-    
+
     # Initialize ClickHouse with retries
     for attempt in range(5):
         try:
-            ch_client = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASSWORD or "", secure=False, verify=False)
+            ch_client = clickhouse_connect.get_client(
+                host=CH_HOST,
+                port=CH_PORT,
+                username=CH_USER,
+                password=CH_PASSWORD or "",
+                secure=False,
+                verify=False,
+            )
             logger.info(f"ClickHouse connected on attempt {attempt + 1}")
             break
         except Exception as e:
@@ -64,7 +75,7 @@ async def init_databases():
             if attempt < 4:
                 await asyncio.sleep(2)
             else:
-                logger.error(f"Failed to connect to ClickHouse after 5 attempts")
+                logger.error("Failed to connect to ClickHouse after 5 attempts")
                 raise
 
     # 1. PostgreSQL Table Init
@@ -131,7 +142,8 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
     # 2. PostgreSQL Insertion
     try:
         conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO parsed_items (source_job_id, url, worker, language, character_count, extracted_text)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (source_job_id) DO UPDATE 
@@ -140,7 +152,14 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
                 language = EXCLUDED.language, 
                 character_count = EXCLUDED.character_count, 
                 extracted_text = EXCLUDED.extracted_text;
-        """, job_id, url, worker, language, char_count, text)
+        """,
+            job_id,
+            url,
+            worker,
+            language,
+            char_count,
+            text,
+        )
         await conn.close()
         logger.info(f"Successfully inserted {job_id} into PostgreSQL")
     except Exception as e:
@@ -149,9 +168,16 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
     # 3. ClickHouse Insertion
     try:
         ch_client.insert(
-            'duka_analytics',
+            "duka_analytics",
             [[job_id, url, worker, language, char_count, text]],
-            column_names=['job_id', 'url', 'worker', 'language', 'character_count', 'extracted_text']
+            column_names=[
+                "job_id",
+                "url",
+                "worker",
+                "language",
+                "character_count",
+                "extracted_text",
+            ],
         )
         logger.info(f"Successfully inserted {job_id} into ClickHouse")
     except Exception as e:
@@ -163,29 +189,29 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
 async def consume_and_export():
     logger.info("Waiting 20 seconds for Kafka to be fully ready...")
     await asyncio.sleep(20)
-    
+
     await init_databases()
-    
+
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BROKERS,
-        auto_offset_reset='earliest',
-        group_id='exporter-group'
+        auto_offset_reset="earliest",
+        group_id="exporter-group",
     )
-    
+
     await consumer.start()
     logger.info("Multi-Sink Exporter Worker is online and listening for parsed items...")
-    
+
     try:
         async for message in consumer:
             try:
-                parsed_item = ParsedItem(**json.loads(message.value.decode('utf-8')))
+                parsed_item = ParsedItem(**json.loads(message.value.decode("utf-8")))
                 await export_to_all_sinks(parsed_item)
             except json.JSONDecodeError:
                 logger.warning("Failed to decode message package. Skipping invalid JSON format.")
             except Exception as item_err:
                 logger.error(f"Error handling individual export record: {item_err}", exc_info=True)
-                
+
     except Exception as e:
         logger.critical(f"Fatal error in exporter consumer loop: {e}", exc_info=True)
     finally:

@@ -1,11 +1,14 @@
 import asyncio
-import redis
+
 import asyncpg
 import clickhouse_connect
-from kafka import KafkaProducer
+import redis
 from elasticsearch import Elasticsearch
+from kafka import KafkaProducer
 from minio import Minio
+
 from app.common.config.settings import settings
+
 
 async def test_postgres():
     try:
@@ -16,6 +19,7 @@ async def test_postgres():
     except Exception as e:
         print(f"❌ PostgreSQL Failed: {e}")
 
+
 def test_clickhouse():
     try:
         client = clickhouse_connect.get_client(
@@ -23,13 +27,14 @@ def test_clickhouse():
             port=settings.CLICKHOUSE_HTTP_PORT,
             user=settings.CLICKHOUSE_USER,
             password=settings.CLICKHOUSE_PASSWORD,
-            database=settings.CLICKHOUSE_DB
+            database=settings.CLICKHOUSE_DB,
         )
         client.ping()
         print("✅ ClickHouse: Connected Successfully!")
         client.close()
     except Exception as e:
         print(f"❌ ClickHouse Failed: {e}")
+
 
 def test_redis():
     try:
@@ -39,6 +44,7 @@ def test_redis():
     except Exception as e:
         print(f"❌ Redis Failed: {e}")
 
+
 def test_kafka():
     try:
         producer = KafkaProducer(bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS)
@@ -46,6 +52,7 @@ def test_kafka():
         print("✅ Kafka: Connected Successfully!")
     except Exception as e:
         print(f"❌ Kafka Failed: {e}")
+
 
 def test_elasticsearch():
     try:
@@ -55,19 +62,21 @@ def test_elasticsearch():
     except Exception as e:
         print(f"❌ Elasticsearch Failed: {e}")
 
+
 def test_minio():
     try:
         client = Minio(
             settings.MINIO_ENDPOINT,
             access_key=settings.MINIO_ACCESS_KEY,
             secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE
+            secure=settings.MINIO_SECURE,
         )
         # List buckets to verify connection and permissions
         buckets = client.list_buckets()
         print(f"✅ MinIO: Connected Successfully! Found {len(buckets)} buckets.")
     except Exception as e:
         print(f"❌ MinIO Failed: {e}")
+
 
 if __name__ == "__main__":
     print("🔍 Running full infrastructure check...\n")

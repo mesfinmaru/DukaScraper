@@ -1,12 +1,13 @@
-from datetime import datetime, timedelta
 import json
 import os
+from datetime import datetime, timedelta
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from app.schemas.scraper import CrawlRequest
 from kafka import KafkaProducer
 
 from app.common.config.settings import settings
-from app.schemas.scraper import CrawlRequest
 
 default_args = {
     "owner": "airflow",
@@ -15,6 +16,7 @@ default_args = {
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
+
 
 def load_and_dispatch_targets(**context):
     """Reads crawl targets from JSON and dispatches them to Kafka as CrawlRequests."""
@@ -25,7 +27,7 @@ def load_and_dispatch_targets(**context):
         raise FileNotFoundError(f"Could not find crawl targets file at: {json_path}")
 
     # Using utf-8-sig to handle any BOM automatically
-    with open(json_path, "r", encoding="utf-8-sig") as f:
+    with open(json_path, encoding="utf-8-sig") as f:
         targets = json.load(f)
 
     producer = KafkaProducer(
@@ -44,11 +46,7 @@ def load_and_dispatch_targets(**context):
             job_params=target.get("job_params", {}),
         )
 
-        payload_dict = (
-            request_payload.model_dump()
-            if hasattr(request_payload, "model_dump")
-            else request_payload.dict()
-        )
+        payload_dict = request_payload.model_dump() if hasattr(request_payload, "model_dump") else request_payload.dict()
 
         producer.send(settings.crawl_request_topic, payload_dict)
         dispatched_count += 1
@@ -56,6 +54,7 @@ def load_and_dispatch_targets(**context):
 
     producer.flush()
     print(f"✅ Successfully dispatched {dispatched_count} crawl targets to Kafka topic '{settings.crawl_request_topic}'.")
+
 
 with DAG(
     "duka_dynamic_crawl_pipeline",
@@ -65,7 +64,6 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     catchup=False,
 ) as dag:
-
     dispatch_targets_task = PythonOperator(
         task_id="dispatch_json_crawl_targets",
         python_callable=load_and_dispatch_targets,

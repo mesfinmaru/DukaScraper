@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer
 from pydantic import ValidationError
 
 # --- Path Setup ---
@@ -16,7 +16,7 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
-from app.pipeline.schemas import CrawlRequest, ParsedItem
+from app.pipeline.schemas import CrawlRequest
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -58,6 +58,7 @@ async def main():
     finally:
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,12 +1,14 @@
 import asyncio
 import os
 import sys
+
 from aiokafka import AIOKafkaProducer
 from minio import Minio
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "./")))
 from app.common.config.settings import settings
+
 
 def test_minio_connection():
     print("Testing MinIO Connection...")
@@ -22,6 +24,7 @@ def test_minio_connection():
     except Exception as e:
         print(f"❌ MinIO Connection Failed: {e}")
 
+
 async def test_kafka_connection():
     print("Testing Kafka Connection...")
     try:
@@ -32,7 +35,7 @@ async def test_kafka_connection():
     except Exception as e:
         print(f"❌ Kafka Connection Failed: {e}")
 
+
 if __name__ == "__main__":
     test_minio_connection()
     asyncio.run(test_kafka_connection())
-           

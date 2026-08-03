@@ -1,4 +1,5 @@
 from minio import Minio
+
 from app.common.config.settings import settings
 
 

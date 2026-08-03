@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import sys
-import signal
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup
@@ -51,6 +50,7 @@ except Exception as e:
     logger.critical(f"Failed to connect to MinIO ({settings.MINIO_ENDPOINT}): {e}", exc_info=True)
     sys.exit(1)
 
+
 def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
     """
     Strips HTML boilerplate and extracts clean text based on target language:
@@ -59,35 +59,36 @@ def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
     """
     if not raw_html_or_text:
         return ""
-    
+
     # Use BeautifulSoup to strip out all HTML tags, scripts, and CSS styles
     soup = BeautifulSoup(raw_html_or_text, "html.parser")
     for script_or_style in soup(["script", "style", "header", "footer", "nav"]):
         script_or_style.decompose()
-        
+
     text = soup.get_text(separator=" ")
-    
+
     # Normalize spacing and clean up messy hidden linebreaks
     lines = (line.strip() for line in text.splitlines())
     chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
     clean_text = "\n".join(chunk for chunk in chunks if chunk)
-    
+
     if language == "am":
         # Regex matching Ethiopic script characters (\u1200-\u137F) along with numbers/punctuation
-        amharic_sentence_pattern = re.compile(r'[\u1200-\u137F\s\d.,!?።፣፤፥፦]+')
+        amharic_sentence_pattern = re.compile(r"[\u1200-\u137F\s\d.,!?።፣፤፥፦]+")
         extracted_matches = amharic_sentence_pattern.findall(clean_text)
-        
+
         final_sentences = []
         for block in extracted_matches:
-            cleaned_block = re.sub(r'\s+', ' ', block).strip()
-            if len(cleaned_block) > 5 and any('\u1200' <= char <= '\u137F' for char in cleaned_block):
+            cleaned_block = re.sub(r"\s+", " ", block).strip()
+            if len(cleaned_block) > 5 and any("\u1200" <= char <= "\u137f" for char in cleaned_block):
                 final_sentences.append(cleaned_block)
         return "\n".join(final_sentences)
-    
+
     else:
         # Standard English/Latin text cleanup
         paragraphs = [p.strip() for p in clean_text.split("\n") if len(p.strip()) > 20]
         return "\n".join(paragraphs) if paragraphs else clean_text
+
 
 def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
     """Synchronously uploads a payload to MinIO in a thread worker."""
@@ -103,48 +104,45 @@ def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
     except Exception as e:
         logger.error(f"Failed to upload {object_name} to MinIO: {e}")
 
+
 async def save_to_minio(object_name: str, payload_bytes: bytes):
     """Async wrapper to prevent blocking the event loop during MinIO uploads."""
     await asyncio.to_thread(_upload_to_minio_sync, object_name, payload_bytes)
 
+
 async def consume_and_parse():
-    logger.info(
-        f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, "
-        f"listening on topic: {KAFKA_INPUT_TOPIC}"
-    )
-    
+    logger.info(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, listening on topic: {KAFKA_INPUT_TOPIC}")
+
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BROKERS,
-        auto_offset_reset='earliest',
-        group_id='parser-group'
+        auto_offset_reset="earliest",
+        group_id="parser-group",
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKERS)
-    
+
     await consumer.start()
     await producer.start()
     logger.info("Parser Worker is active and processing multi-language feeds...")
-    
+
     try:
         async for message in consumer:
             logger.debug(f"[Kafka Offset {message.offset}] Received new ingestion payload.")
-            
+
             try:
-                crawl_result = CrawlResult(**json.loads(message.value.decode('utf-8')))
+                crawl_result = CrawlResult(**json.loads(message.value.decode("utf-8")))
                 raw_payload = crawl_result.html
                 source_site = crawl_result.url
                 target_lang = crawl_result.language or "en"
-                
+
                 logger.info(f"Processing content from source [{target_lang}]: {source_site}")
-                
+
                 # Execute language-aware extraction logic in thread
-                extracted_text = await asyncio.to_thread(
-                    clean_and_extract_text, raw_payload, target_lang
-                )
-                
+                extracted_text = await asyncio.to_thread(clean_and_extract_text, raw_payload, target_lang)
+
                 if extracted_text and extracted_text.strip():
                     logger.info(f"Extracted {len(extracted_text)} chars of text ({target_lang}).")
-                    
+
                     extracted_data = {
                         "character_count": len(extracted_text),
                         "extracted_text": extracted_text,
@@ -168,15 +166,15 @@ async def consume_and_parse():
                     # 2. Save structured output to MinIO parsed bucket
                     object_name = f"parsed_{crawl_result.source_job_id}.json"
                     await save_to_minio(object_name, output_payload_bytes)
-                    
+
                 else:
                     logger.info(f"Skipping payload: No meaningful content extracted for [{target_lang}].")
-                    
+
             except json.JSONDecodeError:
                 logger.warning("Failed to decode message package. Skipping invalid JSON format.")
             except Exception as loop_err:
                 logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
-                
+
     except Exception as e:
         logger.critical(f"Fatal error in consumer pipeline loop: {e}", exc_info=True)
     finally:
@@ -184,10 +182,12 @@ async def consume_and_parse():
         await consumer.stop()
         await producer.stop()
 
+
 def handle_shutdown(loop: asyncio.AbstractEventLoop):
     logger.info("Shutdown signal received. Stopping worker...")
     for task in asyncio.all_tasks(loop=loop):
         task.cancel()
+
 
 if __name__ == "__main__":
     try:

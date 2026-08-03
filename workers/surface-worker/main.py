@@ -58,7 +58,7 @@ class RuleBasedProxyManager:
             self.proxies = proxy_pool_config
         else:
             self.proxies = []
-        
+
         self._index = 0
         logger.info(f"Loaded {len(self.proxies)} proxies into the rule-based rotation pool.")
 
@@ -126,7 +126,7 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         # Select rule-based proxy for this specific request
         proxy_url = proxy_manager.get_proxy(request.language, request.url)
         if proxy_url:
-            logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}") # Log domain/ip without credentials
+            logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")  # Log domain/ip without credentials
 
         # Use a dynamic client or pass proxy per request to ensure thread safety
         async with httpx.AsyncClient(
