@@ -1,7 +1,8 @@
 name: ci
+
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, dagim-feature]
   pull_request:
     branches: [main, develop]
 
@@ -18,7 +19,15 @@ jobs:
 
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install -r requirements.txt
+          # Ensure dev dependencies (including ruff) are installed
+          pip install .[dev]
+
+      - name: Run Ruff Linter & Formatter Check
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
 
       - name: Test
         run: pytest tests/ -q
