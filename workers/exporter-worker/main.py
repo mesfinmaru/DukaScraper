@@ -1,13 +1,14 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import sys
 
-import asyncpg
 import clickhouse_connect
 from aiokafka import AIOKafkaConsumer
 from elasticsearch import AsyncElasticsearch
+from minio import Minio
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -19,52 +20,50 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.pipeline.schemas import ParsedItem
+from app.pipeline.topics import topics
+from app.storage.postgres.client import pg_client
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- Configuration & Clients ---
-KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", getattr(settings, "KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"))
-logger.info(f"KAFKA_BROKERS from env={os.getenv('KAFKA_BOOTSTRAP_SERVERS')}, from settings={getattr(settings, 'KAFKA_BOOTSTRAP_SERVERS', 'NOT SET')}, final={KAFKA_BROKERS}")
-KAFKA_INPUT_TOPIC = getattr(settings, "crawl_parsed_topic", "crawl.parsed")
+KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
+KAFKA_INPUT_TOPIC = topics.CRAWL_PARSED
 
 # Elasticsearch
-ES_HOST = os.getenv("ELASTICSEARCH_URL") or getattr(settings, "ELASTICSEARCH_HOST", "http://elasticsearch:9200")
-es_client = AsyncElasticsearch(hosts=[ES_HOST])
+es_client = AsyncElasticsearch(hosts=[settings.ELASTICSEARCH_URL])
+ES_INDEX = "duka_articles"
 
-# PostgreSQL - Fix for [REDACTED] placeholder
-RAW_DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@postgres:5432/duka"
-DATABASE_URL = (
-    RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
-    .replace("postgres+asyncpg://", "postgresql://")
-    .replace("localhost", "postgres")
-    .replace("[REDACTED]", "postgres")
+# MinIO (for parsed JSON archival, matches parser-worker's bucket)
+minio_client = Minio(
+    settings.MINIO_ENDPOINT,
+    access_key=settings.MINIO_ROOT_USER,
+    secret_key=settings.MINIO_ROOT_PASSWORD,
+    secure=settings.MINIO_SECURE,
 )
-logger.info(f"PostgreSQL URL: {DATABASE_URL}")
 
 # ClickHouse
-CH_HOST = os.getenv("CH_HOST") or getattr(settings, "CLICKHOUSE_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", os.getenv("CLICKHOUSE_HTTP_PORT", "8123")))
-CH_USER = os.getenv("CLICKHOUSE_USER", "default")
-CH_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", None)  # None = no auth
-ch_client = None  # Lazy init
+ch_client = None  # Lazy init, set in init_databases()
 
 
 async def init_databases():
-    """Initializes tables/indices across all databases if they don't already exist."""
+    """Initializes ClickHouse table and PostgreSQL connections. PostgreSQL
+    schema (duka_system, duka_db) is NOT modified here - only connected to;
+    it is created ahead of time via database/01_duka_system.sql and
+    database/02_duka_db.sql."""
     global ch_client
 
-    logger.info(f"Attempting ClickHouse connection to {CH_HOST}:{CH_PORT}")
+    logger.info(f"Attempting ClickHouse connection to {settings.CLICKHOUSE_HOST}:{settings.CLICKHOUSE_HTTP_PORT}")
 
     # Initialize ClickHouse with retries
     for attempt in range(5):
         try:
             ch_client = clickhouse_connect.get_client(
-                host=CH_HOST,
-                port=CH_PORT,
-                username=CH_USER,
-                password=CH_PASSWORD or "",
+                host=settings.CLICKHOUSE_HOST,
+                port=settings.CLICKHOUSE_HTTP_PORT,
+                username=settings.CLICKHOUSE_USER,
+                password=settings.CLICKHOUSE_PASSWORD or "",
                 secure=False,
                 verify=False,
             )
@@ -78,26 +77,7 @@ async def init_databases():
                 logger.error("Failed to connect to ClickHouse after 5 attempts")
                 raise
 
-    # 1. PostgreSQL Table Init
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS parsed_items (
-                source_job_id TEXT PRIMARY KEY,
-                url TEXT,
-                worker TEXT,
-                language TEXT,
-                character_count INT,
-                extracted_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        await conn.close()
-        logger.info("PostgreSQL table 'parsed_items' verified/created.")
-    except Exception as e:
-        logger.error(f"Failed to initialize PostgreSQL table: {e}")
-
-    # 2. ClickHouse Table Init
+    # ClickHouse analytics table (time-series metrics only, no full text)
     try:
         ch_client.command("""
             CREATE TABLE IF NOT EXISTS duka_analytics (
@@ -106,7 +86,6 @@ async def init_databases():
                 worker String,
                 language String,
                 character_count Int32,
-                extracted_text String,
                 created_at DateTime DEFAULT now()
             ) ENGINE = MergeTree() ORDER BY job_id;
         """)
@@ -114,18 +93,60 @@ async def init_databases():
     except Exception as e:
         logger.error(f"Failed to initialize ClickHouse table: {e}")
 
+    # PostgreSQL - connect using the existing pg_client (duka_system + duka_db)
+    try:
+        await pg_client.connect()
+        logger.info("PostgreSQL connections established (duka_system + duka_db).")
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+
+
+def _upload_parsed_json_sync(object_name: str, payload_bytes: bytes) -> str:
+    """Uploads the parsed JSON to MinIO's parsed-data bucket. Returns the object path."""
+    bucket = settings.MINIO_PARSED_BUCKET
+    if not minio_client.bucket_exists(bucket):
+        minio_client.make_bucket(bucket)
+
+    minio_client.put_object(
+        bucket_name=bucket,
+        object_name=object_name,
+        data=io.BytesIO(payload_bytes),
+        length=len(payload_bytes),
+        content_type="application/json",
+    )
+    return f"s3://{bucket}/{object_name}"
+
 
 async def export_to_all_sinks(parsed_item: ParsedItem):
+    """
+    Fan-out a single ParsedItem to all storage sinks with ZERO field
+    duplication across systems:
+      - PostgreSQL (duka_db.parsed_items): metadata + MinIO path references only
+      - MinIO (duka-parsed-data):          the actual extracted text (JSON)
+      - Elasticsearch (duka_articles):     full-text search index
+      - ClickHouse (duka_analytics):       time-series performance metrics only
+    """
     job_id = parsed_item.source_job_id
     url = parsed_item.url
     worker = parsed_item.worker
     language = parsed_item.language
-    char_count = parsed_item.data.get("character_count", 0)
-    text = parsed_item.data.get("extracted_text", "")
+    data = parsed_item.data if isinstance(parsed_item.data, dict) else parsed_item.data.model_dump()
+    char_count = data.get("character_count", 0)
+    text = data.get("extracted_text", "")
 
-    logger.info(f"Exporting Job ID: {job_id} [{language}] -> Writing to ES, Postgres & ClickHouse...")
+    logger.info(f"Exporting Job ID: {job_id} [{language}] -> MinIO, Postgres, Elasticsearch & ClickHouse...")
 
-    # 1. Elasticsearch Indexing
+    # 1. MinIO: persist the parsed JSON payload (source of truth for full text)
+    parsed_json_path = None
+    try:
+        object_name = f"{job_id}/parsed.json"
+        payload_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        parsed_json_path = _upload_parsed_json_sync(object_name, payload_bytes)
+        logger.info(f"Saved parsed JSON to {parsed_json_path}")
+    except Exception as e:
+        logger.error(f"MinIO Export Error [{job_id}]: {e}")
+
+    # 2. Elasticsearch: index full text for search
     try:
         doc = {
             "job_id": job_id,
@@ -135,51 +156,35 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
             "character_count": char_count,
             "extracted_text": text,
         }
-        await es_client.index(index="duka_articles", id=job_id, document=doc)
+        await es_client.index(index=ES_INDEX, id=job_id, document=doc)
+        logger.info(f"Indexed {job_id} into Elasticsearch")
     except Exception as e:
         logger.error(f"Elasticsearch Export Error [{job_id}]: {e}")
 
-    # 2. PostgreSQL Insertion
+    # 3. PostgreSQL (duka_db.parsed_items): metadata + path references ONLY (no full text)
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute(
-            """
-            INSERT INTO parsed_items (source_job_id, url, worker, language, character_count, extracted_text)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (source_job_id) DO UPDATE 
-            SET url = EXCLUDED.url, 
-                worker = EXCLUDED.worker, 
-                language = EXCLUDED.language, 
-                character_count = EXCLUDED.character_count, 
-                extracted_text = EXCLUDED.extracted_text;
-        """,
-            job_id,
-            url,
-            worker,
-            language,
-            char_count,
-            text,
+        raw_html_path = f"s3://{settings.MINIO_RAW_BUCKET}/crawl_{job_id}.json"
+        await pg_client.create_parsed_item(
+            job_id=job_id,
+            source_url=url,
+            raw_html_path=raw_html_path,
+            parsed_json_path=parsed_json_path or "",
+            language=language,
+            character_count=char_count,
+            word_count=len(text.split()) if text else 0,
         )
-        await conn.close()
-        logger.info(f"Successfully inserted {job_id} into PostgreSQL")
+        logger.info(f"Inserted metadata for {job_id} into duka_db.parsed_items")
     except Exception as e:
         logger.error(f"PostgreSQL Export Error [{job_id}]: {e}")
 
-    # 3. ClickHouse Insertion
+    # 4. ClickHouse: metrics only (no full text, no duplication)
     try:
         ch_client.insert(
             "duka_analytics",
-            [[job_id, url, worker, language, char_count, text]],
-            column_names=[
-                "job_id",
-                "url",
-                "worker",
-                "language",
-                "character_count",
-                "extracted_text",
-            ],
+            [[job_id, url, worker, language, char_count]],
+            column_names=["job_id", "url", "worker", "language", "character_count"],
         )
-        logger.info(f"Successfully inserted {job_id} into ClickHouse")
+        logger.info(f"Inserted metrics for {job_id} into ClickHouse")
     except Exception as e:
         logger.error(f"ClickHouse Export Error [{job_id}]: {e}")
 
@@ -187,8 +192,8 @@ async def export_to_all_sinks(parsed_item: ParsedItem):
 
 
 async def consume_and_export():
-    logger.info("Waiting 20 seconds for Kafka to be fully ready...")
-    await asyncio.sleep(20)
+    logger.info("Waiting for Kafka to be fully ready...")
+    await asyncio.sleep(10)
 
     await init_databases()
 
@@ -200,7 +205,7 @@ async def consume_and_export():
     )
 
     await consumer.start()
-    logger.info("Multi-Sink Exporter Worker is online and listening for parsed items...")
+    logger.info(f"Multi-Sink Exporter Worker is online, listening on '{KAFKA_INPUT_TOPIC}'...")
 
     try:
         async for message in consumer:
@@ -218,6 +223,7 @@ async def consume_and_export():
         logger.info("Shutting down exporter worker...")
         await consumer.stop()
         await es_client.close()
+        await pg_client.close()
 
 
 if __name__ == "__main__":

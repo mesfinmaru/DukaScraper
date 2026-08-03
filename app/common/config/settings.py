@@ -7,7 +7,11 @@ class Settings(BaseSettings):
     # Project Metadata
     PROJECT_NAME: str = "DukaScraper"
     VERSION: str = "1.0.0"
+    PROJECT_VERSION: str = "1.0.0"
     API_V1_STR: str = "/api/v1"
+
+    # CORS
+    BACKEND_CORS_ORIGINS: list[str] = ["*"]
 
     # Crawl Settings
     deep_max_pages_per_job: int = 50
@@ -38,11 +42,17 @@ class Settings(BaseSettings):
     CLICKHOUSE_DB: str = "duka_scraper"
 
     # Database Credentials (loaded from .env)
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    POSTGRES_DB: str
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "postgres"
+    POSTGRES_DB: str = "duka"
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
+
+    # Duka Scraper uses TWO separate PostgreSQL databases on the same server:
+    #   - duka_system: users + jobs (auth & orchestration)
+    #   - duka_db:     parsed_items + exports (parsed content metadata)
+    DUKA_SYSTEM_DB: str = "duka_system"
+    DUKA_DB: str = "duka_db"
 
     # Infrastructure Connections
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -62,7 +72,7 @@ class Settings(BaseSettings):
 
     @property
     def DATABASE_URL(self) -> str:
-        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.DUKA_SYSTEM_DB}"
 
     model_config = SettingsConfigDict(
         env_file=".env",

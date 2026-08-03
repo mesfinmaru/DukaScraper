@@ -9,11 +9,15 @@ class MinioManager:
     """
     Manages the connection to MinIO and ensures required buckets are created on startup.
     This service is the source of truth for bucket creation.
+
+    Bucket names come from settings so they always match what the workers
+    (surface, parser, exporter) actually read/write:
+      - MINIO_RAW_BUCKET    ("duka-raw-data")    raw HTML from surface/deep/dark workers
+      - MINIO_PARSED_BUCKET ("duka-parsed-data") parsed JSON from parser/exporter workers
+      - duka-exports                             generated CSV/JSON/Parquet exports
     """
 
-    # Bucket names are defined here to align with the system architecture.
-    RAW_ASSETS_BUCKET = "raw-assets"
-    EXPORTS_BUCKET = "exports"
+    EXPORTS_BUCKET = "duka-exports"
 
     def __init__(self):
         self.client = Minio(
@@ -23,7 +27,8 @@ class MinioManager:
             secure=settings.MINIO_SECURE,
         )
         self.buckets_to_create = [
-            self.RAW_ASSETS_BUCKET,
+            settings.MINIO_RAW_BUCKET,
+            settings.MINIO_PARSED_BUCKET,
             self.EXPORTS_BUCKET,
         ]
 

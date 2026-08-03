@@ -23,6 +23,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d
     networks:
       - duka-net
     restart: always
@@ -95,6 +96,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  kafka-topics-init:
+    image: apache/kafka:3.9.1
+    container_name: kafka-topics-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests --partitions 10 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.raw --partitions 10 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.parsed --partitions 10 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests.retry --partitions 5 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests.dlq --partitions 5 --replication-factor 1
+        echo "Kafka topics initialized successfully."
+    networks:
+      - duka-net
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -198,9 +217,34 @@ services:
           sleep 2;
         done
         mc mb minio/duka-raw-data --ignore-existing
-        echo "MinIO bucket initialized successfully."
+        mc mb minio/duka-parsed-data --ignore-existing
+        mc mb minio/duka-exports --ignore-existing
+        echo "MinIO buckets initialized successfully."
     networks:
       - duka-net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: duka-api
+    restart: always
+    environment:
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    networks:
+      - duka-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
 
   surface-worker:
     build:
@@ -264,10 +308,7 @@ services:
     container_name: exporter-worker
     restart: on-failure:5
     environment:
-      - CH_HOST=clickhouse
-      - CH_PORT=8123
-      - DATABASE_URL=postgresql://postgres:[REDACTED]@postgres:5432/duka
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
       - .:/app
