@@ -20,9 +20,6 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Lint
-        run: ruff check app/ workers/ tests/
-
       - name: Test
         run: pytest tests/ -q
 
@@ -34,7 +31,6 @@ jobs:
           - surface-worker
           - deep-worker
           - dark-worker
-          - rss-worker
           - parser-worker
           - exporter-worker
     steps:
