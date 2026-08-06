@@ -13,9 +13,9 @@
             │  (Auth + Job Management)   │
             └───────┬──────────┬─────────┘
                     │          │
-        ┌───────────▼──┐   ┌──▼──────────────┐
-        │ PostgreSQL   │   │  Kafka          │
-        │ (duka_system)│   │(crawl.requests) │
+        ┌──────────▼──┐   ┌──▼──────────────┐
+        │ PostgreSQL  │   │  Kafka          │
+        │(duka_system)│   │(crawl.requests) │
         │             │   │                 │
         │ users       │   └────────┬────────┘
         │ jobs        │            │
@@ -37,8 +37,8 @@
            │Raw HTML    │  │Update job │  │Publish raw   │
            │files       │  │progress   │  │content       │
            └────────────┘  └───────────┘  └──────┬───────┘
-                                                   │
-                                                   ▼
+                                                 │
+                                                 ▼
                                         ┌──────────────────┐
                                         │  PARSER WORKER   │
                                         │                  │

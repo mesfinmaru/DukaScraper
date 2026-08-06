@@ -4,12 +4,12 @@ networks:
 
 volumes:
   postgres_data:
-  redis_data:
   es_data:
   clickhouse_data:
   minio_data:
   kafka_data:
   pgadmin_data:
+  ollama_data:
 
 services:
   postgres:
@@ -23,7 +23,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database:/docker-entrypoint-initdb.d
+      - ./database/postgres:/docker-entrypoint-initdb.d
     networks:
       - duka-net
     restart: always
@@ -158,6 +158,7 @@ services:
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./database/clickhouse:/docker-entrypoint-initdb.d
     networks:
       - duka-net
     restart: always
@@ -187,6 +188,26 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - duka-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    command: serve
 
   api:
     build:
@@ -277,23 +298,28 @@ services:
   tor:
     image: dperson/torproxy:latest
     container_name: tor
-    profiles: ["dark"]
     ports:
       - "9050:9050"
     networks:
       - duka-net
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "echo -e 'GET / HTTP/1.0\\r\\n\\r\\n' | timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9050' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   dark-worker:
     build:
       context: .
       dockerfile: workers/dark-worker/Dockerfile
     container_name: dark-worker
-    profiles: ["dark"]
     restart: on-failure:5
     environment:
       - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - TOR_SOCKS5_PROXY=socks5h://tor:9050
     volumes:
       - .:/app
     extra_hosts:
@@ -307,6 +333,34 @@ services:
         condition: service_healthy
       tor:
         condition: service_started
+
+  llm-worker:
+    build:
+      context: .
+      dockerfile: workers/llm-worker/Dockerfile
+    container_name: llm-worker
+    restart: on-failure:5
+    environment:
+      - APP_ENV=docker
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen2.5:0.5b
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_DATABASE=duka_scraper
+    volumes:
+      - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
 
   exporter-worker:
     build:

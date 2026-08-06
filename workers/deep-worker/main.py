@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -23,6 +22,7 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest, CrawlResult
+from app.services.recursive_crawl_service import extract_and_queue_children
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -51,6 +51,12 @@ minio_client = Minio(
     secure=settings.MINIO_SECURE,
 )
 
+# Deep-worker uses browser automation - more expensive per task than surface, keep concurrency modest
+MAX_CONCURRENT_TASKS = 15
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+playwright_manager = None
+browser = None
+
 
 def _upload_to_minio_sync(job_id: str, payload_bytes: bytes):
     if not minio_client.bucket_exists(BUCKET_NAME):
@@ -72,45 +78,66 @@ async def save_to_minio(job_id: str, payload_bytes: bytes):
 
 
 async def ensure_playwright_browser() -> None:
+    global playwright_manager, browser
+    if browser is not None:
+        return
+
     try:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            await browser.close()
-            return
+        playwright_manager = await async_playwright().start()
+        browser = await playwright_manager.chromium.launch(headless=True)
+        logger.info("Shared Playwright browser initialized")
     except PlaywrightError:
         logger.info("Chromium browser is not installed; installing it now.")
 
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "playwright",
-        "install",
-        "--with-deps",
-        "chromium",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    stdout, _ = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(f"Playwright browser installation failed: {stdout.decode('utf-8', errors='ignore')}")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "--with-deps",
+            "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(f"Playwright browser installation failed: {stdout.decode('utf-8', errors='ignore')}")
+
+        playwright_manager = await async_playwright().start()
+        browser = await playwright_manager.chromium.launch(headless=True)
 
 
 async def render_page(url: str) -> tuple[str, int]:
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"])
-        page = await context.new_page()
-        try:
-            response = await page.goto(
-                url,
-                wait_until="networkidle",
-                timeout=int(settings.deep_timeout_seconds * 1000),
-            )
-            html = await page.content()
-            return html, response.status if response else 200
-        finally:
-            await context.close()
-            await browser.close()
+    if browser is None:
+        await ensure_playwright_browser()
+
+    context = await browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"])
+    page = await context.new_page()
+    try:
+        response = await page.goto(
+            url,
+            wait_until="networkidle",
+            timeout=int(settings.deep_timeout_seconds * 1000),
+        )
+        html = await page.content()
+        return html, response.status if response else 200
+    finally:
+        await context.close()
+
+
+async def extract_and_queue_children_local(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    html: str,
+) -> tuple[list[str], int, int]:
+    """Thin wrapper around the shared recursive_crawl_service for this worker's topics."""
+    return await extract_and_queue_children(
+        producer=producer,
+        request=request,
+        html=html,
+        consume_topic=CONSUME_TOPIC,
+        redis_url=settings.REDIS_URL,
+    )
 
 
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
@@ -120,7 +147,11 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if request.worker_type != WORKER_TYPE:
             return
 
-        logger.info(f"Rendering job {request.job_id} for URL: {request.url}")
+        escalation_note = f" (escalated: {request.escalation_reason})" if request.escalation_reason else ""
+        logger.info(
+            f"Rendering job {request.job_id} depth={request.depth}/{request.max_depth} "
+            f"for URL: {request.url}{escalation_note}"
+        )
         await ensure_playwright_browser()
 
         try:
@@ -129,14 +160,23 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             logger.warning(f"Playwright render error for {request.url}: {e}")
             html, status_code = "", 599
 
+        # --- Recursive link extraction (shared logic, all workers) ---
+        extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
+
         result = CrawlResult(
-            source_job_id=request.job_id,
+            job_id=request.job_id,
             url=request.url,
             worker=WORKER_TYPE,
             language=request.language,
             html=html,
             status_code=status_code,
             network="deep",
+            depth=request.depth,
+            extracted_links=extracted_links,
+            child_tasks_queued=queued_count,
+            duplicate_links_skipped=skipped_count,
+            was_escalated=request.retry_count > 0,
+            escalation_reason=request.escalation_reason,
         )
 
         payload_bytes = result.model_dump_json().encode("utf-8")
@@ -146,7 +186,10 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
-        logger.info(f"Published rendered raw result for {request.url}")
+        logger.info(
+            f"Published rendered raw result for {request.url} "
+            f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
+        )
 
     except ValidationError as e:
         logger.error(f"Invalid message format: {e}")
@@ -157,7 +200,8 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
 
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes):
-    await process_request(producer, message_value)
+    async with semaphore:
+        await process_request(producer, message_value)
 
 
 async def main():
@@ -170,9 +214,13 @@ async def main():
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
+    await ensure_playwright_browser()
     await producer.start()
     await consumer.start()
-    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}'.")
+    logger.info(
+        f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' "
+        f"(browser rendering + recursive crawling)."
+    )
 
     loop = asyncio.get_running_loop()
     current_task = asyncio.current_task()
@@ -198,6 +246,10 @@ async def main():
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()
         await producer.stop()
+        if browser is not None:
+            await browser.close()
+        if playwright_manager is not None:
+            await playwright_manager.stop()
 
 
 if __name__ == "__main__":

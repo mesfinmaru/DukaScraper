@@ -93,9 +93,9 @@ All shared data structures, such as API schemas and Kafka message payloads, are 
 | surface-worker | `workers/surface-worker/` | `crawl.requests` → `crawl.raw` |
 | deep-worker | `workers/deep-worker/` | `crawl.requests` → `crawl.raw` |
 | dark-worker | `workers/dark-worker/` | `crawl.requests` → `crawl.raw` |
-| rss-worker | `workers/rss-worker/` | `rss.poll` → `crawl.requests` |
 | parser-worker | `workers/parser-worker/` | `crawl.raw` → `crawl.parsed` |
-| exporter-worker | `workers/exporter-worker/` | `crawl.parsed` → `crawl.export` |
+| exporter-worker | `workers/exporter-worker/` | `crawl.parsed` → `crawl.parsed` (export side effects) |
+| llm-worker | `workers/llm-worker/` | `crawl.parsed` → `ClickHouse` |
 
 ## Dark worker safety
 

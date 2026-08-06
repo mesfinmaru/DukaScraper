@@ -18,7 +18,7 @@ class ClickHouseManager:
                 port=int(getattr(settings, "CLICKHOUSE_HTTP_PORT", 8123)),
                 user=getattr(settings, "CLICKHOUSE_USER", "default"),
                 password=getattr(settings, "CLICKHOUSE_PASSWORD", ""),
-                database=getattr(settings, "CLICKHOUSE_DB", "duka_scraper"),
+                database=settings.CLICKHOUSE_DB,
             )
             logger.info("ClickHouse client initialized successfully.")
         except Exception as e:

@@ -73,12 +73,19 @@ class ElasticsearchManager:
         raise RuntimeError(f"Failed to ensure Elasticsearch index '{index_name}'")
 
     async def ensure_articles_index(self) -> None:
-        """Create the shared parsed-articles index if it does not exist."""
+        """Create the shared parsed-articles index if it does not exist.
+
+        NOTE: source_type intentionally excluded from this mapping. It is now
+        determined POST-parsing by the llm-worker intelligence pipeline and
+        lives in ClickHouse `intelligence_analytics`, not in this pre-analysis
+        article index.
+        """
         await self.ensure_index(
             "duka_articles",
             mappings={
                 "properties": {
                     "job_id": {"type": "keyword"},
+                    "item_id": {"type": "keyword"},
                     "url": {"type": "keyword"},
                     "worker": {"type": "keyword"},
                     "language": {"type": "keyword"},

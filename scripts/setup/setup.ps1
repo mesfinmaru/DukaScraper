@@ -28,8 +28,8 @@ Write-Host "[3/4] Creating Kafka topics (crawl.requests, crawl.raw, crawl.parsed
 docker compose up kafka-topics-init
 
 Write-Host ""
-Write-Host "[4/4] Starting API + surface/deep/parser/exporter workers..."
-docker compose up -d api surface-worker parser-worker deep-worker exporter-worker
+Write-Host "[4/4] Starting API + crawl/render/parse/LLM workers..."
+docker compose up -d api surface-worker parser-worker deep-worker llm-worker exporter-worker
 
 Write-Host ""
 Write-Host "=================================================================="
@@ -50,7 +50,10 @@ Write-Host "  Prometheus:           http://localhost:9090"
 Write-Host "  Kafka external port:  localhost:29092 (WSL/native clients)"
 Write-Host ""
 Write-Host "Try it: submit a crawl job"
-Write-Host '  curl -X POST http://localhost:8000/api/v1/jobs/trigger -H "Content-Type: application/json" -d ''{"url":"https://example.com","user_id":"USR12345"}'''
+Write-Host '  curl -X POST http://localhost:8000/api/v1/jobs/trigger -H "Content-Type: application/json" -d ''{"url":"https://www.ena.et/","user_id":"USR12345","language":"am"}'''
+Write-Host ""
+Write-Host "Or run the full demo set from the Airflow crawl targets file:"
+Write-Host '  docker compose exec api python -c "from app.airflow.dags.dynamic_crawl_scheduler_dag import load_and_dispatch_targets; load_and_dispatch_targets(None)"'
 Write-Host ""
 Write-Host "WSL usage: set APP_ENV=wsl before running API/workers natively in Ubuntu WSL."
 Write-Host ""
@@ -59,4 +62,4 @@ Write-Host "  1. Set DARK_ENABLED=true in .env"
 Write-Host "  2. docker compose --profile dark up -d tor dark-worker"
 Write-Host ""
 Write-Host "Check status: docker compose ps"
-Write-Host "View logs:    docker compose logs -f surface-worker parser-worker exporter-worker"
+Write-Host "View logs:    docker compose logs -f surface-worker parser-worker llm-worker exporter-worker"

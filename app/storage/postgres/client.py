@@ -24,6 +24,7 @@ duka_db.exports:
 """
 
 import logging
+import re
 from datetime import date, datetime
 
 import asyncpg
@@ -31,6 +32,11 @@ import asyncpg
 from app.common.config.settings import settings
 
 logger = logging.getLogger("dukascraper")
+
+
+# Note: previous code normalized incoming user IDs to match an 8-char
+# schema. This normalization was removed to allow using DB-generated
+# `user_id` values directly. Keep helper functions minimal.
 
 
 def _coerce_publish_date(value: str | date | datetime | None) -> date | None:
@@ -95,7 +101,6 @@ class PostgreSQLClient:
         """Get user from duka_system.users by user_id (e.g. 'USR12345')"""
         if not self.system_conn:
             raise RuntimeError("Database not connected")
-
         return await self.system_conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
     async def get_user_by_username(self, username: str):
@@ -120,40 +125,30 @@ class PostgreSQLClient:
             password_hash,
         )
 
-    async def ensure_user(
-        self,
-        user_id: str,
-        full_name: str,
-        username: str,
-        email: str,
-        password_hash: str,
-    ):
-        """Ensure a specific user exists for demo/bootstrap flows."""
-        if not self.system_conn:
-            raise RuntimeError("Database not connected")
-
-        existing = await self.get_user(user_id)
-        if existing:
-            return existing
-
-        return await self.system_conn.fetchrow(
-            """INSERT INTO users (user_id, full_name, username, email, password_hash)
-               VALUES ($1, $2, $3, $4, $5)
-               RETURNING user_id, full_name, username, email, created_at""",
-            user_id,
-            full_name,
-            username,
-            email,
-            password_hash,
-        )
+    # Note: `ensure_user` removed per user request. The code expects the
+    # caller to provide a valid existing `user_id` (e.g. 'USR12345'). If a
+    # user must be created programmatically, call `create_user()` explicitly.
 
     # ========== duka_system queries (jobs) ==========
 
-    async def create_job(self, user_id: str, url: str, worker_type: str, language: str = "am"):
-        """Create new job in duka_system.jobs. job_id is auto-generated (e.g. JOB00000001)."""
+    async def create_job(
+        self,
+        user_id: str,
+        url: str,
+        worker_type: str,
+        language: str = "am",
+    ):
+        """Create new job in duka_system.jobs. job_id is auto-generated (e.g. JOB00000001).
+
+        NOTE: source_type REMOVED. Classification now happens post-parsing via the
+        llm-worker intelligence pipeline, not at job creation time.
+        """
         if not self.system_conn:
             raise RuntimeError("Database not connected")
 
+        # Use the provided `user_id` directly. Caller must ensure it exists
+        # in the `users` table (e.g. 'USR12345'). This keeps behavior simple
+        # and avoids implicit user creation during job submission.
         return await self.system_conn.fetchrow(
             """INSERT INTO jobs (user_id, url, worker_type, language, status)
                VALUES ($1, $2, $3, $4, 'pending')
@@ -212,7 +207,11 @@ class PostgreSQLClient:
         character_count: int | None = None,
         word_count: int | None = None,
     ):
-        """Create parsed item metadata in duka_db.parsed_items. item_id is auto-generated (e.g. ITEM00000001)."""
+        """Create parsed item metadata in duka_db.parsed_items. item_id is auto-generated (e.g. ITEM00000001).
+
+        NOTE: source_type REMOVED. Classification now happens post-parsing via the
+        llm-worker intelligence pipeline (see intelligence_processed flag + mark_item_intelligence_processed()).
+        """
         if not self.db_conn:
             raise RuntimeError("Database not connected")
 
@@ -234,6 +233,15 @@ class PostgreSQLClient:
             word_count,
             raw_html_path,
             parsed_json_path,
+        )
+
+    async def mark_item_intelligence_processed(self, item_id: str):
+        """Flag a parsed item as processed by the LLM intelligence worker."""
+        if not self.db_conn:
+            raise RuntimeError("Database not connected")
+
+        await self.db_conn.execute(
+            "UPDATE parsed_items SET intelligence_processed = TRUE WHERE item_id = $1", item_id
         )
 
     async def get_parsed_item(self, item_id: str):

@@ -18,12 +18,22 @@ ES_INDEX = "duka_articles"
 
 
 @router.get("/search")
-async def search_articles(q: str = Query(..., description="Full-text search query"), size: int = 20):
-    """Full-text search over scraped/parsed articles in Elasticsearch."""
+async def search_articles(
+    q: str = Query(..., description="Full-text search query"),
+    size: int = 20,
+):
+    """Full-text search over scraped/parsed articles in Elasticsearch.
+
+    NOTE: source_type filtering removed here - source_type is now determined
+    POST-parsing by the llm-worker intelligence pipeline and lives in
+    ClickHouse `intelligence_analytics`, not in this pre-analysis article index.
+    """
     try:
+        query: dict = {"multi_match": {"query": q, "fields": ["url", "extracted_text"]}}
+
         result = await es_client.client.search(
             index=ES_INDEX,
-            query={"multi_match": {"query": q, "fields": ["url", "extracted_text"]}},
+            query=query,
             size=size,
         )
         hits = result.get("hits", {}).get("hits", [])
@@ -63,6 +73,7 @@ async def get_articles_for_job(job_id: str):
                 "parsed_json_path": item["parsed_json_path"],
                 "parsed_at": item["parsed_at"].isoformat() if item["parsed_at"] else None,
                 "is_exported": item["is_exported"],
+                "intelligence_processed": item["intelligence_processed"],
             }
             for item in items
         ],
@@ -89,4 +100,5 @@ async def get_article(item_id: str):
         "parsed_json_path": item["parsed_json_path"],
         "parsed_at": item["parsed_at"].isoformat() if item["parsed_at"] else None,
         "is_exported": item["is_exported"],
+        "intelligence_processed": item["intelligence_processed"],
     }

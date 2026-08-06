@@ -80,6 +80,7 @@ async def init_databases():
                 username=settings.CLICKHOUSE_USER,
                 password=settings.CLICKHOUSE_PASSWORD or "",
                 secure=False,
+                database=settings.CLICKHOUSE_DB,
                 verify=False,
             )
             logger.info(f"ClickHouse connected on attempt {attempt + 1}")
@@ -92,10 +93,15 @@ async def init_databases():
                 raise
 
     try:
+        # NOTE: source_type intentionally excluded. Classification now happens
+        # POST-parsing via the llm-worker intelligence pipeline, which writes
+        # to the separate `intelligence_analytics` table (see
+        # app/storage/clickhouse/intelligence_schema.sql), not here.
         ch_client.command(
             """
             CREATE TABLE IF NOT EXISTS duka_analytics (
                 job_id String,
+                item_id String,
                 url String,
                 worker String,
                 language String,
@@ -105,6 +111,12 @@ async def init_databases():
             """
         )
         logger.info("ClickHouse table 'duka_analytics' verified/created.")
+
+        # Backfill item_id column for pre-existing tables (safe if it already exists)
+        try:
+            ch_client.command("ALTER TABLE duka_analytics ADD COLUMN IF NOT EXISTS item_id String DEFAULT ''")
+        except Exception as e:
+            logger.warning(f"ClickHouse ALTER TABLE for item_id skipped/failed: {e}")
     except Exception as e:
         logger.error(f"Failed to initialize ClickHouse table: {e}")
 
@@ -118,6 +130,7 @@ async def init_databases():
                 mappings={
                     "properties": {
                         "job_id": {"type": "keyword"},
+                        "item_id": {"type": "keyword"},
                         "url": {"type": "keyword"},
                         "worker": {"type": "keyword"},
                         "language": {"type": "keyword"},
@@ -137,7 +150,8 @@ async def init_databases():
 def _normalize_item_data(parsed_item: ParsedItem) -> dict[str, Any]:
     data = parsed_item.data if isinstance(parsed_item.data, dict) else parsed_item.data.model_dump()
     return {
-        "job_id": parsed_item.source_job_id,
+        "job_id": parsed_item.job_id,
+        "item_id": parsed_item.item_id,
         "url": parsed_item.url,
         "worker": parsed_item.worker,
         "language": parsed_item.language,
@@ -152,14 +166,19 @@ def _normalize_item_data(parsed_item: ParsedItem) -> dict[str, Any]:
 
 
 async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
+    """Export a parsed item to Elasticsearch + ClickHouse, and mark it exported in PostgreSQL.
+
+    NOTE: The PostgreSQL parsed_items row is already created by parser-worker
+    (which owns item_id generation). This function only marks it as exported -
+    it must NOT call create_parsed_item again, or it would create a duplicate row.
+    """
     data = _normalize_item_data(parsed_item)
     job_id = data["job_id"]
+    item_id = data["item_id"]
 
     parsed_payload = parsed_item.model_dump()
     parsed_payload["data"] = data
     payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
-    parsed_json_path = f"s3://{settings.MINIO_PARSED_BUCKET}/{job_id}.json"
-    raw_html_path = f"s3://{settings.MINIO_RAW_BUCKET}/crawl_{job_id}.json"
 
     await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, f"{job_id}.json", payload_bytes, "application/json")
     logger.info(f"Saved parsed JSON for {job_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
@@ -167,9 +186,10 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
     try:
         await es_client.index(
             index=ES_INDEX,
-            id=job_id,
+            id=item_id,
             document={
                 "job_id": job_id,
+                "item_id": item_id,
                 "url": data["url"],
                 "worker": data["worker"],
                 "language": data["language"],
@@ -180,45 +200,33 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
                 "status": data["status"],
             },
         )
-        logger.info(f"Indexed {job_id} into Elasticsearch")
+        logger.info(f"Indexed {item_id} into Elasticsearch")
     except Exception as e:
-        logger.error(f"Elasticsearch Export Error [{job_id}]: {e}")
+        logger.error(f"Elasticsearch Export Error [{item_id}]: {e}")
 
     try:
-        record = await pg_client.create_parsed_item(
-            job_id=job_id,
-            source_url=data["url"],
-            raw_html_path=raw_html_path,
-            parsed_json_path=parsed_json_path,
-            language=data["language"],
-            title=data["title"],
-            publish_date=data["publish_date"],
-            character_count=data["character_count"],
-            word_count=len(data["extracted_text"].split()) if data["extracted_text"] else 0,
-        )
-        if record and record.get("item_id"):
-            await pg_client.mark_item_exported(record["item_id"])
-        logger.info(f"Inserted metadata for {job_id} into duka_db.parsed_items")
+        await pg_client.mark_item_exported(item_id)
+        logger.info(f"Marked parsed_items row {item_id} as exported (duka_db.parsed_items)")
     except Exception as e:
-        logger.error(f"PostgreSQL Export Error [{job_id}]: {e}")
+        logger.error(f"PostgreSQL Export Error [{item_id}]: {e}")
 
     try:
         await asyncio.to_thread(
             ch_client.insert,
             "duka_analytics",
-            [[job_id, data["url"], data["worker"], data["language"], data["character_count"]]],
-            column_names=["job_id", "url", "worker", "language", "character_count"],
+            [[job_id, item_id, data["url"], data["worker"], data["language"], data["character_count"]]],
+            column_names=["job_id", "item_id", "url", "worker", "language", "character_count"],
         )
-        logger.info(f"Inserted metrics for {job_id} into ClickHouse")
+        logger.info(f"Inserted metrics for {item_id} into ClickHouse")
     except Exception as e:
-        logger.error(f"ClickHouse Export Error [{job_id}]: {e}")
+        logger.error(f"ClickHouse Export Error [{item_id}]: {e}")
 
     return data
 
 
 def _batch_to_csv_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
     buffer = io.StringIO()
-    fieldnames = ["job_id", "url", "worker", "language", "character_count", "status", "title", "publish_date", "extracted_text"]
+    fieldnames = ["job_id", "item_id", "url", "worker", "language", "character_count", "status", "title", "publish_date", "extracted_text"]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
     for item in batch:

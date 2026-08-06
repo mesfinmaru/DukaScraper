@@ -1,41 +1,37 @@
 [
   {
-    "job_id": "fanamc_amharic",
-    "url": "https://www.fanamc.com/%E1%8B%9C%E1%8A%93",
-    "worker_type": "surface-worker",
+    "job_id": "ena_amharic",
+    "url": "https://www.ena.et/",
+    "worker_type": "surface",
     "language": "am",
     "job_params": {
-      "render_js": false,
       "enabled": true
     }
   },
   {
     "job_id": "ethiopian_reporter_am",
-    "url": "https://am.thereporter.et/",
-    "worker_type": "surface-worker",
+    "url": "https://ethiopianreporter.com/",
+    "worker_type": "surface",
     "language": "am",
     "job_params": {
-      "render_js": false,
       "enabled": true
     }
   },
   {
-    "job_id": "bbc_amharic",
-    "url": "https://www.bbc.com/amharic",
-    "worker_type": "surface-worker",
-    "language": "am",
+    "job_id": "bbc_news_en",
+    "url": "https://www.bbc.com/news",
+    "worker_type": "surface",
+    "language": "en",
     "job_params": {
-      "render_js": true,
       "enabled": true
     }
   },
   {
-    "job_id": "ethio_press",
-    "url": "https://press.et/",
-    "worker_type": "surface-worker",
-    "language": "am",
+    "job_id": "wikipedia_ethiopia_en",
+    "url": "https://en.wikipedia.org/wiki/Ethiopia",
+    "worker_type": "surface",
+    "language": "en",
     "job_params": {
-      "render_js": true,
       "enabled": true
     }
   }

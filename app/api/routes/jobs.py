@@ -11,25 +11,36 @@ router = APIRouter()
 
 
 class ScrapeRequest(BaseModel):
-    """Schema for incoming scraping requests from the UI or external systems."""
+    """Schema for incoming scraping requests from the UI or external systems.
+
+    NOTE: source_type has been REMOVED. Content classification now happens
+    AFTER crawling+parsing, via the llm-worker intelligence pipeline (Ollama
+    qwen2.5:14b), which writes category/threat_severity/source_type to
+    ClickHouse intelligence_analytics.
+
+    Worker routing (surface/deep/dark) is fully automatic via the
+    multi-signal WorkerAssignmentEngine - it is NOT required to specify
+    render_js/requires_auth manually. worker_override remains available as
+    an escape hatch for edge cases.
+    """
 
     url: HttpUrl
     user_id: str = Field(..., description="ID of the user submitting the job, e.g. 'USR12345'.")
-    render_js: bool = Field(
-        False,
-        description="Route to deep-worker when the page requires JavaScript rendering.",
-    )
     language: str = Field(
         "am",
         description="Language of the content to be scraped ('am', 'en').",
     )
-    requires_auth: bool = Field(
-        False,
-        description="Set to true if the page is behind a login (routes to deep-worker).",
-    )
     worker_override: str | None = Field(
         None,
-        description="Explicitly specify a worker, bypassing routing rules.",
+        description="Explicitly specify a worker ('surface', 'deep', 'dark'), bypassing the rules engine.",
+    )
+    max_depth: int = Field(
+        5,
+        description="Max recursion depth for link extraction (0 = single URL only, no recursion). Default 5.",
+    )
+    recursive_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Recursion control: {enable_extraction: bool, link_filter_patterns: list, skip_domains: list}",
     )
     job_params: dict[str, Any] = Field(
         default_factory=dict,
@@ -39,18 +50,31 @@ class ScrapeRequest(BaseModel):
 
 @router.post("/trigger", status_code=202, response_model=dict)
 async def trigger_scrape_job(request: ScrapeRequest):
-    """Persist a new job row and publish the matching CrawlRequest."""
+    """Persist a new job row and publish the matching CrawlRequest.
+
+    worker_type is assigned automatically by the multi-signal rules engine
+    (domain whitelist + WAF/CDN detection + Ethiopian domain intelligence +
+    URL path/query heuristics + .onion/.i2p detection). If a SURFACE worker
+    later hits a 403/login-form/empty-shell, it self-escalates to DEEP
+    automatically - no manual intervention required.
+    """
     try:
         result = await submit_crawl_job(
             user_id=request.user_id,
             url=str(request.url),
             language=request.language,
-            render_js=request.render_js,
-            requires_auth=request.requires_auth,
             worker_override=request.worker_override,
+            max_depth=request.max_depth,
+            recursive_config=request.recursive_config,
             job_params=request.job_params,
         )
-        logger.info("Triggered job %s for URL: %s -> worker: %s", result["job_id"], request.url, result["assigned_worker"])
+        logger.info(
+            "Triggered job %s for URL: %s -> worker: %s (reason=%s)",
+            result["job_id"],
+            request.url,
+            result["assigned_worker"],
+            result["assignment_reason"],
+        )
         return result
 
     except Exception as e:

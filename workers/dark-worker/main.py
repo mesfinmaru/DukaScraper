@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import signal
-from urllib.parse import urlparse
 import sys
 
 import httpx
@@ -22,6 +21,7 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest, CrawlResult
+from app.services.recursive_crawl_service import extract_and_queue_children
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -35,7 +35,15 @@ KAFKA_BOOTSTRAP_SERVERS = settings.KAFKA_BOOTSTRAP_SERVERS
 CONSUME_TOPIC = settings.crawl_request_topic
 PRODUCE_TOPIC = settings.crawl_raw_topic
 WORKER_TYPE = "dark"
-TOR_PROXY_URL = settings.tor_proxy_url  # e.g. socks5://tor:9050
+
+# NOTE: Dark worker is ALWAYS ACTIVE (no profile gating, no dark_enabled
+# feature flag). It always subscribes to crawl.requests like surface/deep;
+# it simply only receives tasks routed to worker_type="dark" (.onion/.i2p
+# detection lives in the WorkerAssignmentEngine, not here).
+#
+# Env override supports either `socks5h://tor:9050` (preferred - resolves
+# .onion hostnames THROUGH Tor) or the legacy settings.tor_proxy_url.
+TOR_PROXY_URL = os.getenv("TOR_SOCKS5_PROXY", settings.tor_proxy_url)
 
 # --- MinIO Setup ---
 BUCKET_NAME = settings.MINIO_RAW_BUCKET
@@ -80,6 +88,27 @@ async def save_to_minio(job_id: str, payload_bytes: bytes):
     await asyncio.to_thread(_upload_to_minio_sync, job_id, payload_bytes)
 
 
+async def extract_and_queue_children_local(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    html: str,
+) -> tuple[list[str], int, int]:
+    """Thin wrapper around the shared recursive_crawl_service for this worker's topics.
+
+    NOTE: Dark-web special case is handled INSIDE LinkExtractionService.normalize_url,
+    which strips session-token query params (sid, phpsessid, csrf_token, nonce, etc.)
+    that many onion forums/markets mint per-request - without this, the Bloom filter
+    dedup would treat every click as a "new" URL and recurse forever.
+    """
+    return await extract_and_queue_children(
+        producer=producer,
+        request=request,
+        html=html,
+        consume_topic=CONSUME_TOPIC,
+        redis_url=settings.REDIS_URL,
+    )
+
+
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
     """Processes a single incoming crawl request from Kafka, routed through the Tor SOCKS5 proxy."""
     try:
@@ -89,16 +118,10 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if request.worker_type != WORKER_TYPE:
             return
 
-        if not settings.dark_enabled:
-            logger.warning(f"Dark worker received job {request.job_id} but dark_enabled=False. Skipping.")
-            return
-
-        hostname = (urlparse(request.url).hostname or "").lower()
-        if not hostname.endswith(".onion"):
-            logger.warning(f"Dark worker skipping non-.onion URL for job {request.job_id}: {request.url}")
-            return
-
-        logger.info(f"Processing job {request.job_id} [{request.language}] for .onion URL: {request.url}")
+        logger.info(
+            f"Processing job {request.job_id} [{request.language}] depth={request.depth}/{request.max_depth} "
+            f"via Tor for URL: {request.url}"
+        )
 
         async with httpx.AsyncClient(
             proxy=TOR_PROXY_URL,
@@ -108,39 +131,38 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         ) as client:
             try:
                 response = await client.get(request.url)
-                response.raise_for_status()
-
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=str(response.url),
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html=response.text,
-                    status_code=response.status_code,
-                    network="dark",
-                )
+                html = response.text
+                status_code = response.status_code
+                final_url = str(response.url)
             except httpx.HTTPStatusError as e:
                 logger.warning(f"HTTP error {e.response.status_code} for {request.url} via Tor")
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=str(e.request.url),
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html=e.response.text if e.response is not None else "",
-                    status_code=e.response.status_code,
-                    network="dark",
-                )
+                html = e.response.text if e.response is not None else ""
+                status_code = e.response.status_code
+                final_url = str(e.request.url)
             except httpx.RequestError as e:
                 logger.warning(f"Request error for {request.url} via Tor: {e}")
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=request.url,
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html="",
-                    status_code=599,
-                    network="dark",
-                )
+                html = ""
+                status_code = 599
+                final_url = request.url
+
+        # --- Recursive link extraction (shared logic, all workers) ---
+        extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
+
+        result = CrawlResult(
+            job_id=request.job_id,
+            url=final_url,
+            worker=WORKER_TYPE,
+            language=request.language,
+            html=html,
+            status_code=status_code,
+            network="dark",
+            depth=request.depth,
+            extracted_links=extracted_links,
+            child_tasks_queued=queued_count,
+            duplicate_links_skipped=skipped_count,
+            was_escalated=request.retry_count > 0,
+            escalation_reason=request.escalation_reason,
+        )
 
         payload_bytes = result.model_dump_json().encode("utf-8")
 
@@ -153,7 +175,10 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
-        logger.info(f"Published raw result for {request.url}")
+        logger.info(
+            f"Published raw result for {request.url} "
+            f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
+        )
 
     except ValidationError as e:
         logger.error(f"Invalid message format: {e}")
@@ -170,7 +195,7 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
 
 
 async def main():
-    """Main worker lifecycle loop."""
+    """Main worker lifecycle loop. Dark worker is always active - no feature flag gating."""
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -181,7 +206,10 @@ async def main():
 
     await producer.start()
     await consumer.start()
-    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' (Tor proxy: {TOR_PROXY_URL}).")
+    logger.info(
+        f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' "
+        f"(Tor proxy: {TOR_PROXY_URL}, recursive crawling enabled)."
+    )
 
     loop = asyncio.get_running_loop()
     current_task = asyncio.current_task()

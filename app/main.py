@@ -23,13 +23,7 @@ async def lifespan(app: FastAPI):
     logger.info("API starting up...")
     # Connect to all services
     await pg_client.connect()
-    await pg_client.ensure_user(
-        user_id="USR12345",
-        full_name="Demo User",
-        username="demo",
-        email="demo@example.com",
-        password_hash="demo-password-hash",
-    )
+    # NOTE: not creating demo user on startup; assume `USR12345` already exists.
     if kafka_producer:
         await kafka_producer.start()
     minio_client.connect()

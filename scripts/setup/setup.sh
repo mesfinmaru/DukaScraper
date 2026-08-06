@@ -35,8 +35,8 @@ echo "[3/4] Creating Kafka topics (crawl.requests, crawl.raw, crawl.parsed, ...)
 docker compose up kafka-topics-init
 
 echo ""
-echo "[4/4] Starting API + surface/deep/parser/exporter workers..."
-docker compose up -d api surface-worker parser-worker deep-worker exporter-worker
+echo "[4/4] Starting API + crawl/render/parse/LLM workers..."
+docker compose up -d api surface-worker parser-worker deep-worker llm-worker exporter-worker
 
 echo ""
 echo "=================================================================="
@@ -59,7 +59,10 @@ echo ""
 echo "Try it: submit a crawl job"
 echo '  curl -X POST http://localhost:8000/api/v1/jobs/trigger \'
 echo '    -H "Content-Type: application/json" \'
-echo '    -d "{\"url\": \"https://example.com\", \"user_id\": \"USR12345\"}"'
+echo '    -d "{\"url\": \"https://www.ena.et/\", \"user_id\": \"USR12345\", \"language\": \"am\"}"'
+echo ""
+echo "Or run the full demo set from the Airflow crawl targets file:"
+echo '  docker compose exec api python -c "from app.airflow.dags.dynamic_crawl_scheduler_dag import load_and_dispatch_targets; load_and_dispatch_targets(None)"'
 echo ""
 echo "WSL usage: export APP_ENV=wsl before running API/workers natively in Ubuntu WSL."
 echo ""
@@ -68,4 +71,4 @@ echo "  1. Set DARK_ENABLED=true in .env"
 echo "  2. docker compose --profile dark up -d tor dark-worker"
 echo ""
 echo "Check status: docker compose ps"
-echo "View logs:    docker compose logs -f surface-worker parser-worker exporter-worker"
+echo "View logs:    docker compose logs -f surface-worker parser-worker llm-worker exporter-worker"

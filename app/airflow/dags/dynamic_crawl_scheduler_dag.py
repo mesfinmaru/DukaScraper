@@ -41,7 +41,7 @@ def load_and_dispatch_targets(**context):
         request_payload = CrawlRequest(
             job_id=target.get("job_id"),
             url=target.get("url"),
-            worker_type=target.get("worker_type", "surface-worker"),
+            worker_type=target.get("worker_type", "surface"),
             language=target.get("language", "en"),
             job_params=target.get("job_params", {}),
         )
@@ -55,7 +55,7 @@ def load_and_dispatch_targets(**context):
     producer.flush()
     print(f"✅ Successfully dispatched {dispatched_count} crawl targets to Kafka topic '{settings.crawl_request_topic}'.")
 
-
+\
 with DAG(
     "duka_dynamic_crawl_pipeline",
     default_args=default_args,

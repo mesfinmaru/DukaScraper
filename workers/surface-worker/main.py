@@ -20,7 +20,9 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.constants.worker_assignment import check_escalation
 from app.pipeline.schemas import CrawlRequest, CrawlResult
+from app.services.recursive_crawl_service import extract_and_queue_children
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -34,6 +36,7 @@ KAFKA_BOOTSTRAP_SERVERS = settings.KAFKA_BOOTSTRAP_SERVERS
 CONSUME_TOPIC = settings.crawl_request_topic
 PRODUCE_TOPIC = settings.crawl_raw_topic
 WORKER_TYPE = "surface"
+MAX_RETRY_COUNT = 3  # Circuit-breaker on escalation loops
 
 # --- MinIO Setup ---
 BUCKET_NAME = settings.MINIO_RAW_BUCKET
@@ -54,7 +57,6 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
-
 
 # --- Rule-Based Proxy Manager ---
 class RuleBasedProxyManager:
@@ -79,7 +81,6 @@ class RuleBasedProxyManager:
 
         # Rule 1: Region/Language-specific routing (e.g., Amharic / local targets)
         if language == "am":
-            # Try to match an Africa or local regional proxy if available in the pool
             local_proxies = [p for p in self.proxies if any(k in p.lower() for k in ["africa", "local", "eu"])]
             if local_proxies:
                 selected_proxy = local_proxies[self._index % len(local_proxies)]
@@ -120,6 +121,49 @@ async def save_to_minio(job_id: str, payload_bytes: bytes):
     await asyncio.to_thread(_upload_to_minio_sync, job_id, payload_bytes)
 
 
+async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, reason: str) -> None:
+    """Requeue a job to the DEEP worker after detecting auth/WAF/empty-shell signals."""
+    if request.retry_count >= MAX_RETRY_COUNT:
+        logger.warning(
+            f"Job {request.job_id} exceeded max escalation retries ({MAX_RETRY_COUNT}); "
+            f"giving up on {request.url}"
+        )
+        return
+
+    escalated_request = request.model_copy(
+        update={
+            "worker_type": "deep",
+            "target_layer": "deep",
+            "retry_count": request.retry_count + 1,
+            "escalation_reason": reason,
+        }
+    )
+    await producer.send_and_wait(
+        CONSUME_TOPIC,
+        value=escalated_request.model_dump_json().encode("utf-8"),
+        key=request.job_id.encode("utf-8"),
+    )
+    logger.warning(
+        f"Escalated job {request.job_id} ({request.url}) to DEEP worker "
+        f"(reason={reason}, retry_count={escalated_request.retry_count})"
+    )
+
+
+async def extract_and_queue_children_local(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    html: str,
+) -> tuple[list[str], int, int]:
+    """Thin wrapper around the shared recursive_crawl_service for this worker's topics."""
+    return await extract_and_queue_children(
+        producer=producer,
+        request=request,
+        html=html,
+        consume_topic=CONSUME_TOPIC,
+        redis_url=settings.REDIS_URL,
+    )
+
+
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
     """Processes a single incoming crawl request from Kafka using dynamic proxies."""
     try:
@@ -129,14 +173,16 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if request.worker_type != WORKER_TYPE:
             return
 
-        logger.info(f"Processing job {request.job_id} [{request.language}] for URL: {request.url}")
+        logger.info(
+            f"Processing job {request.job_id} [{request.language}] depth={request.depth}/{request.max_depth} "
+            f"for URL: {request.url}"
+        )
 
         # Select rule-based proxy for this specific request
         proxy_url = proxy_manager.get_proxy(request.language, request.url)
         if proxy_url:
-            logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")  # Log domain/ip without credentials
+            logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")
 
-        # Use a dynamic client or pass proxy per request to ensure thread safety
         async with httpx.AsyncClient(
             proxy=proxy_url,
             headers=DEFAULT_HEADERS,
@@ -145,39 +191,44 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         ) as client:
             try:
                 response = await client.get(request.url)
-                response.raise_for_status()
-
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=str(response.url),
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html=response.text,
-                    status_code=response.status_code,
-                    network="surface",
-                )
+                html = response.text
+                status_code = response.status_code
+                final_url = str(response.url)
             except httpx.HTTPStatusError as e:
                 logger.warning(f"HTTP error {e.response.status_code} for {request.url} using proxy")
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=str(e.request.url),
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html=e.response.text if e.response is not None else "",
-                    status_code=e.response.status_code,
-                    network="surface",
-                )
+                html = e.response.text if e.response is not None else ""
+                status_code = e.response.status_code
+                final_url = str(e.request.url)
             except httpx.RequestError as e:
                 logger.warning(f"Request error for {request.url}: {e}")
-                result = CrawlResult(
-                    source_job_id=request.job_id,
-                    url=request.url,
-                    worker=WORKER_TYPE,
-                    language=request.language,
-                    html="",
-                    status_code=599,
-                    network="surface",
-                )
+                html = ""
+                status_code = 599
+                final_url = request.url
+
+        # --- Auto-escalation check (SURFACE -> DEEP) ---
+        should_escalate, reason = check_escalation(status_code, html, WORKER_TYPE)
+        if should_escalate:
+            await escalate_to_deep(producer, request, reason)
+            return  # Do not publish a partial/blocked CrawlResult; DEEP worker will produce the real one
+
+        # --- Recursive link extraction (shared logic, all workers) ---
+        extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
+
+        result = CrawlResult(
+            job_id=request.job_id,
+            url=final_url,
+            worker=WORKER_TYPE,
+            language=request.language,
+            html=html,
+            status_code=status_code,
+            network="surface",
+            depth=request.depth,
+            extracted_links=extracted_links,
+            child_tasks_queued=queued_count,
+            duplicate_links_skipped=skipped_count,
+            was_escalated=request.retry_count > 0,
+            escalation_reason=request.escalation_reason,
+        )
 
         payload_bytes = result.model_dump_json().encode("utf-8")
 
@@ -190,7 +241,10 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
-        logger.info(f"Published raw result for {request.url}")
+        logger.info(
+            f"Published raw result for {request.url} "
+            f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
+        )
 
     except ValidationError as e:
         logger.error(f"Invalid message format: {e}")
@@ -218,7 +272,10 @@ async def main():
 
     await producer.start()
     await consumer.start()
-    logger.info(f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' with rule-based proxy routing.")
+    logger.info(
+        f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' "
+        f"with rule-based proxy routing + recursive crawling + auto-escalation."
+    )
 
     loop = asyncio.get_running_loop()
     current_task = asyncio.current_task()

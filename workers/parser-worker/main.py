@@ -5,9 +5,13 @@ import logging
 import os
 import re
 import signal
+import sys
 from datetime import datetime
 from typing import Any
-import sys
+
+from app.amharic.cleaning.cleaner import clean_and_extract_text as clean_amharic_text
+from app.amharic.language_detection.detector import detect_language_from_text as detect_amharic_language
+from app.amharic.quality.scorer import score_text_quality
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -24,6 +28,7 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlResult, ParsedItem
+from app.storage.postgres.client import pg_client
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -33,6 +38,7 @@ logger = logging.getLogger(__name__)
 KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
 KAFKA_INPUT_TOPIC = settings.crawl_raw_topic
 KAFKA_OUTPUT_TOPIC = settings.crawl_parsed_topic
+MINIO_RAW_BUCKET = settings.MINIO_RAW_BUCKET
 MINIO_PARSED_BUCKET = settings.MINIO_PARSED_BUCKET
 
 minio_client = Minio(
@@ -44,60 +50,13 @@ minio_client = Minio(
 
 
 def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
-    """
-    Strips HTML boilerplate and extracts clean text based on target language:
-    - For Amharic ('am'): Isolates text containing Ethiopic script characters.
-    - For English ('en'): Extracts clean general article text.
-    """
-    if not raw_html_or_text:
-        return ""
-
-    try:
-        soup = BeautifulSoup(raw_html_or_text, "lxml")
-    except FeatureNotFound:
-        soup = BeautifulSoup(raw_html_or_text, "html.parser")
-    for script_or_style in soup(["script", "style", "header", "footer", "nav"]):
-        script_or_style.decompose()
-
-    text = soup.get_text(separator=" ")
-
-    # Normalize spacing and clean up messy hidden linebreaks
-    lines = (line.strip() for line in text.splitlines())
-    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-    clean_text = "\n".join(chunk for chunk in chunks if chunk)
-
-    if language == "am":
-        # Regex matching Ethiopic script characters (\u1200-\u137F) along with numbers/punctuation
-        amharic_sentence_pattern = re.compile(r"[\u1200-\u137F\s\d.,!?።፣፤፥፦]+")
-        extracted_matches = amharic_sentence_pattern.findall(clean_text)
-
-        final_sentences = []
-        for block in extracted_matches:
-            cleaned_block = re.sub(r"\s+", " ", block).strip()
-            if len(cleaned_block) > 5 and any("\u1200" <= char <= "\u137f" for char in cleaned_block):
-                final_sentences.append(cleaned_block)
-        return "\n".join(final_sentences)
-
-    else:
-        # Standard English/Latin text cleanup
-        paragraphs = [p.strip() for p in clean_text.split("\n") if len(p.strip()) > 20]
-        return "\n".join(paragraphs) if paragraphs else clean_text
+    """Compatibility wrapper around the shared Amharic-aware cleaner."""
+    return clean_amharic_text(raw_html_or_text, language)
 
 
 def detect_language_from_text(text: str, fallback: str = "en") -> str:
-    """Detect Amharic vs Latin content using Unicode ranges."""
-
-    if not text:
-        return fallback or "en"
-
-    amharic_chars = sum(1 for char in text if "\u1200" <= char <= "\u137f")
-    latin_chars = sum(1 for char in text if char.isascii() and char.isalpha())
-
-    if amharic_chars > latin_chars:
-        return "am"
-    if latin_chars > 0:
-        return "en"
-    return fallback or "en"
+    """Compatibility wrapper around the shared language detector."""
+    return detect_amharic_language(text, fallback)
 
 
 def extract_title(raw_html_or_text: str) -> str | None:
@@ -214,7 +173,14 @@ async def ensure_minio_bucket() -> None:
         logger.info(f"Created MinIO bucket: {MINIO_PARSED_BUCKET}")
 
 
-async def parse_message(crawl_result: CrawlResult) -> dict[str, Any]:
+async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]:
+    """Parse a CrawlResult into structured data and persist parsed_items metadata.
+
+    Returns:
+        (item_id, parsed_item_dict) - item_id comes from PostgreSQL duka_db.parsed_items
+        (auto-generated, e.g. 'ITEM00000001'). NOTE: source_type is NOT set here -
+        it is determined later by the llm-worker intelligence pipeline.
+    """
     source_html = crawl_result.html or ""
     start_time = asyncio.get_running_loop().time()
     extracted_text = await asyncio.to_thread(clean_and_extract_text, source_html, crawl_result.language or "en")
@@ -230,11 +196,34 @@ async def parse_message(crawl_result: CrawlResult) -> dict[str, Any]:
         "title": title,
         "publish_date": publish_date,
         "detected_language": detected_language,
+        "fetch_duration": crawl_result.fetch_duration,
+        "payload_size_bytes": len(source_html.encode("utf-8")),
+        "proxy_ip": None,
+        "retry_count": None,
     }
 
     status = "failed" if crawl_result.status_code >= 400 and not extracted_text else "completed"
+
+    # --- Persist parsed_items metadata FIRST to obtain the auto-generated item_id ---
+    raw_html_path = f"s3://{MINIO_RAW_BUCKET}/crawl_{crawl_result.job_id}.json"
+    parsed_json_path = f"s3://{MINIO_PARSED_BUCKET}/{crawl_result.job_id}.json"
+
+    item_record = await pg_client.create_parsed_item(
+        job_id=crawl_result.job_id,
+        source_url=crawl_result.url,
+        raw_html_path=raw_html_path,
+        parsed_json_path=parsed_json_path,
+        language=detected_language,
+        title=title,
+        publish_date=publish_date,
+        character_count=len(extracted_text),
+        word_count=len(extracted_text.split()) if extracted_text else 0,
+    )
+    item_id = item_record["item_id"]
+
     parsed_item = ParsedItem(
-        source_job_id=crawl_result.source_job_id,
+        job_id=crawl_result.job_id,
+        item_id=item_id,
         url=crawl_result.url,
         worker=crawl_result.worker,
         language=detected_language,
@@ -242,13 +231,14 @@ async def parse_message(crawl_result: CrawlResult) -> dict[str, Any]:
         status=status,
         parse_duration=parse_duration,
     )
-    return parsed_item.model_dump()
+    return item_id, parsed_item.model_dump()
 
 
 async def consume_and_parse():
     logger.info(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, listening on topic: {KAFKA_INPUT_TOPIC}")
 
     await ensure_minio_bucket()
+    await pg_client.connect()
 
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
@@ -285,15 +275,15 @@ async def consume_and_parse():
                 crawl_result = CrawlResult(**json.loads(message.value.decode("utf-8")))
                 logger.info(f"Processing content from source [{crawl_result.language}]: {crawl_result.url}")
 
-                parsed_payload = await parse_message(crawl_result)
+                item_id, parsed_payload = await parse_message(crawl_result)
                 output_payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
-                # 1. Produce to Kafka for the downstream exporter/storage worker
-                await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes, key=crawl_result.source_job_id.encode("utf-8"))
-                logger.info(f"Produced parsed item to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
+                # 1. Produce to Kafka for the downstream exporter/llm-worker
+                await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes, key=crawl_result.job_id.encode("utf-8"))
+                logger.info(f"Produced parsed item {item_id} to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
 
                 # 2. Save structured output to MinIO parsed bucket
-                object_name = f"{crawl_result.source_job_id}.json"
+                object_name = f"{crawl_result.job_id}.json"
                 await save_to_minio(object_name, output_payload_bytes)
 
             except json.JSONDecodeError:
@@ -311,6 +301,7 @@ async def consume_and_parse():
         logger.info("Shutting down parser worker...")
         await consumer.stop()
         await producer.stop()
+        await pg_client.close()
 
 
 def handle_shutdown(loop: asyncio.AbstractEventLoop):
