@@ -57,6 +57,30 @@ class TestExtractLinks:
         # Should extract the good link, may skip the bad one
         assert len(links) >= 1
 
+    def test_exclude_static_assets(self):
+        """Do not return links that end in image or asset extensions."""
+        html = """
+        <a href="https://example.com/image.png">Image</a>
+        <a href="https://example.com/page.html">Page</a>
+        <a href="https://example.com/script.js">Script</a>
+        """
+        links = LinkExtractionService.extract_links(html, "https://example.com")
+        assert "https://example.com/page.html" in links
+        assert "https://example.com/image.png" not in links
+        assert "https://example.com/script.js" not in links
+
+    def test_exclude_mailto_and_javascript(self):
+        """Skip mailto and javascript hrefs."""
+        html = """
+        <a href="mailto:test@example.com">Email</a>
+        <a href="javascript:void(0)">JS</a>
+        <a href="https://example.com/page">Page</a>
+        """
+        links = LinkExtractionService.extract_links(html, "https://example.com")
+        assert "https://example.com/page" in links
+        assert not any(link.startswith("mailto:") for link in links)
+        assert not any(link.startswith("javascript:") for link in links)
+
 
 class TestNormalizeURL:
     """Test URL normalization for deduplication."""

@@ -62,10 +62,60 @@ class LinkExtractionService:
         "ecommerce": [r"shop", r"store", r"amazon", r"ebay", r"aliexpress", r"/shop/", r"/product/"],
     }
 
+    INVALID_SCHEMES = {"mailto", "javascript", "tel", "sms", "data"}
+    EXCLUDED_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".ico",
+        ".css",
+        ".js",
+        ".json",
+        ".pdf",
+        ".zip",
+        ".rar",
+        ".exe",
+        ".mp4",
+        ".mp3",
+        ".wav",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".rss",
+        ".xml",
+    }
+
+    @staticmethod
+    def _is_static_asset(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            path = (parsed.path or "").lower()
+            return any(path.endswith(ext) for ext in LinkExtractionService.EXCLUDED_EXTENSIONS)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_valid_scheme(href: str) -> bool:
+        try:
+            parsed = urlparse(href)
+            scheme = (parsed.scheme or "").lower()
+            if not scheme:
+                return True
+            return scheme in {"http", "https"} and scheme not in LinkExtractionService.INVALID_SCHEMES
+        except Exception:
+            return False
+
     @staticmethod
     def extract_links(html: str, base_url: str) -> list[str]:
         """
-        Extract all href values from HTML as absolute URLs.
+        Extract all href values from HTML as absolute HTTP(S) URLs.
 
         Args:
             html: Raw HTML content
@@ -77,18 +127,29 @@ class LinkExtractionService:
         if not html:
             return []
 
-        # Regex to match href="..." and href='...' and href=...
         pattern = r'href\s*=\s*["\']?([^"\'>\s]+)["\']?'
         matches = re.findall(pattern, html, re.IGNORECASE)
 
         links = []
+        seen = set()
         for href in matches:
+            if not href or not LinkExtractionService._is_valid_scheme(href):
+                continue
+
             try:
-                # Convert relative URLs to absolute
                 absolute_url = urljoin(base_url, href)
-                # Basic validation
-                if absolute_url.startswith(("http://", "https://", "ftp://")):
-                    links.append(absolute_url)
+                parsed = urlparse(absolute_url)
+                if parsed.scheme.lower() not in {"http", "https"}:
+                    continue
+                if not parsed.netloc:
+                    continue
+                if LinkExtractionService._is_static_asset(absolute_url):
+                    continue
+
+                normalized_href = absolute_url.strip()
+                if normalized_href and normalized_href not in seen:
+                    seen.add(normalized_href)
+                    links.append(normalized_href)
             except Exception as e:
                 logger.debug(f"Failed to process href '{href}': {e}")
 
@@ -223,7 +284,16 @@ class LinkExtractionService:
         for link in links:
             try:
                 parsed = urlparse(link)
+                scheme = (parsed.scheme or "").lower()
                 link_domain = parsed.netloc.lower()
+
+                if scheme not in {"http", "https"}:
+                    logger.debug(f"Filtered out {link} because unsupported scheme")
+                    continue
+
+                if LinkExtractionService._is_static_asset(link):
+                    logger.debug(f"Filtered out static asset link {link}")
+                    continue
 
                 # Skip if domain in blocklist
                 if any(skip_d.lower() in link_domain for skip_d in skip_domains):

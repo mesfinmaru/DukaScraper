@@ -51,6 +51,14 @@ def _coerce_publish_date(value: str | date | datetime | None) -> date | None:
     raise TypeError(f"Unsupported publish_date value: {type(value)!r}")
 
 
+def _normalize_user_id(value: str) -> str:
+    """Normalize a user identifier to 8 uppercase alphanumeric characters."""
+    normalized = re.sub(r"[^A-Za-z0-9]", "", (value or "").upper())
+    if not normalized:
+        normalized = "USER0000"
+    return normalized[:8].ljust(8, "0")
+
+
 class PostgreSQLClient:
     """PostgreSQL client for both duka_system and duka_db"""
 

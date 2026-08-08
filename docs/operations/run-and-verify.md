@@ -60,6 +60,10 @@ docker exec postgres psql -U postgres -d duka -c "SELECT item_id, job_id, source
 docker exec clickhouse clickhouse-client --query "SELECT item_id, job_id, category, threat_severity, summary FROM duka_scraper.intelligence_analytics ORDER BY created_at DESC LIMIT 5;"
 ```
 
+```bash
+docker exec clickhouse clickhouse-client --query "SELECT worker, status_code, latency_ms, payload_size_bytes, created_at FROM duka_scraper.crawler_performance ORDER BY created_at DESC LIMIT 5;"
+```
+
 ## 7. Verify recursive crawling
 
 Check the worker logs for child requests with a depth greater than zero:

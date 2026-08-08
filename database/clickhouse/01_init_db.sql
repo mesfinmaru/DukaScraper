@@ -1,14 +1,20 @@
+-- ============================================================
+-- ClickHouse init: duka_scraper database
+-- ============================================================
+-- Single source of truth for ClickHouse schema.
+-- duka_analytics (old schema) REMOVED - replaced by:
+--   scraped_analytics     -> per-item crawl/parse analytics
+--   crawler_performance   -> per-attempt worker performance
+--   intelligence_analytics -> aggregated source_type intelligence
+-- ============================================================
+
 CREATE DATABASE IF NOT EXISTS duka_scraper;
 
--- NOTE: source_type intentionally excluded from both tables below.
--- Content classification now happens POST-parsing via the llm-worker
--- intelligence pipeline (Ollama qwen2.5:14b), which writes
--- category/threat_severity/entities/source_type to
--- duka_analytics.intelligence_analytics (see
--- app/storage/clickhouse/intelligence_schema.sql), not here.
+DROP TABLE IF EXISTS duka_scraper.duka_analytics;
 
 CREATE TABLE IF NOT EXISTS duka_scraper.scraped_analytics (
-    item_id UUID,
+    item_id String,
+    job_id String,
     source_domain LowCardinality(String),
     crawl_timestamp DateTime,
     language LowCardinality(String),
@@ -18,23 +24,29 @@ CREATE TABLE IF NOT EXISTS duka_scraper.scraped_analytics (
 ORDER BY (source_domain, crawl_timestamp);
 
 CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
-    job_id UUID,
+    job_id String,
     worker LowCardinality(String),
     status_code UInt16,
     latency_ms UInt32,
     proxy_ip String,
     retry_count UInt8,
-    payload_size_bytes UInt32
+    payload_size_bytes UInt32,
+    created_at DateTime DEFAULT now()
 ) ENGINE = MergeTree()
 ORDER BY (worker, job_id);
 
--- NOTE: The exporter-worker also creates/maintains `duka_analytics` at
--- runtime (see workers/exporter-worker/main.py init_databases()), which
--- includes job_id/item_id/url/worker/language/character_count columns.
--- That table is the one actually populated by the live pipeline; the
--- tables above are reserved for future richer analytics (per-item +
--- per-crawl-attempt).
---
--- The `intelligence_analytics` table (LLM-derived source_type, category,
--- threat_severity, entities, summary) is created separately by the
--- llm-worker / app/storage/clickhouse/intelligence_schema.sql.
+CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_analytics (
+    job_id String,
+    item_id String,
+    url String,
+    source_type String,
+    category LowCardinality(String),
+    threat_severity UInt8,
+    entities Array(String),
+    summary String,
+    language LowCardinality(String),
+    llm_model String,
+    llm_score Float32,
+    created_at DateTime DEFAULT now()
+) ENGINE = MergeTree()
+ORDER BY (created_at, category);

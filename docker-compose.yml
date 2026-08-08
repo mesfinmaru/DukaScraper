@@ -168,6 +168,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - duka-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -344,7 +358,7 @@ services:
       - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=qwen2.5:0.5b
+      - OLLAMA_MODEL=qwen2.5:14b
       - CH_HOST=clickhouse
       - CH_PORT=8123
       - CH_DATABASE=duka_scraper
@@ -361,6 +375,23 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      until curl -s http://ollama:11434/api/tags >/dev/null 2>&1; do
+        echo "Waiting for Ollama service..."
+        sleep 2
+      done
+      ollama pull qwen2.5:14b
+    networks:
+      - duka-net
+    restart: "no"
 
   exporter-worker:
     build:

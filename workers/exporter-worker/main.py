@@ -10,6 +10,7 @@ import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import clickhouse_connect
 from aiokafka import AIOKafkaConsumer
@@ -93,30 +94,38 @@ async def init_databases():
                 raise
 
     try:
-        # NOTE: source_type intentionally excluded. Classification now happens
-        # POST-parsing via the llm-worker intelligence pipeline, which writes
-        # to the separate `intelligence_analytics` table (see
-        # app/storage/clickhouse/intelligence_schema.sql), not here.
+        # Ensure the analytics database and required tables exist.
+        ch_client.command(f"CREATE DATABASE IF NOT EXISTS {settings.CLICKHOUSE_DB}")
         ch_client.command(
             """
-            CREATE TABLE IF NOT EXISTS duka_analytics (
+            CREATE TABLE IF NOT EXISTS duka_scraper.scraped_analytics (
                 job_id String,
                 item_id String,
-                url String,
-                worker String,
-                language String,
-                character_count Int32,
-                created_at DateTime DEFAULT now()
-            ) ENGINE = MergeTree() ORDER BY job_id;
+                source_domain LowCardinality(String),
+                crawl_timestamp DateTime,
+                language LowCardinality(String),
+                word_count UInt32,
+                character_count UInt32
+            ) ENGINE = MergeTree() ORDER BY (source_domain, crawl_timestamp);
             """
         )
-        logger.info("ClickHouse table 'duka_analytics' verified/created.")
+        logger.info("ClickHouse table 'scraped_analytics' verified/created.")
 
-        # Backfill item_id column for pre-existing tables (safe if it already exists)
-        try:
-            ch_client.command("ALTER TABLE duka_analytics ADD COLUMN IF NOT EXISTS item_id String DEFAULT ''")
-        except Exception as e:
-            logger.warning(f"ClickHouse ALTER TABLE for item_id skipped/failed: {e}")
+        ch_client.command(
+            """
+            CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
+                job_id String,
+                worker LowCardinality(String),
+                status_code UInt16,
+                latency_ms UInt32,
+                proxy_ip String,
+                retry_count UInt8,
+                payload_size_bytes UInt32,
+                created_at DateTime DEFAULT now()
+            ) ENGINE = MergeTree() ORDER BY (worker, job_id);
+            """
+        )
+        logger.info("ClickHouse table 'crawler_performance' verified/created.")
     except Exception as e:
         logger.error(f"Failed to initialize ClickHouse table: {e}")
 
@@ -211,13 +220,25 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
         logger.error(f"PostgreSQL Export Error [{item_id}]: {e}")
 
     try:
+        source_domain = ""
+        if parsed_item.url:
+            source_domain = urlparse(parsed_item.url).hostname or ""
+
         await asyncio.to_thread(
             ch_client.insert,
-            "duka_analytics",
-            [[job_id, item_id, data["url"], data["worker"], data["language"], data["character_count"]]],
-            column_names=["job_id", "item_id", "url", "worker", "language", "character_count"],
+            "scraped_analytics",
+            [[
+                job_id,
+                item_id,
+                source_domain,
+                datetime.now(timezone.utc),
+                data["language"],
+                int(data.get("word_count", 0) or 0),
+                int(data.get("character_count", 0) or 0),
+            ]],
+            column_names=["job_id", "item_id", "source_domain", "crawl_timestamp", "language", "word_count", "character_count"],
         )
-        logger.info(f"Inserted metrics for {item_id} into ClickHouse")
+        logger.info(f"Inserted metrics for {item_id} into ClickHouse scraped_analytics")
     except Exception as e:
         logger.error(f"ClickHouse Export Error [{item_id}]: {e}")
 

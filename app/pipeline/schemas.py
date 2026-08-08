@@ -270,22 +270,6 @@ class ExportRecord(BaseModel):
     created_at: Optional[datetime] = None
 
 
-class ClickHouseAnalyticsRecord(BaseModel):
-    """
-    Schema for ClickHouse duka_analytics table
-    Analytics and time-series data (metrics only - no full text)
-    """
-
-    job_id: str
-    language: str
-    worker: str
-    source_domain: str
-    character_count: int
-    status: str
-    crawl_date: str
-    created_at: datetime
-
-
 class ElasticsearchArticle(BaseModel):
     """
     Schema for Elasticsearch duka_articles index

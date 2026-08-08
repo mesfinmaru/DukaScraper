@@ -6,7 +6,7 @@ import os
 import re
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from app.amharic.cleaning.cleaner import clean_and_extract_text as clean_amharic_text
@@ -17,6 +17,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup, FeatureNotFound
 from minio import Minio
 from pydantic import ValidationError
+import clickhouse_connect
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -47,6 +48,47 @@ minio_client = Minio(
     secret_key=settings.MINIO_ROOT_PASSWORD,
     secure=settings.MINIO_SECURE,
 )
+
+ch_client = None
+
+
+async def init_clickhouse() -> None:
+    """Initialize ClickHouse client and verify analytics schema."""
+    global ch_client
+    if ch_client is not None:
+        return
+
+    try:
+        ch_client = clickhouse_connect.get_client(
+            host=settings.CLICKHOUSE_HOST,
+            port=settings.CLICKHOUSE_HTTP_PORT,
+            username=settings.CLICKHOUSE_USER,
+            password=settings.CLICKHOUSE_PASSWORD or "",
+            secure=False,
+            database=settings.CLICKHOUSE_DB,
+            verify=False,
+        )
+        logger.info("ClickHouse client initialized for parser worker")
+
+        ch_client.command(f"CREATE DATABASE IF NOT EXISTS {settings.CLICKHOUSE_DB}")
+        ch_client.command(
+            """
+            CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
+                job_id String,
+                worker LowCardinality(String),
+                status_code UInt16,
+                latency_ms UInt32,
+                proxy_ip String,
+                retry_count UInt8,
+                payload_size_bytes UInt32,
+                created_at DateTime DEFAULT now()
+            ) ENGINE = MergeTree() ORDER BY (worker, job_id);
+            """
+        )
+        logger.info("Verified ClickHouse table 'crawler_performance' for parser worker")
+    except Exception as e:
+        logger.error(f"Failed to initialize ClickHouse client in parser worker: {e}")
+        raise
 
 
 def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
@@ -221,6 +263,36 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     )
     item_id = item_record["item_id"]
 
+    if ch_client is not None:
+        try:
+            await asyncio.to_thread(
+                ch_client.insert,
+                "crawler_performance",
+                [[
+                    crawl_result.job_id,
+                    crawl_result.worker,
+                    int(crawl_result.status_code or 0),
+                    int(crawl_result.fetch_duration * 1000) if crawl_result.fetch_duration else 0,
+                    "",
+                    0,
+                    len(source_html.encode("utf-8")),
+                    datetime.now(timezone.utc),
+                ]],
+                column_names=[
+                    "job_id",
+                    "worker",
+                    "status_code",
+                    "latency_ms",
+                    "proxy_ip",
+                    "retry_count",
+                    "payload_size_bytes",
+                    "created_at",
+                ],
+            )
+            logger.info(f"Inserted crawler_performance for item {item_id}")
+        except Exception as e:
+            logger.warning(f"Failed to insert crawler_performance for item {item_id}: {e}")
+
     parsed_item = ParsedItem(
         job_id=crawl_result.job_id,
         item_id=item_id,
@@ -237,6 +309,7 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
 async def consume_and_parse():
     logger.info(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, listening on topic: {KAFKA_INPUT_TOPIC}")
 
+    await init_clickhouse()
     await ensure_minio_bucket()
     await pg_client.connect()
 

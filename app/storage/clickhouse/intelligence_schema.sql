@@ -2,10 +2,8 @@ app/storage/clickhouse/intelligence_schema.sql-- ClickHouse Intelligence Analyti
 -- Stores LLM-analyzed content for threat detection, data leak identification, etc.
 --
 -- NOTE ON DATABASE NAME: this table lives inside the `duka_scraper`
--- database (see settings.CLICKHOUSE_DB / database/clickhouse/01_init_db.sql),
--- the SAME database as `duka_analytics` (a TABLE, not a database - created
--- at runtime by exporter-worker). Do not confuse the `duka_analytics` TABLE
--- with a database of the same name.
+-- database (see settings.CLICKHOUSE_DB / database/clickhouse/01_init_db.sql).
+-- `intelligence_analytics` is the dedicated LLM classification table.
 --
 -- category values:
 --   data_leak        Credentials, corporate DB dumps, PII, leaks

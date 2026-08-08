@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from datetime import datetime
@@ -36,6 +37,11 @@ from app.common.constants.intelligence_categories import (
     ALL_INTELLIGENCE_CATEGORIES,
     CATEGORY_DESCRIPTIONS,
     DEFAULT_INTELLIGENCE_CATEGORY,
+)
+from app.common.constants.source_types import (
+    ALL_SOURCE_TYPES,
+    SOURCE_TYPE_DESCRIPTIONS,
+    DEFAULT_SOURCE_TYPE,
 )
 from app.pipeline.schemas import ParsedItem, IntelligenceAnalytics
 from app.storage.postgres.client import pg_client
@@ -127,6 +133,9 @@ class OllamaLLMClient:
         category_list_str = "\n".join(
             f'  - "{cat}": {desc}' for cat, desc in CATEGORY_DESCRIPTIONS.items()
         )
+        source_type_list_str = "\n".join(
+            f'  - "{st}": {desc}' for st, desc in SOURCE_TYPE_DESCRIPTIONS.items()
+        )
         prompt = f"""Analyze this scraped content for actionable intelligence.
 
 Source URL: {url}
@@ -134,11 +143,15 @@ Source URL: {url}
 Content:
 {parsed_text[:2000]}
 
-Classify into exactly ONE of these categories:
+First, classify the SOURCE TYPE of the content. Pick ONE of the following:
+{source_type_list_str}
+
+Second, classify the content into exactly ONE intelligence CATEGORY. Pick ONE of the following:
 {category_list_str}
 
 Please respond ONLY with a valid JSON object (no markdown, no explanation) containing:
 {{
+  "source_type": one of {sorted(ALL_SOURCE_TYPES)},
   "category": one of {sorted(ALL_INTELLIGENCE_CATEGORIES)},
   "threat_severity": integer from 1-5 (1=low, 5=critical),
   "entities": list of extracted entities (names, emails, IPs, domains, sensitive info),
@@ -162,12 +175,13 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
                 return self._empty_intelligence()
 
             result = response.json()
-            response_text = result.get("response", "").strip()
+            response_text = str(result.get("response", "")).strip()
 
-            # Parse JSON response
-            intelligence = json.loads(response_text)
+            if not response_text:
+                logger.error("Empty response text from Ollama")
+                return self._empty_intelligence()
 
-            # Validate and normalize
+            intelligence = self._parse_intelligence_response(response_text)
             intelligence = self._validate_intelligence(intelligence)
             intelligence["llm_score"] = result.get("eval_count", 0) / max(result.get("eval_duration", 1), 1)
 
@@ -182,27 +196,60 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             return self._empty_intelligence()
 
     @staticmethod
+    def _parse_intelligence_response(response_text: str) -> dict:
+        """Parse the Ollama response text into structured intelligence."""
+        try:
+            cleaned_text = response_text.strip()
+            if cleaned_text.startswith("{") and cleaned_text.endswith("}"):
+                return json.loads(cleaned_text)
+
+            # Some models may prefix with trailing text or explanation, extract the first JSON object.
+            match = re.search(r"(\{.*\})", cleaned_text, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+
+            return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from Ollama response: {e}")
+            return {}
+
     def _validate_intelligence(data: dict) -> dict:
         """Validate and normalize LLM output."""
         category = data.get("category", DEFAULT_INTELLIGENCE_CATEGORY)
         if category not in ALL_INTELLIGENCE_CATEGORIES:
             category = DEFAULT_INTELLIGENCE_CATEGORY
 
+        source_type = data.get("source_type", DEFAULT_SOURCE_TYPE)
+        if source_type not in ALL_SOURCE_TYPES:
+            source_type = DEFAULT_SOURCE_TYPE
+
+        raw_entities = data.get("entities", [])
+        if isinstance(raw_entities, str):
+            entities = [e.strip() for e in re.split(r"[\n,;]+", raw_entities) if e.strip()]
+        elif isinstance(raw_entities, list):
+            entities = [str(e).strip() for e in raw_entities if str(e).strip()]
+        else:
+            entities = []
+
+        summary = str(data.get("summary") or data.get("description") or "").strip()
+
         return {
+            "source_type": source_type,
             "category": category,
             "threat_severity": max(1, min(5, int(data.get("threat_severity", 1)))),  # Clamp 1-5
-            "entities": data.get("entities", [])[:50],  # Max 50 entities
-            "summary": (data.get("summary", "")[:200]).strip(),  # Max 200 chars
+            "entities": entities[:50],  # Max 50 entities
+            "summary": summary[:200],  # Max 200 chars
         }
 
     @staticmethod
     def _empty_intelligence() -> dict:
         """Return empty/safe intelligence object."""
         return {
+            "source_type": DEFAULT_SOURCE_TYPE,
             "category": DEFAULT_INTELLIGENCE_CATEGORY,
-            "threat_severity": 0,
+            "threat_severity": 1,
             "entities": [],
-            "summary": "Unable to analyze",
+            "summary": "Unable to extract intelligence from this content.",
             "llm_score": 0.0,
         }
 
@@ -288,7 +335,7 @@ async def process_parsed_item(message_value: bytes):
             job_id=parsed_item.job_id,
             item_id=parsed_item.item_id,
             url=parsed_item.url,
-            source_type=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),  # Inferred source_type
+            source_type=intelligence_data.get("source_type", DEFAULT_SOURCE_TYPE),
             category=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),
             threat_severity=intelligence_data.get("threat_severity", 0),
             entities=intelligence_data.get("entities", []),

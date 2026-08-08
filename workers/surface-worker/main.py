@@ -20,9 +20,9 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
-from app.common.constants.worker_assignment import check_escalation
+from workers.common import check_escalation
 from app.pipeline.schemas import CrawlRequest, CrawlResult
-from app.services.recursive_crawl_service import extract_and_queue_children
+from workers.common import extract_and_queue_children
 
 # --- Logging Setup ---
 logging.basicConfig(
