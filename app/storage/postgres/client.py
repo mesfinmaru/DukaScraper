@@ -67,9 +67,26 @@ class PostgreSQLClient:
         self.db_conn = None
 
     async def connect(self):
-        """Connect to both PostgreSQL databases"""
+        """Connect to both PostgreSQL databases and auto-create missing database/schema objects."""
+        admin_conn = None
         try:
-            # Connect to duka_system
+            # Connect to the default Postgres database for admin tasks.
+            admin_conn = await asyncpg.connect(
+                host=settings.POSTGRES_HOST,
+                port=settings.POSTGRES_PORT,
+                user=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD,
+                database="postgres",
+            )
+            logger.info("Connected to PostgreSQL admin database for initialization.")
+
+            await self._create_database_if_missing(admin_conn, settings.DUKA_SYSTEM_DB)
+            await self._create_database_if_missing(admin_conn, settings.DUKA_DB)
+
+            if admin_conn is not None:
+                await admin_conn.close()
+                admin_conn = None
+
             self.system_conn = await asyncpg.connect(
                 host=settings.POSTGRES_HOST,
                 port=settings.POSTGRES_PORT,
@@ -79,7 +96,6 @@ class PostgreSQLClient:
             )
             logger.info(f"Connected to PostgreSQL {settings.DUKA_SYSTEM_DB}")
 
-            # Connect to duka_db
             self.db_conn = await asyncpg.connect(
                 host=settings.POSTGRES_HOST,
                 port=settings.POSTGRES_PORT,
@@ -89,9 +105,15 @@ class PostgreSQLClient:
             )
             logger.info(f"Connected to PostgreSQL {settings.DUKA_DB}")
 
+            await self._ensure_duka_system_schema()
+            await self._ensure_duka_db_schema()
+
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
             raise
+        finally:
+            if admin_conn is not None:
+                await admin_conn.close()
 
     async def close(self):
         """Close both database connections"""
@@ -118,10 +140,33 @@ class PostgreSQLClient:
 
         return await self.system_conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
 
-    async def create_user(self, full_name: str, username: str, email: str, password_hash: str):
-        """Create a new user in duka_system.users. user_id is auto-generated (e.g. USR12345)."""
+    async def create_user(
+        self,
+        full_name: str,
+        username: str,
+        email: str,
+        password_hash: str,
+        user_id: str | None = None,
+    ):
+        """Create a new user in duka_system.users.
+
+        If user_id is provided, it will be used directly; otherwise the DB will
+        generate a new `USRxxxxx` identifier.
+        """
         if not self.system_conn:
             raise RuntimeError("Database not connected")
+
+        if user_id:
+            return await self.system_conn.fetchrow(
+                """INSERT INTO users (user_id, full_name, username, email, password_hash)
+                   VALUES ($1, $2, $3, $4, $5)
+                   RETURNING user_id, full_name, username, email, created_at""",
+                user_id,
+                full_name,
+                username,
+                email,
+                password_hash,
+            )
 
         return await self.system_conn.fetchrow(
             """INSERT INTO users (full_name, username, email, password_hash)
@@ -133,9 +178,30 @@ class PostgreSQLClient:
             password_hash,
         )
 
-    # Note: `ensure_user` removed per user request. The code expects the
-    # caller to provide a valid existing `user_id` (e.g. 'USR12345'). If a
-    # user must be created programmatically, call `create_user()` explicitly.
+    async def ensure_user(self, user_id: str):
+        """Ensure a user exists for the given user_id, creating a placeholder if needed."""
+        if not self.system_conn:
+            raise RuntimeError("Database not connected")
+
+        normalized_id = _normalize_user_id(user_id)
+        user = await self.get_user(normalized_id)
+        if user:
+            return user
+
+        username = normalized_id.lower()
+        email = f"{username}@example.com"
+        password_hash = "auto-generated"
+
+        return await self.create_user(
+            full_name=f"Auto-created {normalized_id}",
+            username=username,
+            email=email,
+            password_hash=password_hash,
+            user_id=normalized_id,
+        )
+
+    # Note: callers should provide a valid existing `user_id` (e.g. 'USR12345')
+    # or call `ensure_user()` first to auto-create a placeholder collaborator.
 
     # ========== duka_system queries (jobs) ==========
 
@@ -315,6 +381,100 @@ class PostgreSQLClient:
             raise RuntimeError("Database not connected")
 
         return await self.db_conn.fetch("SELECT * FROM exports WHERE job_id = $1", job_id)
+
+    async def _create_database_if_missing(self, admin_conn, database_name: str):
+        """Create a PostgreSQL database only if it does not already exist."""
+        sanitized_name = database_name.replace('"', '""')
+        exists = await admin_conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            database_name,
+        )
+        if not exists:
+            await admin_conn.execute(f"CREATE DATABASE \"{sanitized_name}\"")
+            logger.info(f"Created PostgreSQL database: {database_name}")
+        else:
+            logger.info(f"PostgreSQL database already exists: {database_name}")
+
+    async def _ensure_duka_system_schema(self):
+        """Create the duka_system schema objects if they are missing."""
+        if not self.system_conn:
+            raise RuntimeError("Database not connected")
+
+        await self.system_conn.execute("CREATE SEQUENCE IF NOT EXISTS job_seq START 1 INCREMENT 1")
+        await self.system_conn.execute(
+            "CREATE OR REPLACE FUNCTION generate_user_id() RETURNS VARCHAR AS $$ DECLARE new_id VARCHAR(8); BEGIN LOOP new_id := 'USR' || LPAD((FLOOR(RANDOM() * 90000) + 10000)::TEXT, 5, '0'); EXIT WHEN NOT EXISTS (SELECT 1 FROM users WHERE user_id = new_id); END LOOP; RETURN new_id; END; $$ LANGUAGE plpgsql;"
+        )
+        await self.system_conn.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "    user_id VARCHAR(8) PRIMARY KEY DEFAULT generate_user_id(),"
+            "    full_name VARCHAR(150) NOT NULL,"
+            "    username VARCHAR(100) NOT NULL UNIQUE,"
+            "    email VARCHAR(255) NOT NULL UNIQUE,"
+            "    password_hash VARCHAR(255) NOT NULL,"
+            "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+        await self.system_conn.execute(
+            """CREATE TABLE IF NOT EXISTS jobs (
+    job_id VARCHAR(11) PRIMARY KEY DEFAULT ('JOB' || LPAD(nextval('job_seq')::TEXT, 8, '0')),
+    user_id VARCHAR(8) NOT NULL,
+    url TEXT NOT NULL,
+    worker_type VARCHAR(20) NOT NULL CHECK (worker_type IN ('surface','deep','dark')),
+    language VARCHAR(10) DEFAULT 'am',
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    CONSTRAINT fk_jobs_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+)"""
+        )
+        await self.system_conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
+        await self.system_conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        logger.info("Ensured duka_system schema exists.")
+
+    async def _ensure_duka_db_schema(self):
+        """Create the duka_db schema objects if they are missing."""
+        if not self.db_conn:
+            raise RuntimeError("Database not connected")
+
+        await self.db_conn.execute("CREATE SEQUENCE IF NOT EXISTS item_seq START 1 INCREMENT 1")
+        await self.db_conn.execute("CREATE SEQUENCE IF NOT EXISTS export_seq START 1 INCREMENT 1")
+        await self.db_conn.execute(
+            """CREATE TABLE IF NOT EXISTS parsed_items (
+    item_id VARCHAR(12) PRIMARY KEY DEFAULT ('ITEM' || LPAD(nextval('item_seq')::TEXT, 8, '0')),
+    job_id VARCHAR(11) NOT NULL,
+    source_url TEXT NOT NULL,
+    language VARCHAR(10) DEFAULT 'am',
+    title TEXT,
+    publish_date DATE,
+    character_count INT,
+    word_count INT,
+    raw_html_path TEXT NOT NULL,
+    parsed_json_path TEXT NOT NULL,
+    parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_exported BOOLEAN DEFAULT FALSE,
+    intelligence_processed BOOLEAN DEFAULT FALSE
+)"""
+        )
+        await self.db_conn.execute(
+            """CREATE TABLE IF NOT EXISTS exports (
+    export_id VARCHAR(11) PRIMARY KEY DEFAULT ('EXP' || LPAD(nextval('export_seq')::TEXT, 8, '0')),
+    job_id VARCHAR(11) NOT NULL,
+    export_type VARCHAR(20) NOT NULL CHECK (export_type IN ('csv','json','parquet')),
+    file_path TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','completed','failed')),
+    file_size_mb DECIMAL(10, 2),
+    item_count INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)"""
+        )
+        await self.db_conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_job ON parsed_items(job_id)")
+        await self.db_conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_url ON parsed_items(source_url)")
+        await self.db_conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_language ON parsed_items(language)")
+        await self.db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parsed_items_intelligence_processed ON parsed_items(intelligence_processed)"
+        )
+        await self.db_conn.execute("CREATE INDEX IF NOT EXISTS idx_exports_job ON exports(job_id)")
+        logger.info("Ensured duka_db schema exists.")
 
 
 # Global PostgreSQL client instance

@@ -15,7 +15,7 @@ class ScrapeRequest(BaseModel):
 
     NOTE: source_type has been REMOVED. Content classification now happens
     AFTER crawling+parsing, via the llm-worker intelligence pipeline (Ollama
-    qwen2.5:14b), which writes category/threat_severity/source_type to
+    qwen2:8b), which writes category/threat_severity/source_type to
     ClickHouse intelligence_analytics.
 
     Worker routing (surface/deep/dark) is fully automatic via the

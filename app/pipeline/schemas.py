@@ -191,7 +191,7 @@ class IntelligenceAnalytics(BaseModel):
     )
     summary: str = Field(..., description="LLM-generated summary of findings")
     language: str = Field(default="am", description="Original language")
-    llm_model: str = Field(default="qwen2.5:14b", description="Which LLM model performed analysis")
+    llm_model: str = Field(default="qwen2:8b", description="Which LLM model performed analysis")
     llm_score: float = Field(default=0.0, description="Model confidence (0-1)")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Analysis timestamp")
 

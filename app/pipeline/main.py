@@ -4,7 +4,7 @@ This module keeps the job dispatch sequence in one place:
 PostgreSQL job row -> Kafka CrawlRequest event.
 
 NOTE: source_type has been REMOVED from job submission. Classification now
-happens post-parsing via the llm-worker intelligence pipeline (Ollama qwen2.5:14b),
+happens post-parsing via the llm-worker intelligence pipeline (Ollama qwen2:8b),
 not at job creation time. Worker assignment is now handled by the multi-signal
 WorkerAssignmentEngine (app.common.constants.worker_assignment) instead of manual
 selection - it inspects domain whitelists, WAF/CDN protection, Ethiopian domain
@@ -50,6 +50,8 @@ async def submit_crawl_job(
     """
 
     worker_type, assignment_reason = assign_worker_with_reason(url, worker_override)
+
+    await pg_client.ensure_user(user_id)
 
     job_row = await pg_client.create_job(
         user_id=user_id,

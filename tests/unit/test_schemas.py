@@ -139,7 +139,7 @@ def test_intelligence_analytics_validation():
 
 	assert intelligence.category == "cyber_threat"
 	assert intelligence.threat_severity == 4
-	assert intelligence.llm_model == "qwen2.5:14b"
+	assert intelligence.llm_model == "qwen2:8b"
 
 
 def test_intelligence_analytics_default_category():

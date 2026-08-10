@@ -14,13 +14,13 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import sys
 from datetime import datetime
 from typing import Optional
 
 import clickhouse_connect
+import re
 import httpx
 from aiokafka import AIOKafkaConsumer
 
@@ -37,11 +37,6 @@ from app.common.constants.intelligence_categories import (
     ALL_INTELLIGENCE_CATEGORIES,
     CATEGORY_DESCRIPTIONS,
     DEFAULT_INTELLIGENCE_CATEGORY,
-)
-from app.common.constants.source_types import (
-    ALL_SOURCE_TYPES,
-    SOURCE_TYPE_DESCRIPTIONS,
-    DEFAULT_SOURCE_TYPE,
 )
 from app.pipeline.schemas import ParsedItem, IntelligenceAnalytics
 from app.storage.postgres.client import pg_client
@@ -60,7 +55,7 @@ WORKER_TYPE = "llm-worker"
 
 # --- Ollama Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2:8b")
 MAX_CONCURRENT_TASKS = 4
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -133,9 +128,6 @@ class OllamaLLMClient:
         category_list_str = "\n".join(
             f'  - "{cat}": {desc}' for cat, desc in CATEGORY_DESCRIPTIONS.items()
         )
-        source_type_list_str = "\n".join(
-            f'  - "{st}": {desc}' for st, desc in SOURCE_TYPE_DESCRIPTIONS.items()
-        )
         prompt = f"""Analyze this scraped content for actionable intelligence.
 
 Source URL: {url}
@@ -143,15 +135,11 @@ Source URL: {url}
 Content:
 {parsed_text[:2000]}
 
-First, classify the SOURCE TYPE of the content. Pick ONE of the following:
-{source_type_list_str}
-
-Second, classify the content into exactly ONE intelligence CATEGORY. Pick ONE of the following:
+Classify into exactly ONE of these categories:
 {category_list_str}
 
 Please respond ONLY with a valid JSON object (no markdown, no explanation) containing:
 {{
-  "source_type": one of {sorted(ALL_SOURCE_TYPES)},
   "category": one of {sorted(ALL_INTELLIGENCE_CATEGORIES)},
   "threat_severity": integer from 1-5 (1=low, 5=critical),
   "entities": list of extracted entities (names, emails, IPs, domains, sensitive info),
@@ -171,11 +159,28 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             )
 
             if response.status_code != 200:
+                # If model is not found, attempt to fallback to a lightweight rule-based analyzer.
                 logger.error(f"Ollama error: {response.status_code} - {response.text}")
+                try:
+                    body_text = response.text or ""
+                except Exception:
+                    body_text = ""
+
+                if response.status_code == 404 or "model" in body_text.lower() and "not found" in body_text.lower():
+                    logger.warning("Ollama model not found; using fallback analyzer.")
+                    return self._fallback_analyze(parsed_text, url)
+
                 return self._empty_intelligence()
 
             result = response.json()
-            response_text = str(result.get("response", "")).strip()
+            raw_response = result.get("response", "")
+            if isinstance(raw_response, list):
+                response_text = "\n".join(str(item) for item in raw_response)
+            else:
+                response_text = str(raw_response).strip()
+
+            if not response_text:
+                response_text = str(result.get("output") or result.get("text") or "").strip()
 
             if not response_text:
                 logger.error("Empty response text from Ollama")
@@ -183,7 +188,7 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
 
             intelligence = self._parse_intelligence_response(response_text)
             intelligence = self._validate_intelligence(intelligence)
-            intelligence["llm_score"] = result.get("eval_count", 0) / max(result.get("eval_duration", 1), 1)
+            intelligence["llm_score"] = self._extract_llm_score(result, response_text)
 
             logger.info(f"LLM analysis complete: {intelligence['category']} (severity: {intelligence['threat_severity']})")
             return intelligence
@@ -198,30 +203,84 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
     @staticmethod
     def _parse_intelligence_response(response_text: str) -> dict:
         """Parse the Ollama response text into structured intelligence."""
-        try:
-            cleaned_text = response_text.strip()
-            if cleaned_text.startswith("{") and cleaned_text.endswith("}"):
+        cleaned_text = response_text.strip()
+        if cleaned_text.startswith("{") and cleaned_text.endswith("}"):
+            try:
                 return json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                pass
 
-            # Some models may prefix with trailing text or explanation, extract the first JSON object.
-            match = re.search(r"(\{.*\})", cleaned_text, re.DOTALL)
-            if match:
+        match = re.search(r"(\{.*\})", cleaned_text, re.DOTALL)
+        if match:
+            try:
                 return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
 
-            return {}
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON from Ollama response: {e}")
-            return {}
+        extracted = {}
+        for line in cleaned_text.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            extracted[key.strip().strip('"').strip("'")] = value.strip().strip('"').strip("'")
+        return extracted
 
+    def _fallback_analyze(self, parsed_text: str, url: str) -> dict:
+        """Simple rule-based fallback analyzer used when Ollama model is unavailable.
+
+        This provides reasonable default category/summary/entities so the pipeline
+        continues producing analytics even without a working LLM.
+        """
+        text = (parsed_text or "").strip()
+        summary = (text[:180] + "...") if len(text) > 180 else text
+
+        # Extract simple entities: emails, domains, IPs
+        entities = []
+        try:
+            entities += re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+            entities += re.findall(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", text)
+            domains = re.findall(r"(?:https?://)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})", text)
+            entities += domains
+        except Exception:
+            pass
+
+        # Heuristic category selection by keywords
+        lowered = text.lower()
+        category = DEFAULT_INTELLIGENCE_CATEGORY
+        if any(k in lowered for k in ("attack", "bomb", "explosion", "violent", "kill")):
+            category = "threat"
+        elif any(k in lowered for k in ("policy", "government", "minister", "parliament")):
+            category = "political"
+        elif any(k in lowered for k in ("health", "hospital", "disease", "covid", "vaccine")):
+            category = "health"
+
+        return {
+            "category": category,
+            "threat_severity": 1,
+            "entities": list(dict.fromkeys([e for e in entities if e])),
+            "summary": summary[:200] if summary else "No summary available",
+            "llm_score": 0.1,
+        }
+
+    @staticmethod
+    def _extract_llm_score(result: dict, response_text: str) -> float:
+        try:
+            if "eval_count" in result and "eval_duration" in result:
+                return float(result.get("eval_count", 0)) / max(float(result.get("eval_duration", 1)), 1)
+            if "score" in result:
+                return float(result.get("score", 0.0))
+            if "llm_score" in result:
+                return float(result.get("llm_score", 0.0))
+        except Exception:
+            pass
+        return 1.0 if response_text else 0.0
+
+    @staticmethod
     def _validate_intelligence(data: dict) -> dict:
         """Validate and normalize LLM output."""
         category = data.get("category", DEFAULT_INTELLIGENCE_CATEGORY)
         if category not in ALL_INTELLIGENCE_CATEGORIES:
             category = DEFAULT_INTELLIGENCE_CATEGORY
-
-        source_type = data.get("source_type", DEFAULT_SOURCE_TYPE)
-        if source_type not in ALL_SOURCE_TYPES:
-            source_type = DEFAULT_SOURCE_TYPE
 
         raw_entities = data.get("entities", [])
         if isinstance(raw_entities, str):
@@ -232,9 +291,10 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             entities = []
 
         summary = str(data.get("summary") or data.get("description") or "").strip()
+        if not summary:
+            summary = "No summary provided by LLM."
 
         return {
-            "source_type": source_type,
             "category": category,
             "threat_severity": max(1, min(5, int(data.get("threat_severity", 1)))),  # Clamp 1-5
             "entities": entities[:50],  # Max 50 entities
@@ -245,11 +305,10 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
     def _empty_intelligence() -> dict:
         """Return empty/safe intelligence object."""
         return {
-            "source_type": DEFAULT_SOURCE_TYPE,
             "category": DEFAULT_INTELLIGENCE_CATEGORY,
-            "threat_severity": 1,
+            "threat_severity": 0,
             "entities": [],
-            "summary": "Unable to extract intelligence from this content.",
+            "summary": "Unable to analyze",
             "llm_score": 0.0,
         }
 
@@ -275,28 +334,46 @@ async def ingest_intelligence_to_clickhouse(intelligence: IntelligenceAnalytics)
         return
 
     try:
-        await asyncio.to_thread(
-            ch_client.insert,
-            "intelligence_analytics",
-            [[
-                intelligence.job_id,
-                intelligence.item_id,
-                intelligence.url,
-                intelligence.source_type,
-                intelligence.category,
-                intelligence.threat_severity,
-                intelligence.entities,
-                intelligence.summary,
-                intelligence.language,
-                intelligence.llm_model,
-                intelligence.llm_score,
-                intelligence.created_at,
-            ]],
-            column_names=[
-                "job_id", "item_id", "url", "source_type", "category", "threat_severity",
-                "entities", "summary", "language", "llm_model", "llm_score", "created_at",
-            ],
-        )
+        # Use a fresh ClickHouse client per thread to avoid concurrent session errors.
+        def _do_insert():
+            client = clickhouse_connect.get_client(
+                host=CH_HOST,
+                port=CH_HTTP_PORT,
+                username=CH_USER,
+                password=CH_PASSWORD or "",
+                database=CH_DATABASE,
+                secure=False,
+                verify=False,
+            )
+            try:
+                client.insert(
+                    "intelligence_analytics",
+                    [[
+                        intelligence.job_id,
+                        intelligence.item_id,
+                        intelligence.url,
+                        intelligence.source_type,
+                        intelligence.category,
+                        intelligence.threat_severity,
+                        intelligence.entities,
+                        intelligence.summary,
+                        intelligence.language,
+                        intelligence.llm_model,
+                        intelligence.llm_score,
+                        intelligence.created_at,
+                    ]],
+                    column_names=[
+                        "job_id", "item_id", "url", "source_type", "category", "threat_severity",
+                        "entities", "summary", "language", "llm_model", "llm_score", "created_at",
+                    ],
+                )
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_do_insert)
         logger.info(f"Ingested intelligence record: job={intelligence.job_id} item={intelligence.item_id}")
 
     except Exception as e:
@@ -335,7 +412,7 @@ async def process_parsed_item(message_value: bytes):
             job_id=parsed_item.job_id,
             item_id=parsed_item.item_id,
             url=parsed_item.url,
-            source_type=intelligence_data.get("source_type", DEFAULT_SOURCE_TYPE),
+            source_type=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),  # Inferred source_type
             category=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),
             threat_severity=intelligence_data.get("threat_severity", 0),
             entities=intelligence_data.get("entities", []),

@@ -55,7 +55,7 @@ def load_and_dispatch_targets(**context):
     producer.flush()
     print(f"✅ Successfully dispatched {dispatched_count} crawl targets to Kafka topic '{settings.crawl_request_topic}'.")
 
-\
+
 with DAG(
     "duka_dynamic_crawl_pipeline",
     default_args=default_args,

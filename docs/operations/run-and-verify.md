@@ -60,10 +60,6 @@ docker exec postgres psql -U postgres -d duka -c "SELECT item_id, job_id, source
 docker exec clickhouse clickhouse-client --query "SELECT item_id, job_id, category, threat_severity, summary FROM duka_scraper.intelligence_analytics ORDER BY created_at DESC LIMIT 5;"
 ```
 
-```bash
-docker exec clickhouse clickhouse-client --query "SELECT worker, status_code, latency_ms, payload_size_bytes, created_at FROM duka_scraper.crawler_performance ORDER BY created_at DESC LIMIT 5;"
-```
-
 ## 7. Verify recursive crawling
 
 Check the worker logs for child requests with a depth greater than zero:
@@ -76,7 +72,7 @@ docker logs surface-worker --tail 80 2>&1 | Select-String "depth="
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Ollama responses are empty or the worker exits | The model has not been pulled yet | Run `docker exec ollama ollama pull qwen2.5:14b` |
+| Ollama responses are empty or the worker exits | The model has not been pulled yet | Run `docker exec ollama ollama pull qwen2:8b` |
 | Dark worker never processes jobs | Tor is not healthy | Check `docker compose ps tor` and `docker logs tor --tail 50` |
 | No events on Kafka topics | Topics were not created or the cluster is still booting | Wait for `kafka-topics-init` and re-run `docker compose ps` |
 | Worker restarts repeatedly | The container is crashing on startup | Inspect `docker logs <worker-name> --tail 50` |

@@ -278,6 +278,9 @@ services:
     environment:
       - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_HTTP_PORT=8123
+      - CLICKHOUSE_DB=duka_scraper
     volumes:
       - .:/app
     extra_hosts:
@@ -358,7 +361,7 @@ services:
       - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=qwen2.5:14b
+      - OLLAMA_MODEL=qwen2:8b
       - CH_HOST=clickhouse
       - CH_PORT=8123
       - CH_DATABASE=duka_scraper
@@ -388,7 +391,7 @@ services:
         echo "Waiting for Ollama service..."
         sleep 2
       done
-      ollama pull qwen2.5:14b
+      ollama pull qwen2:8b
     networks:
       - duka-net
     restart: "no"

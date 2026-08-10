@@ -7,7 +7,7 @@
 | `REDIS_URL` | `redis://localhost:6379/0` | Recursive crawl service | Redis endpoint for Bloom dedup |
 | `TOR_SOCKS5_PROXY` | `socks5://tor:9050` | Dark worker | Tor SOCKS5 proxy |
 | `OLLAMA_BASE_URL` | `http://ollama:11434` | LLM worker | Ollama API base URL |
-| `OLLAMA_MODEL` | `qwen2.5:14b` | LLM worker | Model used for intelligence extraction |
+| `OLLAMA_MODEL` | `qwen2:8b` | LLM worker | Model used for intelligence extraction |
 | `CH_HOST` | `clickhouse` | LLM worker | ClickHouse host |
 | `CH_PORT` | `8123` | LLM worker | ClickHouse HTTP port |
 | `CH_DATABASE` | `duka_scraper` | LLM worker | ClickHouse database |
