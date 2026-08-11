@@ -17,7 +17,7 @@ Healthy services should include: `postgres`, `kafka`, `kafka-topics-init`, `elas
 ## Pull the Ollama model
 
 ```bash
-docker exec ollama ollama pull qwen2:8b
+docker exec ollama ollama pull qwen2.5:14b
 ```
 
 ## Access URLs

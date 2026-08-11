@@ -14,9 +14,9 @@ class ScrapeRequest(BaseModel):
     """Schema for incoming scraping requests from the UI or external systems.
 
     NOTE: source_type has been REMOVED. Content classification now happens
-    AFTER crawling+parsing, via the llm-worker intelligence pipeline (Ollama
-    qwen2:8b), which writes category/threat_severity/source_type to
-    ClickHouse intelligence_analytics.
+    AFTER crawling+parsing, via the llm-worker hosted intelligence pipeline
+    (Groq / openai/gpt-oss-120b), which writes category/threat_severity/
+    source_type to ClickHouse intelligence_analytics.
 
     Worker routing (surface/deep/dark) is fully automatic via the
     multi-signal WorkerAssignmentEngine - it is NOT required to specify
@@ -93,7 +93,6 @@ async def get_job_status(job_id: str):
         "job_id": job["job_id"],
         "user_id": job["user_id"],
         "url": job["url"],
-        "worker_type": job["worker_type"],
         "language": job["language"],
         "status": job["status"],
         "created_at": job["created_at"].isoformat() if job["created_at"] else None,
@@ -112,7 +111,6 @@ async def get_user_jobs(user_id: str):
             {
                 "job_id": job["job_id"],
                 "url": job["url"],
-                "worker_type": job["worker_type"],
                 "status": job["status"],
                 "created_at": job["created_at"].isoformat() if job["created_at"] else None,
             }

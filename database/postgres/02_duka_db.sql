@@ -44,7 +44,10 @@ CREATE TABLE parsed_items (
 
     source_url TEXT NOT NULL,
 
-    language VARCHAR(10) DEFAULT 'am',
+    language VARCHAR(20) DEFAULT 'unknown',
+
+    worker_type VARCHAR(20) NOT NULL
+        CHECK (worker_type IN ('surface','deep','dark')),
 
     title TEXT,
 
@@ -70,6 +73,9 @@ ON parsed_items(job_id);
 
 CREATE INDEX idx_parsed_items_url
 ON parsed_items(source_url);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_parsed_items_job_source_url
+ON parsed_items(job_id, source_url);
 
 CREATE INDEX idx_parsed_items_language
 ON parsed_items(language);

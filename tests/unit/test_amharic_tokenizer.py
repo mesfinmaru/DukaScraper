@@ -1,4 +1,4 @@
-from app.amharic.tokenizer.tokenizer import tokenize_sentences, tokenize_words
+from app.language.tokenizer.tokenizer import tokenize_sentences, tokenize_words
 
 
 def test_tokenizes_sentences_on_ethiopic_punctuation():

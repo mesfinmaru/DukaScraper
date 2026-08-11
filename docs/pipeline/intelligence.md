@@ -9,4 +9,4 @@ The LLM worker consumes parsed content from the `crawl.parsed` topic and writes 
 - `misinformation`
 - `other`
 
-The Ollama prompt asks the local `qwen2:8b` model to return a compact JSON object containing the category, threat severity, entities, and a short summary. The ClickHouse ingestion path writes a row into `intelligence_analytics` with the job id, item id, URL, category, threat severity, entities, summary, and model metadata.
+The hosted Groq prompt asks the configured model to return a compact JSON object containing the category, threat severity, entities, and a short summary. The ClickHouse ingestion path writes a row into `intelligence_analytics` with the job id, item id, URL, category, threat severity, entities, summary, and model metadata.

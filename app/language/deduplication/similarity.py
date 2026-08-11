@@ -1,10 +1,10 @@
-"""Naive near-duplicate detection for parsed articles."""
+"""Naive near-duplicate detection for parsed Amharic and English articles."""
 
 from __future__ import annotations
 
 import hashlib
 
-from app.amharic.normalization.normalize import normalize_text
+from app.language.normalization.normalize import normalize_text
 
 
 def _shingles(text: str, size: int = 3) -> set[str]:

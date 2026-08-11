@@ -9,9 +9,9 @@ import sys
 from datetime import datetime
 from typing import Any
 
-from app.amharic.cleaning.cleaner import clean_and_extract_text as clean_amharic_text
-from app.amharic.language_detection.detector import detect_language_from_text as detect_amharic_language
-from app.amharic.quality.scorer import score_text_quality
+from app.language.cleaning.cleaner import clean_and_extract_text as clean_amharic_text
+from app.language.language_detection.detector import detect_language_from_text as detect_amharic_language
+from app.language.quality.scorer import score_text_quality
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -29,10 +29,15 @@ if APP_ENV == "wsl":
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlResult, ParsedItem
 from app.storage.postgres.client import pg_client
+from app.services.link_extraction_service import LinkExtractionService
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class UnsupportedLanguageError(Exception):
+    """Raised when content is outside the currently supported am/en scope."""
 
 # --- Configuration ---
 KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
@@ -47,6 +52,18 @@ minio_client = Minio(
     secret_key=settings.MINIO_ROOT_PASSWORD,
     secure=settings.MINIO_SECURE,
 )
+
+
+def _normalize_item_suffix(item_id: str) -> str:
+    digits = re.sub(r"[^0-9]", "", str(item_id or ""))
+    return digits.zfill(8) if digits else "00000000"
+
+
+def _item_object_name(prefix: str, item_id: str, extension: str = ".json") -> str:
+    normalized_prefix = prefix.strip().lower()
+    if normalized_prefix == "parsed":
+        normalized_prefix = "parse"
+    return f"{normalized_prefix}_item{_normalize_item_suffix(item_id)}{extension}"
 
 
 def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
@@ -183,8 +200,25 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     """
     source_html = crawl_result.html or ""
     start_time = asyncio.get_running_loop().time()
-    extracted_text = await asyncio.to_thread(clean_and_extract_text, source_html, crawl_result.language or "en")
-    detected_language = detect_language_from_text(extracted_text or source_html, crawl_result.language or "en")
+    requested_language = (crawl_result.language or "unknown").lower()
+    extracted_text = await asyncio.to_thread(clean_and_extract_text, source_html, requested_language)
+    detection_text = extracted_text
+    if not detection_text:
+        detection_text = await asyncio.to_thread(
+            clean_and_extract_text,
+            source_html,
+            "other",
+            preserve_amharic=False,
+        )
+    detected_language = detect_language_from_text(detection_text, "unknown")
+    if not detection_text:
+        detected_language = "unknown"
+    if not extracted_text and detection_text:
+        extracted_text = detection_text
+    if detected_language not in {"am", "en"}:
+        raise UnsupportedLanguageError(
+            f"Resolved language '{detected_language}' is outside the am/en allowlist"
+        )
     title = await asyncio.to_thread(extract_title, source_html)
     publish_date = await asyncio.to_thread(extract_publish_date, source_html, extracted_text)
     parse_duration = asyncio.get_running_loop().time() - start_time
@@ -205,15 +239,14 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     status = "failed" if crawl_result.status_code >= 400 and not extracted_text else "completed"
 
     # --- Persist parsed_items metadata FIRST to obtain the auto-generated item_id ---
-    raw_html_path = f"s3://{MINIO_RAW_BUCKET}/crawl_{crawl_result.job_id}.json"
-    parsed_json_path = f"s3://{MINIO_PARSED_BUCKET}/{crawl_result.job_id}.json"
-
+    canonical_url = LinkExtractionService.normalize_url(crawl_result.url)
     item_record = await pg_client.create_parsed_item(
         job_id=crawl_result.job_id,
-        source_url=crawl_result.url,
-        raw_html_path=raw_html_path,
-        parsed_json_path=parsed_json_path,
+        source_url=canonical_url,
+        raw_html_path="",
+        parsed_json_path="",
         language=detected_language,
+        worker_type=crawl_result.worker,
         title=title,
         publish_date=publish_date,
         character_count=len(extracted_text),
@@ -221,10 +254,25 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     )
     item_id = item_record["item_id"]
 
+    raw_object_name = _item_object_name("raw", item_id)
+    parsed_object_name = _item_object_name("parsed", item_id)
+    raw_html_path = f"s3://{MINIO_RAW_BUCKET}/{raw_object_name}"
+    parsed_json_path = f"s3://{MINIO_PARSED_BUCKET}/{parsed_object_name}"
+
+    raw_payload_bytes = (source_html or "").encode("utf-8")
+    await save_to_minio(raw_object_name, raw_payload_bytes)
+
+    await pg_client.db_pool.execute(
+        "UPDATE parsed_items SET raw_html_path = $1, parsed_json_path = $2 WHERE item_id = $3",
+        raw_html_path,
+        parsed_json_path,
+        item_id,
+    )
+
     parsed_item = ParsedItem(
         job_id=crawl_result.job_id,
         item_id=item_id,
-        url=crawl_result.url,
+        url=canonical_url,
         worker=crawl_result.worker,
         language=detected_language,
         data=payload_data,
@@ -282,16 +330,23 @@ async def consume_and_parse():
                 await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes, key=crawl_result.job_id.encode("utf-8"))
                 logger.info(f"Produced parsed item {item_id} to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
 
-                # 2. Save structured output to MinIO parsed bucket
-                object_name = f"{crawl_result.job_id}.json"
-                await save_to_minio(object_name, output_payload_bytes)
+                # 2. Save structured output to MinIO parsed bucket using the item-based prefix
+                parsed_object_name = _item_object_name("parsed", item_id)
+                await save_to_minio(parsed_object_name, output_payload_bytes)
+                await pg_client.update_job_status(crawl_result.job_id, "completed")
 
             except json.JSONDecodeError:
                 logger.warning("Failed to decode message package. Skipping invalid JSON format.")
+                await pg_client.update_job_status(crawl_result.job_id, "failed")
             except ValidationError as e:
                 logger.warning(f"Skipping invalid crawl result payload: {e}")
+                await pg_client.update_job_status(crawl_result.job_id, "failed")
+            except UnsupportedLanguageError as e:
+                logger.info(f"Skipping unsupported-language content for {crawl_result.url}: {e}")
+                await pg_client.update_job_status(crawl_result.job_id, "completed")
             except Exception as loop_err:
                 logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
+                await pg_client.update_job_status(crawl_result.job_id, "failed")
 
     except Exception as e:
         logger.critical(f"Fatal error in consumer pipeline loop: {e}", exc_info=True)

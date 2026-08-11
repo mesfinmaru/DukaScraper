@@ -2,7 +2,7 @@
 LLM Intelligence Worker
 
 Reads parsed content from Kafka (crawl.parsed topic), performs LLM analysis
-using local Qwen model via Ollama, and writes intelligence analytics to ClickHouse.
+using a hosted or local LLM provider, and writes intelligence analytics to ClickHouse.
 
 Pipeline:
   crawl.parsed (Kafka) → [LLM Worker] → intelligence_analytics (ClickHouse)
@@ -24,6 +24,11 @@ import re
 import httpx
 from aiokafka import AIOKafkaConsumer
 
+try:
+    from groq import Groq
+except Exception:  # pragma: no cover - optional dependency fallback
+    Groq = None
+
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -38,6 +43,7 @@ from app.common.constants.intelligence_categories import (
     CATEGORY_DESCRIPTIONS,
     DEFAULT_INTELLIGENCE_CATEGORY,
 )
+from app.common.constants.source_types import ALL_SOURCE_TYPES, DEFAULT_SOURCE_TYPE
 from app.pipeline.schemas import ParsedItem, IntelligenceAnalytics
 from app.storage.postgres.client import pg_client
 
@@ -53,9 +59,14 @@ KAFKA_BOOTSTRAP_SERVERS = settings.KAFKA_BOOTSTRAP_SERVERS
 CONSUME_TOPIC = settings.crawl_parsed_topic  # crawl.parsed
 WORKER_TYPE = "llm-worker"
 
-# --- Ollama Configuration ---
+# --- LLM Configuration ---
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "hosted").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2:8b")
+HOSTED_LLM_URL = os.getenv("HOSTED_LLM_URL", "")
+HOSTED_LLM_API_KEY = os.getenv("HOSTED_LLM_API_KEY", "")
+HOSTED_LLM_MODEL = os.getenv("HOSTED_LLM_MODEL", "google-gemini-flash")
+FALLBACK_ONLY = os.getenv("FALLBACK_ONLY", "false").strip().lower() in ("1", "true", "yes")
 MAX_CONCURRENT_TASKS = 4
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -225,14 +236,15 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             extracted[key.strip().strip('"').strip("'")] = value.strip().strip('"').strip("'")
         return extracted
 
-    def _fallback_analyze(self, parsed_text: str, url: str) -> dict:
+    @staticmethod
+    def _fallback_analyze(parsed_text: str, url: str) -> dict:
         """Simple rule-based fallback analyzer used when Ollama model is unavailable.
 
         This provides reasonable default category/summary/entities so the pipeline
         continues producing analytics even without a working LLM.
         """
         text = (parsed_text or "").strip()
-        summary = (text[:180] + "...") if len(text) > 180 else text
+        summary = (text[:600] + "...") if len(text) > 600 else text
 
         # Extract simple entities: emails, domains, IPs
         entities = []
@@ -244,7 +256,6 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
         except Exception:
             pass
 
-        # Heuristic category selection by keywords
         lowered = text.lower()
         category = DEFAULT_INTELLIGENCE_CATEGORY
         if any(k in lowered for k in ("attack", "bomb", "explosion", "violent", "kill")):
@@ -254,11 +265,23 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
         elif any(k in lowered for k in ("health", "hospital", "disease", "covid", "vaccine")):
             category = "health"
 
+        if any(k in url.lower() for k in ("news", "article", "press", "breaking")):
+            source_type = "news"
+        elif any(k in url.lower() for k in ("forum", "discussion", "board")):
+            source_type = "forum"
+        elif any(k in url.lower() for k in ("blog", "post")):
+            source_type = "blog"
+        elif any(k in url.lower() for k in ("shop", "product", "store")):
+            source_type = "ecommerce"
+        else:
+            source_type = DEFAULT_SOURCE_TYPE
+
         return {
+            "source_type": source_type,
             "category": category,
             "threat_severity": 1,
             "entities": list(dict.fromkeys([e for e in entities if e])),
-            "summary": summary[:200] if summary else "No summary available",
+            "summary": summary if summary else "No summary available",
             "llm_score": 0.1,
         }
 
@@ -282,6 +305,10 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
         if category not in ALL_INTELLIGENCE_CATEGORIES:
             category = DEFAULT_INTELLIGENCE_CATEGORY
 
+        source_type = str(data.get("source_type") or DEFAULT_SOURCE_TYPE).strip().lower()
+        if source_type not in ALL_SOURCE_TYPES:
+            source_type = DEFAULT_SOURCE_TYPE
+
         raw_entities = data.get("entities", [])
         if isinstance(raw_entities, str):
             entities = [e.strip() for e in re.split(r"[\n,;]+", raw_entities) if e.strip()]
@@ -295,16 +322,18 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             summary = "No summary provided by LLM."
 
         return {
+            "source_type": source_type,
             "category": category,
-            "threat_severity": max(1, min(5, int(data.get("threat_severity", 1)))),  # Clamp 1-5
-            "entities": entities[:50],  # Max 50 entities
-            "summary": summary[:200],  # Max 200 chars
+            "threat_severity": max(1, min(5, int(data.get("threat_severity", 1)))),
+            "entities": entities[:100],
+            "summary": summary,
         }
 
     @staticmethod
     def _empty_intelligence() -> dict:
         """Return empty/safe intelligence object."""
         return {
+            "source_type": DEFAULT_SOURCE_TYPE,
             "category": DEFAULT_INTELLIGENCE_CATEGORY,
             "threat_severity": 0,
             "entities": [],
@@ -313,8 +342,234 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
         }
 
 
-# Initialize Ollama client
-ollama_client = OllamaLLMClient(OLLAMA_BASE_URL, OLLAMA_MODEL)
+class HostedLLMClient:
+    """Generic hosted LLM client for Google AI and other hosted endpoints.
+
+    Handles Google Generative API auth and response scraping, while reusing
+    local response parsing helpers from OllamaLLMClient.
+    """
+
+    def __init__(self, base_url: str, api_key: str = "", model: str = ""):
+        self.base_url = base_url.rstrip("/") if base_url else ""
+        self.api_key = api_key
+        self.model = model
+        self.provider = self._detect_provider(self.base_url)
+        self.client = httpx.AsyncClient(timeout=120)
+        self.groq_client = None
+        if self.provider == "groq" and api_key and Groq is not None:
+            self.groq_client = Groq(api_key=api_key)
+
+    @staticmethod
+    def _detect_provider(base_url: str) -> str:
+        if not base_url:
+            return "generic"
+        lower = base_url.lower()
+        if "groq.com" in lower:
+            return "groq"
+        if "generativelanguage.googleapis.com" in lower or "aiplatform.googleapis.com" in lower:
+            return "google"
+        return "generic"
+
+    @staticmethod
+    def _extract_text_from_payload(data):
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            if "content" in data and isinstance(data["content"], str):
+                return data["content"]
+            if "text" in data and isinstance(data["text"], str):
+                return data["text"]
+            if "message" in data:
+                return HostedLLMClient._extract_text_from_payload(data["message"])
+            if "choices" in data:
+                for choice in data["choices"]:
+                    result = HostedLLMClient._extract_text_from_payload(choice)
+                    if result:
+                        return result
+            for value in data.values():
+                result = HostedLLMClient._extract_text_from_payload(value)
+                if result:
+                    return result
+        elif isinstance(data, list):
+            for item in data:
+                result = HostedLLMClient._extract_text_from_payload(item)
+                if result:
+                    return result
+        return ""
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    @staticmethod
+    def _detect_content_language(text: str) -> str:
+        if not text:
+            return "en"
+        text = text.strip()
+        if len(text) < 20:
+            return "en"
+        amharic_chars = sum(1 for ch in text if "\u1200" <= ch <= "\u137f" or "\u1380" <= ch <= "\u139f")
+        english_chars = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+        total_alpha = sum(1 for ch in text if ch.isalpha())
+        if total_alpha == 0:
+            return "en"
+        amharic_ratio = amharic_chars / total_alpha if total_alpha else 0.0
+        english_ratio = english_chars / total_alpha if total_alpha else 0.0
+        if amharic_ratio >= 0.4 and amharic_ratio > english_ratio:
+            return "am"
+        return "en"
+
+    async def is_available(self) -> bool:
+        if not self.base_url:
+            return False
+        if "generativelanguage.googleapis.com" in self.base_url or "aiplatform.googleapis.com" in self.base_url:
+            # Google Generative API endpoints may reject HEAD, so trust the URL and API key if configured.
+            return bool(self.api_key)
+        if "groq.com" in self.base_url.lower():
+            # Groq chat completions endpoint does not support HEAD and may 404 on HEAD checks even when valid.
+            return bool(self.api_key)
+
+        try:
+            response = await self.client.head(self.base_url, timeout=5)
+            return response.status_code in (200, 204, 301, 302)
+        except Exception:
+            return False
+
+    async def extract_intelligence(self, parsed_text: str, url: str) -> dict:
+        if not parsed_text or len(parsed_text.strip()) < 50:
+            return {
+                "source_type": DEFAULT_SOURCE_TYPE,
+                "category": DEFAULT_INTELLIGENCE_CATEGORY,
+                "threat_severity": 1,
+                "entities": [],
+                "summary": "Unable to analyze reliably; fallback inference used.",
+                "llm_score": 0.0,
+            }
+
+        if not self.api_key and FALLBACK_ONLY:
+            logger.warning("No hosted API key available; using fallback analyzer in fallback-only mode.")
+            return OllamaLLMClient._fallback_analyze(parsed_text=parsed_text, url=url)
+
+        category_list_str = "\n".join(
+            f'  - "{cat}": {desc}' for cat, desc in CATEGORY_DESCRIPTIONS.items()
+        )
+        source_type_values = "news, forum, blog, social, government, academic, ecommerce, other"
+        content_language = HostedLLMClient._detect_content_language(parsed_text)
+        summary_language = "Amharic" if content_language == "am" else "English"
+        max_analysis_chars = 2500
+        if len(parsed_text) <= max_analysis_chars:
+            full_content = parsed_text
+        else:
+            half = max_analysis_chars // 2
+            full_content = f"{parsed_text[:half]}\n\n[...middle omitted for provider limit...]\n\n{parsed_text[-half:]}"
+        prompt = f"""You are a careful content analyst. Read the full content below, not just the headline or first paragraph.
+
+Source URL: {url}
+
+Goal:
+- Summarize the main idea, key facts, and why the content matters.
+- This is not limited to intelligence-related content; summarize any meaningful article, post, forum discussion, announcement, report, or public update.
+- If the content is primarily Amharic, write the summary in Amharic. Otherwise write the summary in English.
+- Do not invent facts. Use only what is present in the content.
+- Ignore boilerplate, ads, tracking links, and repeated site navigation noise.
+
+Content language: {summary_language}
+
+Content:
+{full_content}
+
+Classify into exactly ONE intelligence category:
+{category_list_str}
+
+Also classify the source type as one of: {source_type_values}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "source_type": one of [{source_type_values}],
+  "category": one of {sorted(ALL_INTELLIGENCE_CATEGORIES)},
+  "threat_severity": integer from 1-5 (1=low, 5=critical),
+  "entities": list of extracted entities (names, emails, IPs, domains, sensitive info, locations),
+  "summary": a concise 2-4 sentence summary in {summary_language} of the main idea, most important facts, and why it matters
+}}"""
+
+        headers = {}
+        body = None
+
+        if self.provider == "google":
+            if self.api_key:
+                headers["X-goog-api-key"] = self.api_key
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+        elif self.provider == "groq":
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+                headers["Content-Type"] = "application/json"
+            body = {
+                "model": self.model or "openai/gpt-oss-120b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_completion_tokens": 1024,
+                "top_p": 1,
+                "stream": False,
+                "stop": None,
+            }
+        else:
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            body = {"model": self.model or OLLAMA_MODEL, "prompt": prompt}
+
+        try:
+            if self.provider == "groq" and self.groq_client is not None:
+                completion = self.groq_client.chat.completions.create(
+                    model=self.model or "openai/gpt-oss-120b",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_completion_tokens=1024,
+                    top_p=1,
+                    reasoning_effort="medium",
+                    stream=False,
+                    stop=None,
+                )
+                data = completion.model_dump() if hasattr(completion, "model_dump") else completion
+                response_text = self._extract_text_from_payload(data)
+            else:
+                resp = await self.client.post(self.base_url, json=body, headers=headers, timeout=120)
+                text = resp.text or ""
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"response": text}
+
+                response_text = self._extract_text_from_payload(data)
+                if not response_text:
+                    response_text = text
+
+            intelligence = None
+            try:
+                intelligence = OllamaLLMClient._parse_intelligence_response(response_text)
+                intelligence = OllamaLLMClient._validate_intelligence(intelligence)
+                intelligence["llm_score"] = OllamaLLMClient._extract_llm_score({"response": response_text}, response_text)
+            except Exception:
+                intelligence = {
+                    "source_type": DEFAULT_SOURCE_TYPE,
+                    "category": DEFAULT_INTELLIGENCE_CATEGORY,
+                    "threat_severity": 1,
+                    "entities": [],
+                    "summary": response_text if response_text else "Unable to analyze reliably; fallback inference used.",
+                    "llm_score": 0.0,
+                }
+
+            return intelligence
+        except Exception as e:
+            logger.warning(f"Hosted LLM request failed: {e}")
+            return OllamaLLMClient._fallback_analyze(parsed_text=parsed_text, url=url)
+
+
+# Initialize LLM client
+if LLM_PROVIDER == "ollama":
+    llm_client = OllamaLLMClient(OLLAMA_BASE_URL, OLLAMA_MODEL)
+else:
+    llm_client = HostedLLMClient(HOSTED_LLM_URL, HOSTED_LLM_API_KEY, HOSTED_LLM_MODEL)
 
 
 # ============================================================================
@@ -405,20 +660,21 @@ async def process_parsed_item(message_value: bytes):
             extracted_text = parsed_item.data.extracted_text
 
         # Perform LLM analysis
-        intelligence_data = await ollama_client.extract_intelligence(extracted_text, parsed_item.url)
+        intelligence_data = await llm_client.extract_intelligence(extracted_text, parsed_item.url)
+        llm_model = HOSTED_LLM_MODEL if LLM_PROVIDER != "ollama" else OLLAMA_MODEL
 
         # Create intelligence analytics record
         intelligence = IntelligenceAnalytics(
             job_id=parsed_item.job_id,
             item_id=parsed_item.item_id,
             url=parsed_item.url,
-            source_type=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),  # Inferred source_type
+            source_type=intelligence_data.get("source_type", DEFAULT_SOURCE_TYPE),
             category=intelligence_data.get("category", DEFAULT_INTELLIGENCE_CATEGORY),
             threat_severity=intelligence_data.get("threat_severity", 0),
             entities=intelligence_data.get("entities", []),
             summary=intelligence_data.get("summary", ""),
             language=parsed_item.language,
-            llm_model=OLLAMA_MODEL,
+            llm_model=llm_model,
             llm_score=intelligence_data.get("llm_score", 0.0),
         )
 
@@ -445,12 +701,23 @@ async def process_message_safely(message_value: bytes):
 
 async def main():
     """Main LLM worker lifecycle loop."""
-    # Check Ollama availability
-    if not await ollama_client.is_available():
-        logger.error(f"Ollama service not available at {OLLAMA_BASE_URL}. Exiting.")
-        sys.exit(1)
+    if not await llm_client.is_available():
+        if FALLBACK_ONLY and LLM_PROVIDER == "hosted":
+            logger.warning("Hosted LLM unavailable; starting in fallback-only mode.")
+        else:
+            if LLM_PROVIDER == "ollama":
+                logger.error(f"Ollama service not available at {OLLAMA_BASE_URL}. Exiting.")
+            else:
+                logger.error("Hosted LLM service is not available. Check HOSTED_LLM_URL and HOSTED_LLM_API_KEY.")
+            sys.exit(1)
 
-    logger.info(f"Ollama service available. Using model: {OLLAMA_MODEL}")
+    if LLM_PROVIDER == "ollama":
+        logger.info(f"Ollama service available. Using model: {OLLAMA_MODEL}")
+    else:
+        if not HOSTED_LLM_URL and not FALLBACK_ONLY:
+            logger.error("HOSTED_LLM_URL is not configured. Set HOSTED_LLM_URL and HOSTED_LLM_API_KEY.")
+            sys.exit(1)
+        logger.info(f"Using hosted LLM provider: {HOSTED_LLM_URL or 'fallback-only mode'}")
 
     await pg_client.connect()
 
@@ -488,7 +755,7 @@ async def main():
         logger.info("Shutting down LLM worker gracefully...")
         await consumer.stop()
         await pg_client.close()
-        await ollama_client.close()
+        await llm_client.close()
 
 
 if __name__ == "__main__":

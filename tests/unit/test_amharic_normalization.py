@@ -1,4 +1,4 @@
-from app.amharic.normalization.normalize import normalize_text
+from app.language.normalization.normalize import normalize_text
 
 
 def test_normalizes_ethiopic_whitespace_and_zero_width_chars():

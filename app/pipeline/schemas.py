@@ -153,7 +153,7 @@ class ParsedItem(BaseModel):
     )
     url: str
     worker: str  # Which worker crawled it
-    language: str  # 'en' or 'am'
+    language: str  # resolved ISO language code or 'unknown'
     data: ParsedItemData | dict = Field(..., description="Extracted text + metadata")
     status: str = "completed"  # completed or failed
     parse_duration: Optional[float] = None  # Parse time in seconds
@@ -190,7 +190,7 @@ class IntelligenceAnalytics(BaseModel):
         default_factory=list, description="Extracted entities (names, domains, IPs, etc.)"
     )
     summary: str = Field(..., description="LLM-generated summary of findings")
-    language: str = Field(default="am", description="Original language")
+    language: str = Field(default="unknown", description="Resolved content language")
     llm_model: str = Field(default="qwen2:8b", description="Which LLM model performed analysis")
     llm_score: float = Field(default=0.0, description="Model confidence (0-1)")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Analysis timestamp")
@@ -203,16 +203,15 @@ class IntelligenceAnalytics(BaseModel):
 
 class JobRecord(BaseModel):
     """
-    Schema for PostgreSQL duka_system.jobs table
-    Tracks all crawl jobs
-    NOTE: source_type REMOVED (determined post-analysis)
+    Schema for PostgreSQL duka_system.jobs table.
+    Jobs are an orchestration container; worker ownership is recorded at the
+    parsed-item level because each job can be processed by multiple workers.
     """
 
     job_id: Optional[str] = None  # Auto-generated: JOB00000001
     user_id: str  # References users.user_id, e.g. USR12345
     url: str
-    language: str = "am"  # "am" or "en"
-    worker_type: str  # "surface", "deep", or "dark" (assigned by rules engine)
+    language: str = "unknown"  # requested language or resolved content language
     status: str = "pending"  # pending, running, completed, failed
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -233,15 +232,20 @@ class UserRecord(BaseModel):
 
 class ParsedItemRecord(BaseModel):
     """
-    Schema for PostgreSQL duka_db.parsed_items table
-    METADATA ONLY - actual text lives in MinIO (duka-parsed-data)
-    NOTE: source_type REMOVED; item_id added for LLM worker reference
+    Schema for PostgreSQL duka_db.parsed_items table.
+    METADATA ONLY - actual text lives in MinIO (duka-parsed-data).
+    The worker is recorded here because each item is processed by one worker,
+    even though a job can flow through multiple worker stages across items.
     """
 
     item_id: Optional[str] = None  # Auto-generated: ITEM00000001
     job_id: str
     source_url: str
-    language: str = "am"
+    language: str = "unknown"
+    worker_type: str = Field(
+        default="surface",
+        description="Worker that processed this parsed item: 'surface', 'deep', or 'dark'",
+    )
     title: Optional[str] = None
     publish_date: Optional[str] = None
     character_count: Optional[int] = None
@@ -332,15 +336,15 @@ class CreateJobRequest(BaseModel):
 
 
 class JobResponse(BaseModel):
-    """Job creation response"""
+    """Job creation response."""
 
     job_id: str
     user_id: str
     url: str
     language: str
-    worker_type: str  # Assigned by rules engine
     status: str
     created_at: str
+    assigned_worker: Optional[str] = None
 
 
 class SearchResponse(BaseModel):

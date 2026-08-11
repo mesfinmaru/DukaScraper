@@ -7,6 +7,7 @@ import signal
 import sys
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+import httpx
 from minio import Minio
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
@@ -23,6 +24,10 @@ if APP_ENV == "wsl":
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 from app.services.recursive_crawl_service import extract_and_queue_children
+from app.services.link_extraction_service import LinkExtractionService
+from app.storage.postgres.client import pg_client
+from app.language.cleaning.cleaner import clean_and_extract_text
+from app.language.language_detection.detector import detect_language_from_text
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -160,14 +165,40 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             logger.warning(f"Playwright render error for {request.url}: {e}")
             html, status_code = "", 599
 
+        preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
+        if preferred_feed and preferred_feed != request.url:
+            logger.info(f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of rendered page.")
+            try:
+                async with httpx.AsyncClient(
+                    headers=DEFAULT_HEADERS,
+                    follow_redirects=True,
+                    timeout=settings.http_timeout_seconds,
+                ) as client:
+                    feed_response = await client.get(preferred_feed)
+                    feed_response.raise_for_status()
+                    html = feed_response.text
+                    status_code = feed_response.status_code
+                    request = request.model_copy(update={"url": str(feed_response.url)})
+            except httpx.HTTPError as feed_exc:
+                logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}; keeping rendered page")
+
         # --- Recursive link extraction (shared logic, all workers) ---
         extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
 
+        requested_text = clean_and_extract_text(html, request.language, preserve_amharic=False)
+        fallback_text = requested_text or clean_and_extract_text(html, "other", preserve_amharic=False)
+        resolved_language = detect_language_from_text(fallback_text, "unknown")
+        if resolved_language not in {"am", "en"}:
+            await pg_client.update_job_status(request.job_id, "completed")
+            logger.info(
+                f"Skipped {request.url}: resolved language '{resolved_language}' is outside the am/en allowlist"
+            )
+            return
         result = CrawlResult(
             job_id=request.job_id,
             url=request.url,
             worker=WORKER_TYPE,
-            language=request.language,
+            language=resolved_language,
             html=html,
             status_code=status_code,
             network="deep",
@@ -180,12 +211,12 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         )
 
         payload_bytes = result.model_dump_json().encode("utf-8")
-        await save_to_minio(request.job_id, payload_bytes)
         await producer.send_and_wait(
             PRODUCE_TOPIC,
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
+        await pg_client.update_job_status(request.job_id, "completed")
         logger.info(
             f"Published rendered raw result for {request.url} "
             f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
@@ -206,6 +237,7 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
 
 async def main():
     """Main worker lifecycle loop."""
+    await pg_client.connect()
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -250,6 +282,7 @@ async def main():
             await browser.close()
         if playwright_manager is not None:
             await playwright_manager.stop()
+        await pg_client.close()
 
 
 if __name__ == "__main__":

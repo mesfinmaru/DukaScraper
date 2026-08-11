@@ -1,15 +1,15 @@
-"""Simple tokenizers for Amharic text.
+"""Simple tokenizers for Amharic and English text.
 
-The tokenizer splits on Ethiopic sentence punctuation (።፤) and whitespace.
-It does not attempt to resolve clitic-bound forms that are written without a
-space in Amharic, so it should be treated as a basic heuristic.
+The tokenizer splits on common sentence punctuation and whitespace. It does not
+attempt to resolve clitic-bound forms that are written without a space in
+Amharic, so it should be treated as a basic heuristic for both language scripts.
 """
 
 from __future__ import annotations
 
 import re
 
-_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[።፤]+")
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[።፤\.\!?]+")
 _WORD_BOUNDARY_PATTERN = re.compile(r"[\s\.,!?።፣፤፥፦]+")
 
 

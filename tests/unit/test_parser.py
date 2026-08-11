@@ -59,3 +59,45 @@ def test_detect_language_from_text():
 def test_extract_title_and_publish_date():
     assert parser_worker.extract_title(AMHARIC_HTML) == "የሙከራ ርዕስ"
     assert parser_worker.extract_publish_date(AMHARIC_HTML, "") == "2024-01-02"
+
+
+def test_clean_and_extract_text_rejects_placeholder_content():
+    html = """
+    <html><body>
+      <div>waiting...for checking</div>
+      <div>Please wait while we verify your browser.</div>
+      <p>This is a real article paragraph with enough content to be kept.</p>
+    </body></html>
+    """
+    text = parser_worker.clean_and_extract_text(html, "en")
+    assert "waiting" not in text.lower()
+    assert "Please wait" not in text
+    assert "This is a real article paragraph" in text
+
+
+def test_clean_and_extract_text_skips_sites_below_requested_language_threshold_for_amharic():
+    html = """
+    <html><body>
+      <p>This page is mostly English and only has one short Amharic phrase.</p>
+      <p>hello world hello world hello world hello world</p>
+    </body></html>
+    """
+    text = parser_worker.clean_and_extract_text(html, "am")
+    assert text == ""
+
+
+def test_clean_and_extract_text_skips_sites_below_requested_language_threshold_for_english():
+    html = """
+    <html><body>
+      <p>ይህ የአማርኛ ጽሑፍ ነው እና በብዛት አማርኛ ነው።</p>
+      <p>የምንም ተጨማሪ እንግሊዝኛ አይደለም።</p>
+    </body></html>
+    """
+    text = parser_worker.clean_and_extract_text(html, "en")
+    assert text == ""
+
+
+def test_item_based_minio_names_use_item_prefixes():
+    assert parser_worker._item_object_name("raw", "ITEM00000001") == "raw_item00000001.json"
+    assert parser_worker._item_object_name("parsed", "ITEM00000001") == "parse_item00000001.json"
+    assert parser_worker._item_object_name("export", "ITEM00000001", ".csv.gz") == "export_item00000001.csv.gz"

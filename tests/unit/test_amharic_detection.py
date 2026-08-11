@@ -1,4 +1,4 @@
-from app.amharic.language_detection.detector import detect_language_from_text
+from app.language.language_detection.detector import detect_language_from_text
 
 
 def test_detects_mixed_amharic_english_text_as_amharic():

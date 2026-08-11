@@ -1,4 +1,4 @@
-"""Unicode and whitespace normalization for Amharic text."""
+"""Unicode and whitespace normalization for multilingual text."""
 
 from __future__ import annotations
 

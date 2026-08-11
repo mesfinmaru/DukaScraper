@@ -1,4 +1,4 @@
-from app.amharic.quality.scorer import score_text_quality
+from app.language.quality.scorer import score_text_quality
 
 
 def test_rejects_boilerplate_only_text():

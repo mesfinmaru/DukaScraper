@@ -9,7 +9,7 @@ volumes:
   minio_data:
   kafka_data:
   pgadmin_data:
-  ollama_data:
+  # ollama_data removed: using hosted Google AI
 
 services:
   postgres:
@@ -203,25 +203,7 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    environment:
-      - OLLAMA_MODELS=/root/.ollama/models
-    volumes:
-      - ollama_data:/root/.ollama
-    networks:
-      - duka-net
-    restart: always
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-    command: serve
+  # Ollama service removed: using hosted Google AI instead
 
   api:
     build:
@@ -360,8 +342,10 @@ services:
     environment:
       - APP_ENV=docker
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=qwen2:8b
+      - LLM_PROVIDER=hosted
+      - HOSTED_LLM_URL=https://api.groq.com/openai/v1/chat/completions
+      - HOSTED_LLM_API_KEY=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
+      - HOSTED_LLM_MODEL=openai/gpt-oss-120b
       - CH_HOST=clickhouse
       - CH_PORT=8123
       - CH_DATABASE=duka_scraper
@@ -376,25 +360,8 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
 
-  ollama-pull:
-    image: ollama/ollama:latest
-    container_name: ollama-pull
-    depends_on:
-      ollama:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: |
-      until curl -s http://ollama:11434/api/tags >/dev/null 2>&1; do
-        echo "Waiting for Ollama service..."
-        sleep 2
-      done
-      ollama pull qwen2:8b
-    networks:
-      - duka-net
-    restart: "no"
+  # ollama-pull helper removed
 
   exporter-worker:
     build:

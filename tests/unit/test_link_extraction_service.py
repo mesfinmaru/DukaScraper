@@ -81,6 +81,20 @@ class TestExtractLinks:
         assert not any(link.startswith("mailto:") for link in links)
         assert not any(link.startswith("javascript:") for link in links)
 
+    def test_exclude_framework_and_font_junk_links(self):
+        """Skip CDN, font, and framework boilerplate links that never contain article content."""
+        html = """
+        <a href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">Bootstrap</a>
+        <a href="https://fonts.googleapis.com/css2?family=Roboto">Fonts</a>
+        <a href="https://example.com/article/story">Actual article</a>
+        <a href="https://www.googletagmanager.com/gtag/js?id=abc">Analytics</a>
+        """
+        links = LinkExtractionService.extract_links(html, "https://example.com")
+        assert "https://example.com/article/story" in links
+        assert not any("bootstrap" in link.lower() for link in links)
+        assert not any("fonts.googleapis.com" in link.lower() for link in links)
+        assert not any("googletagmanager" in link.lower() for link in links)
+
 
 class TestNormalizeURL:
     """Test URL normalization for deduplication."""
@@ -248,6 +262,61 @@ class TestFilterLinks:
         """Handle empty link lists."""
         filtered = LinkExtractionService.filter_links([])
         assert filtered == []
+
+    def test_extract_rss_links_from_html(self):
+        """Detect RSS/Atom links as high-priority feed targets."""
+        html = '''
+        <html><head>
+            <link rel="alternate" type="application/rss+xml" title="RSS" href="https://example.org/feed.xml">
+            <link rel="alternate" type="application/atom+xml" href="https://example.org/atom.xml">
+        </head></html>
+        '''
+        feeds = LinkExtractionService.extract_rss_links(html, "https://example.org")
+        assert "https://example.org/feed.xml" in feeds
+        assert "https://example.org/atom.xml" in feeds
+
+    def test_select_preferred_content_url_prefers_feed(self):
+        """When a page exposes an RSS/Atom feed, it should be used before the page HTML."""
+        html = '''
+        <html><head>
+            <link rel="alternate" type="application/rss+xml" href="https://example.org/feed.xml">
+            <a href="https://example.org/article/123">Article</a>
+        </head></html>
+        '''
+        preferred = LinkExtractionService.select_preferred_content_url(html, "https://example.org")
+        assert preferred == "https://example.org/feed.xml"
+
+    def test_exclude_video_and_redirect_junk_links(self):
+        """Reject redirect and video links that are not meaningful crawl targets."""
+        links = [
+            "https://example.com/watch?v=abc123",
+            "https://example.com/video/clip.mp4",
+            "https://example.com/redirect?url=https://cdn.example.com/video",
+            "https://example.com/article/123",
+            "https://bit.ly/abc123",
+            "https://example.com/?utm_source=google",
+        ]
+
+        filtered = LinkExtractionService.filter_links(links)
+        assert "https://example.com/article/123" in filtered
+        assert all("watch" not in link for link in filtered)
+        assert all("video" not in link for link in filtered)
+        assert all("bit.ly" not in link for link in filtered)
+
+    def test_rss_links_are_preserved_when_present(self):
+        """RSS endpoints are valid crawl targets and should not be discarded."""
+        links = [
+            "https://example.org/feed.xml",
+            "https://example.org/article/123",
+            "https://example.org/watch?v=abc",
+        ]
+        filtered = LinkExtractionService.filter_links(links)
+        assert "https://example.org/feed.xml" in filtered
+        assert "https://example.org/article/123" in filtered
+        assert "https://example.org/watch?v=abc" not in filtered
+        assert not any("watch?v=" in link for link in filtered)
+        assert not any("bit.ly" in link for link in filtered)
+        assert not any("video" in link for link in filtered if "example.org" in link)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,10 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.pipeline.schemas import CrawlRequest, CrawlResult
+from app.storage.postgres.client import pg_client
 from app.services.recursive_crawl_service import extract_and_queue_children
+from app.language.cleaning.cleaner import clean_and_extract_text
+from app.language.language_detection.detector import detect_language_from_text
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -100,7 +103,7 @@ async def extract_and_queue_children_local(
     that many onion forums/markets mint per-request - without this, the Bloom filter
     dedup would treat every click as a "new" URL and recurse forever.
     """
-    return await extract_and_queue_children(
+    return await extract_and_queue_children(\
         producer=producer,
         request=request,
         html=html,
@@ -148,11 +151,20 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         # --- Recursive link extraction (shared logic, all workers) ---
         extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
 
+        requested_text = clean_and_extract_text(html, request.language, preserve_amharic=False)
+        fallback_text = requested_text or clean_and_extract_text(html, "other", preserve_amharic=False)
+        resolved_language = detect_language_from_text(fallback_text, "unknown")
+        if resolved_language not in {"am", "en"}:
+            await pg_client.update_job_status(request.job_id, "completed")
+            logger.info(
+                f"Skipped {request.url}: resolved language '{resolved_language}' is outside the am/en allowlist"
+            )
+            return
         result = CrawlResult(
             job_id=request.job_id,
             url=final_url,
             worker=WORKER_TYPE,
-            language=request.language,
+            language=resolved_language,
             html=html,
             status_code=status_code,
             network="dark",
@@ -166,10 +178,7 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
         payload_bytes = result.model_dump_json().encode("utf-8")
 
-        # 1. Save directly to MinIO
-        await save_to_minio(request.job_id, payload_bytes)
-
-        # 2. Publish output to downstream raw Kafka topic
+        # Parser-worker assigns the item ID and stores the authoritative raw object.
         await producer.send_and_wait(
             PRODUCE_TOPIC,
             value=payload_bytes,
@@ -196,6 +205,7 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
 
 async def main():
     """Main worker lifecycle loop. Dark worker is always active - no feature flag gating."""
+    await pg_client.connect()
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -235,6 +245,7 @@ async def main():
         logger.info("Shutting down worker gracefully...")
         await consumer.stop()
         await producer.stop()
+        await pg_client.close()
 
 
 if __name__ == "__main__":

@@ -82,9 +82,6 @@ CREATE TABLE jobs (
 
     url TEXT NOT NULL,
 
-    worker_type VARCHAR(20) NOT NULL
-        CHECK (worker_type IN ('surface','deep','dark')),
-
     language VARCHAR(10) DEFAULT 'am',
 
     status VARCHAR(20) DEFAULT 'pending'

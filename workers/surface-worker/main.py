@@ -20,9 +20,14 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.storage.clickhouse.client import ch_client
+from app.storage.postgres.client import pg_client
 from workers.common import check_escalation
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 from workers.common import extract_and_queue_children
+from app.services.link_extraction_service import LinkExtractionService
+from app.language.cleaning.cleaner import clean_and_extract_text
+from app.language.language_detection.detector import detect_language_from_text
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -133,7 +138,6 @@ async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, re
     escalated_request = request.model_copy(
         update={
             "worker_type": "deep",
-            "target_layer": "deep",
             "retry_count": request.retry_count + 1,
             "escalation_reason": reason,
         }
@@ -177,12 +181,14 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             f"Processing job {request.job_id} [{request.language}] depth={request.depth}/{request.max_depth} "
             f"for URL: {request.url}"
         )
+        await pg_client.update_job_status(request.job_id, "running")
 
         # Select rule-based proxy for this specific request
         proxy_url = proxy_manager.get_proxy(request.language, request.url)
         if proxy_url:
             logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")
 
+        preferred_feed = None
         async with httpx.AsyncClient(
             proxy=proxy_url,
             headers=DEFAULT_HEADERS,
@@ -205,20 +211,57 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
                 status_code = 599
                 final_url = request.url
 
+            preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
+            if preferred_feed and preferred_feed != request.url:
+                logger.info(
+                    f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
+                )
+                try:
+                    feed_response = await client.get(preferred_feed)
+                    feed_response.raise_for_status()
+                    html = feed_response.text
+                    status_code = feed_response.status_code
+                    final_url = str(feed_response.url)
+                except httpx.HTTPError as feed_exc:
+                    logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}")
+
         # --- Auto-escalation check (SURFACE -> DEEP) ---
         should_escalate, reason = check_escalation(status_code, html, WORKER_TYPE)
         if should_escalate:
             await escalate_to_deep(producer, request, reason)
             return  # Do not publish a partial/blocked CrawlResult; DEEP worker will produce the real one
 
+        try:
+            latency_ms = int((response.elapsed.total_seconds() * 1000) if 'response' in locals() and response is not None else 0)
+            ch_client.write_crawler_performance(
+                job_id=request.job_id,
+                worker=WORKER_TYPE,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                proxy_ip=proxy_url,
+                retry_count=request.retry_count,
+                payload_size_bytes=len(html.encode("utf-8")),
+            )
+        except Exception as perf_err:
+            logger.warning(f"Unable to write crawler performance metric for {request.job_id}: {perf_err}")
+
         # --- Recursive link extraction (shared logic, all workers) ---
         extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
 
+        requested_text = clean_and_extract_text(html, request.language, preserve_amharic=False)
+        fallback_text = requested_text or clean_and_extract_text(html, "other", preserve_amharic=False)
+        resolved_language = detect_language_from_text(fallback_text, "unknown")
+        if resolved_language not in {"am", "en"}:
+            await pg_client.update_job_status(request.job_id, "completed")
+            logger.info(
+                f"Skipped {request.url}: resolved language '{resolved_language}' is outside the am/en allowlist"
+            )
+            return
         result = CrawlResult(
             job_id=request.job_id,
             url=final_url,
             worker=WORKER_TYPE,
-            language=request.language,
+            language=resolved_language,
             html=html,
             status_code=status_code,
             network="surface",
@@ -232,15 +275,13 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
         payload_bytes = result.model_dump_json().encode("utf-8")
 
-        # 1. Save directly to MinIO
-        await save_to_minio(request.job_id, payload_bytes)
-
-        # 2. Publish output to downstream raw Kafka topic
+        # Parser-worker assigns the item ID and stores the authoritative raw object.
         await producer.send_and_wait(
             PRODUCE_TOPIC,
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
+        await pg_client.update_job_status(request.job_id, "completed")
         logger.info(
             f"Published raw result for {request.url} "
             f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
@@ -262,6 +303,7 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
 
 async def main():
     """Main worker lifecycle loop."""
+    await pg_client.connect()
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,

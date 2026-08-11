@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import clickhouse_connect
+import re
 from aiokafka import AIOKafkaConsumer
 from elasticsearch import AsyncElasticsearch
 from minio import Minio
@@ -51,6 +52,18 @@ minio_client = Minio(
 
 es_client = AsyncElasticsearch(hosts=[settings.ELASTICSEARCH_URL])
 ch_client = None
+
+
+def _normalize_item_suffix(item_id: str) -> str:
+    digits = re.sub(r"[^0-9]", "", str(item_id or ""))
+    return digits.zfill(8) if digits else "00000000"
+
+
+def _item_object_name(prefix: str, item_id: str, extension: str = ".json") -> str:
+    normalized_prefix = prefix.strip().lower()
+    if normalized_prefix == "parsed":
+        normalized_prefix = "parse"
+    return f"{normalized_prefix}_item{_normalize_item_suffix(item_id)}{extension}"
 
 
 def _minio_put_object_sync(bucket_name: str, object_name: str, payload_bytes: bytes, content_type: str):
@@ -189,8 +202,9 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
     parsed_payload["data"] = data
     payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
-    await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, f"{job_id}.json", payload_bytes, "application/json")
-    logger.info(f"Saved parsed JSON for {job_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
+    parsed_object_name = _item_object_name("parsed", item_id)
+    await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, parsed_object_name, payload_bytes, "application/json")
+    logger.info(f"Saved parsed JSON for {item_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
 
     try:
         await es_client.index(
@@ -245,6 +259,15 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
     return data
 
 
+def _single_item_to_csv_bytes(item: dict[str, Any]) -> bytes:
+    buffer = io.StringIO()
+    fieldnames = ["job_id", "item_id", "url", "worker", "language", "character_count", "status", "title", "publish_date", "extracted_text"]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow({name: item.get(name) for name in fieldnames})
+    return buffer.getvalue().encode("utf-8")
+
+
 def _batch_to_csv_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
     buffer = io.StringIO()
     fieldnames = ["job_id", "item_id", "url", "worker", "language", "character_count", "status", "title", "publish_date", "extracted_text"]
@@ -257,6 +280,12 @@ def _batch_to_csv_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
 
 def _batch_to_json_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
     return json.dumps(list(batch), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _job_item_object_name(job_id: str | int, item_id: str | int, extension: str = ".csv.gz") -> str:
+    clean_job = str(job_id).strip()
+    clean_item = str(item_id).strip()
+    return f"{clean_job}/{clean_item}{extension}"
 
 
 class BatchExportManager:
@@ -292,42 +321,47 @@ class BatchExportManager:
         await self.flush()
 
     async def _export_batch(self, batch: list[dict[str, Any]]):
+        if not batch:
+            return
+
         batch_job_id = batch[0]["job_id"]
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        export_type = "csv"
+        export_row = None
+        export_id = None
+        total_size_mb = 0.0
 
-        for export_type in ("csv", "json"):
-            export_row = None
-            export_id = None
-            try:
-                export_row = await pg_client.create_export(
-                    job_id=batch_job_id,
-                    export_type=export_type,
-                    file_path="",
-                    item_count=len(batch),
-                )
-                export_id = export_row["export_id"]
-                if export_type == "csv":
-                    raw_bytes = _batch_to_csv_bytes(batch)
-                    object_name = f"{export_id}/{batch_job_id}_{timestamp}.csv.gz"
-                    content_type = "text/csv"
-                else:
-                    raw_bytes = _batch_to_json_bytes(batch)
-                    object_name = f"{export_id}/{batch_job_id}_{timestamp}.json.gz"
-                    content_type = "application/json"
+        try:
+            export_row = await pg_client.create_export(
+                job_id=batch_job_id,
+                export_type=export_type,
+                file_path="",
+                item_count=len(batch),
+            )
+            export_id = export_row["export_id"]
 
+            for item in batch:
+                item_id = item.get("item_id")
+                if item_id is None:
+                    continue
+
+                raw_bytes = _single_item_to_csv_bytes(item)
                 gzipped_bytes = gzip.compress(raw_bytes)
-                await upload_bytes_to_minio(EXPORTS_BUCKET, object_name, gzipped_bytes, content_type)
-                file_path = f"s3://{EXPORTS_BUCKET}/{object_name}"
-                await pg_client.update_export_file_path(export_id, file_path)
-                await pg_client.update_export_status(export_id, "completed", round(len(gzipped_bytes) / (1024 * 1024), 2))
-                logger.info(f"Exported batch {export_id} ({export_type}) with {len(batch)} items")
-            except Exception as e:
-                logger.error(f"Batch export failure for {export_type} export: {e}", exc_info=True)
-                if export_id:
-                    try:
-                        await pg_client.update_export_status(export_id, "failed")
-                    except Exception:
-                        logger.exception("Failed to mark export as failed")
+                object_name = _job_item_object_name(batch_job_id, item_id)
+                await upload_bytes_to_minio(EXPORTS_BUCKET, object_name, gzipped_bytes, "text/csv")
+                total_size_mb += len(gzipped_bytes) / (1024 * 1024)
+                logger.info(f"Exported item {item_id} for job {batch_job_id} to path '{object_name}'")
+
+            folder_path = f"s3://{EXPORTS_BUCKET}/{batch_job_id}/"
+            await pg_client.update_export_file_path(export_id, folder_path)
+            await pg_client.update_export_status(export_id, "completed", round(total_size_mb, 2))
+            logger.info(f"Exported batch {export_id} ({export_type}) with {len(batch)} items under job folder '{batch_job_id}'")
+        except Exception as e:
+            logger.error(f"Batch export failure for {export_type} export: {e}", exc_info=True)
+            if export_id:
+                try:
+                    await pg_client.update_export_status(export_id, "failed")
+                except Exception:
+                    logger.exception("Failed to mark export as failed")
 
 
 async def consume_and_export():

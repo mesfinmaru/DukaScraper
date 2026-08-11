@@ -1,4 +1,4 @@
-from app.amharic.deduplication.similarity import is_near_duplicate
+from app.language.deduplication.similarity import is_near_duplicate
 
 
 def test_detects_near_duplicate_texts():

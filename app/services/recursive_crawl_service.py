@@ -82,7 +82,6 @@ async def extract_and_queue_children(
                 depth=request.depth + 1,
                 max_depth=request.max_depth,
                 parent_url=request.url,
-                target_layer=child_worker,
                 recursive_config=request.recursive_config,
             )
 

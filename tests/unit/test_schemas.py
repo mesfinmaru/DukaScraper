@@ -4,8 +4,10 @@ from pydantic import ValidationError
 from app.pipeline.schemas import (
 	CrawlRequest,
 	CrawlResult,
+	JobRecord,
 	ParsedItem,
 	ParsedItemData,
+	ParsedItemRecord,
 	IntelligenceAnalytics,
 )
 from app.common.constants.intelligence_categories import (
@@ -123,6 +125,20 @@ def test_parsed_item_missing_required_field():
 			language="en",
 			status="completed",
 		)
+
+
+def test_job_and_parsed_item_worker_tracking():
+	job = JobRecord(user_id="USR12345", url="https://example.com", status="pending")
+	assert not hasattr(job, "worker_type")
+
+	item = ParsedItemRecord(
+		job_id="JOB00000001",
+		source_url="https://example.com",
+		worker_type="surface",
+		raw_html_path="s3://raw/test.json",
+		parsed_json_path="s3://parsed/test.json",
+	)
+	assert item.worker_type == "surface"
 
 
 def test_intelligence_analytics_validation():

@@ -88,6 +88,44 @@ class ClickHouseManager:
             logger.error(f"ClickHouse Connection Error: {e}", exc_info=True)
             raise e
 
+    def write_crawler_performance(
+        self,
+        job_id: str,
+        worker: str,
+        status_code: int,
+        latency_ms: int,
+        proxy_ip: str | None = None,
+        retry_count: int = 0,
+        payload_size_bytes: int = 0,
+    ) -> None:
+        """Write a single crawler performance metric row to ClickHouse."""
+        if not self.client:
+            raise ConnectionError("ClickHouse client not initialized. Cannot write performance metrics.")
+
+        self.client.insert(
+            "crawler_performance",
+            [[
+                job_id,
+                worker,
+                int(status_code),
+                int(latency_ms),
+                proxy_ip or "",
+                int(retry_count),
+                int(payload_size_bytes),
+                __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            ]],
+            column_names=[
+                "job_id",
+                "worker",
+                "status_code",
+                "latency_ms",
+                "proxy_ip",
+                "retry_count",
+                "payload_size_bytes",
+                "created_at",
+            ],
+        )
+
     def close(self) -> None:
         """Closes the connection."""
         if self.client:
