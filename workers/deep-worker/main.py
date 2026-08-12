@@ -28,6 +28,7 @@ from app.services.link_extraction_service import LinkExtractionService
 from app.storage.postgres.client import pg_client
 from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import detect_language_from_text
+from app.agents import fetch_with_retry
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -169,17 +170,16 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if preferred_feed and preferred_feed != request.url:
             logger.info(f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of rendered page.")
             try:
-                async with httpx.AsyncClient(
+                status_code, html, final_url = await fetch_with_retry(
+                    fetcher="httpx",
+                    url=preferred_feed,
                     headers=DEFAULT_HEADERS,
-                    follow_redirects=True,
+                    proxy=None,
                     timeout=settings.http_timeout_seconds,
-                ) as client:
-                    feed_response = await client.get(preferred_feed)
-                    feed_response.raise_for_status()
-                    html = feed_response.text
-                    status_code = feed_response.status_code
-                    request = request.model_copy(update={"url": str(feed_response.url)})
-            except httpx.HTTPError as feed_exc:
+                    max_attempts=3,
+                )
+                request = request.model_copy(update={"url": final_url})
+            except Exception as feed_exc:
                 logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}; keeping rendered page")
 
         # --- Recursive link extraction (shared logic, all workers) ---

@@ -6,10 +6,11 @@ import os
 import signal
 import sys
 
-import httpx
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from minio import Minio
 from pydantic import ValidationError
+
+from app.agents import fetch_with_retry
 
 # --- Path Setup ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -25,6 +26,7 @@ from app.storage.postgres.client import pg_client
 from app.services.recursive_crawl_service import extract_and_queue_children
 from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import detect_language_from_text
+from app.agents.agents import fetch_with_retry
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -126,27 +128,20 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             f"via Tor for URL: {request.url}"
         )
 
-        async with httpx.AsyncClient(
-            proxy=TOR_PROXY_URL,
-            headers=DEFAULT_HEADERS,
-            follow_redirects=True,
-            timeout=settings.dark_timeout_seconds,
-        ) as client:
-            try:
-                response = await client.get(request.url)
-                html = response.text
-                status_code = response.status_code
-                final_url = str(response.url)
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"HTTP error {e.response.status_code} for {request.url} via Tor")
-                html = e.response.text if e.response is not None else ""
-                status_code = e.response.status_code
-                final_url = str(e.request.url)
-            except httpx.RequestError as e:
-                logger.warning(f"Request error for {request.url} via Tor: {e}")
-                html = ""
-                status_code = 599
-                final_url = request.url
+        try:
+            status_code, html, final_url = await fetch_with_retry(
+                fetcher="httpx",
+                url=request.url,
+                headers=DEFAULT_HEADERS,
+                proxy=TOR_PROXY_URL,
+                timeout=settings.dark_timeout_seconds,
+                max_attempts=3,
+            )
+        except Exception as e:
+            logger.warning(f"Request error for {request.url} via Tor: {e}")
+            html = ""
+            status_code = 599
+            final_url = request.url
 
         # --- Recursive link extraction (shared logic, all workers) ---
         extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)

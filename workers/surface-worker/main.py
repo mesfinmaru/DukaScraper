@@ -7,6 +7,7 @@ import signal
 import sys
 
 import httpx
+import time
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from minio import Minio
 from pydantic import ValidationError
@@ -28,6 +29,7 @@ from workers.common import extract_and_queue_children
 from app.services.link_extraction_service import LinkExtractionService
 from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import detect_language_from_text
+from app.agents import fetch_with_agent_rotation
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -188,42 +190,41 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         if proxy_url:
             logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")
 
-        preferred_feed = None
-        async with httpx.AsyncClient(
-            proxy=proxy_url,
-            headers=DEFAULT_HEADERS,
-            follow_redirects=True,
-            timeout=settings.http_timeout_seconds,
-        ) as client:
-            try:
-                response = await client.get(request.url)
-                html = response.text
-                status_code = response.status_code
-                final_url = str(response.url)
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"HTTP error {e.response.status_code} for {request.url} using proxy")
-                html = e.response.text if e.response is not None else ""
-                status_code = e.response.status_code
-                final_url = str(e.request.url)
-            except httpx.RequestError as e:
-                logger.warning(f"Request error for {request.url}: {e}")
-                html = ""
-                status_code = 599
-                final_url = request.url
+        start_time = time.perf_counter()
+        try:
+            status_code, html, final_url = await fetch_with_agent_rotation(
+                job_id=request.job_id,
+                url=request.url,
+                proxy=proxy_url,
+                timeout=settings.http_timeout_seconds,
+                max_attempts=3,
+            )
+        except Exception as e:
+            logger.warning(f"Request error for {request.url}: {e}")
+            html = ""
+            status_code = 599
+            final_url = request.url
 
-            preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
-            if preferred_feed and preferred_feed != request.url:
-                logger.info(
-                    f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
-                )
-                try:
-                    feed_response = await client.get(preferred_feed)
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+        preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
+        if preferred_feed and preferred_feed != request.url:
+            logger.info(
+                f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
+            )
+            try:
+                async with httpx.AsyncClient(
+                    headers=DEFAULT_HEADERS,
+                    follow_redirects=True,
+                    timeout=settings.http_timeout_seconds,
+                ) as feed_client:
+                    feed_response = await feed_client.get(preferred_feed)
                     feed_response.raise_for_status()
                     html = feed_response.text
                     status_code = feed_response.status_code
                     final_url = str(feed_response.url)
-                except httpx.HTTPError as feed_exc:
-                    logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}")
+            except httpx.HTTPError as feed_exc:
+                logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}")
 
         # --- Auto-escalation check (SURFACE -> DEEP) ---
         should_escalate, reason = check_escalation(status_code, html, WORKER_TYPE)
@@ -232,7 +233,6 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             return  # Do not publish a partial/blocked CrawlResult; DEEP worker will produce the real one
 
         try:
-            latency_ms = int((response.elapsed.total_seconds() * 1000) if 'response' in locals() and response is not None else 0)
             ch_client.write_crawler_performance(
                 job_id=request.job_id,
                 worker=WORKER_TYPE,
