@@ -27,7 +27,7 @@ python - <<'PY'
 import json
 from kafka import KafkaProducer
 producer = KafkaProducer(bootstrap_servers=['localhost:29092'], value_serializer=lambda v: json.dumps(v).encode('utf-8'))
-producer.send('crawl.requests', {'job_id':'crawl_api_check','url':'https://www.dw.com/am/','language':'am','worker_type':'surface','job_params':{},'depth':0,'max_depth':2,'parent_url':None,'target_layer':'surface','recursive_config':{'enable_extraction':True}})
+producer.send('crawl.requests', {'job_id':'crawl_api_check','url':'https://www.dw.com/am/','language':'am','worker_type':'surface','job_params':{},'depth':0,'max_depth':2,'parent_url':None,'recursive_config':{'enable_extraction':True}})
 producer.flush()
 PY
 ```

@@ -47,7 +47,6 @@ def test_crawl_request_recursive_fields():
 		depth=2,
 		max_depth=5,
 		parent_url="https://news.example.com",
-		target_layer="surface",
 	)
 
 	assert request.depth == 2

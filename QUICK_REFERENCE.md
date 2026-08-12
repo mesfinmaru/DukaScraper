@@ -46,7 +46,7 @@ CrawlRequest:
   depth: int                    # Current recursion level (0=seed)
   max_depth: int               # Circuit-breaker (0=single URL only)
   parent_url: str | None       # Lineage tracking
-  target_layer: str            # Execution network (surface|deep|dark)
+  # target_layer removed: execution layer is determined by `worker_type`
   recursive_config: dict       # Patterns, blocklists, etc.
 
 CrawlResult:

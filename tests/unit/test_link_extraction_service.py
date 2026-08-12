@@ -3,6 +3,7 @@
 import pytest
 
 from app.services.link_extraction_service import LinkExtractionService
+from app.common.constants.worker_assignment import assign_worker
 
 
 class TestExtractLinks:
@@ -144,33 +145,28 @@ class TestNormalizeURL:
         assert norm1 == norm2
 
 
-class TestInferTargetLayer:
-    """Test target_layer inference from URL domain."""
+class TestWorkerAssignmentHelpers:
+    """Ensure worker assignment utilities behave as expected.
 
-    def test_onion_domain_returns_dark(self):
-        """Detect .onion domains."""
+    The `infer_target_layer` helper was removed in favor of the centralized
+    worker assignment engine (`assign_worker` / `assign_worker_with_reason`).
+    These tests validate domain parsing remains stable by using `assign_worker`.
+    """
+
+    def test_onion_domain_assigned_to_dark(self):
         url = "https://example.onion/page"
-        layer = LinkExtractionService.infer_target_layer(url)
-        assert layer == "dark"
+        worker = assign_worker(url)
+        assert worker == "dark"
 
-    def test_standard_domain_returns_surface(self):
-        """Standard domains default to surface."""
+    def test_standard_domain_assigned_to_surface(self):
         url = "https://example.com/page"
-        layer = LinkExtractionService.infer_target_layer(url)
-        assert layer == "surface"
-
-    def test_i2p_domain_returns_deep(self):
-        """Detect .i2p domains (optional)."""
-        url = "https://example.i2p/page"
-        layer = LinkExtractionService.infer_target_layer(url)
-        # May be "deep" or "surface" depending on implementation
-        assert layer in ["deep", "surface"]
+        worker = assign_worker(url)
+        assert worker == "surface"
 
     def test_malformed_url_defaults_to_surface(self):
-        """Malformed URLs default to surface."""
         url = "not-a-valid-url"
-        layer = LinkExtractionService.infer_target_layer(url)
-        assert layer == "surface"
+        worker = assign_worker(url)
+        assert worker == "surface"
 
 
 class TestInferSourceType:

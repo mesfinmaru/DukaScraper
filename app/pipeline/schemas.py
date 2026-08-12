@@ -18,7 +18,7 @@ This allows dynamic classification based on actual content rather than pre-speci
 
 NOTE on recursive crawling:
 All workers (SURFACE, DEEP, DARK) now support depth-limited recursive crawling.
-New fields: depth, max_depth, parent_url, target_layer, recursive_config.
+New fields: depth, max_depth, parent_url, recursive_config.
 """
 
 from datetime import datetime, timezone
@@ -57,9 +57,6 @@ class CrawlRequest(BaseModel):
     )
     parent_url: Optional[str] = Field(
         default=None, description="Lineage tracking: URL that led to this child task"
-    )
-    target_layer: str = Field(
-        default="surface", description="Execution network: 'surface', 'deep', or 'dark'"
     )
     recursive_config: dict = Field(
         default_factory=dict,

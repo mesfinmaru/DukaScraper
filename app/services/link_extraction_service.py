@@ -341,30 +341,7 @@ class LinkExtractionService:
             return url  # Return original on failure
 
     @staticmethod
-    def infer_target_layer(url: str) -> str:
-        """
-        Determine target_layer (execution network) based on domain.
-
-        Args:
-            url: URL to analyze
-
-        Returns:
-            "dark" for .onion domains, "surface" for standard web, etc.
-        """
-        try:
-            parsed = urlparse(url)
-            hostname = (parsed.hostname or "").lower()
-
-            if hostname.endswith(".onion"):
-                return "dark"
-            # Future: add i2p, freenet, etc.
-            if hostname.endswith(".i2p"):
-                return "deep"  # Or dedicated i2p layer
-
-            return "surface"
-        except Exception as e:
-            logger.debug(f"Layer inference failed for {url}: {e}")
-            return "surface"
+    # `infer_target_layer` removed: execution layer is determined by the worker assignment rules
 
     @staticmethod
     def infer_source_type(url: str, domain: Optional[str] = None) -> str:
