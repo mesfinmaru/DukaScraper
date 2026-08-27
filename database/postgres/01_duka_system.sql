@@ -85,7 +85,7 @@ CREATE TABLE jobs (
     language VARCHAR(10) DEFAULT 'am',
 
     status VARCHAR(20) DEFAULT 'pending'
-        CHECK (status IN ('pending','running','completed','failed')),
+        CHECK (status IN ('pending','running','completed','failed','skipped','needs_review')),
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -106,3 +106,66 @@ ON jobs(user_id);
 
 CREATE INDEX idx_jobs_status
 ON jobs(status);
+
+-- ============================================================
+-- CREDENTIAL USAGE TABLE (merged credentials + credential_usage)
+-- ============================================================
+-- Each row represents a credential-domain pair.
+-- A credential with no domain assignment has domain = NULL (base row).
+-- Each domain row stores the credential metadata alongside usage data.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS credential_usage (
+
+    email VARCHAR(255) NOT NULL,
+
+    domain VARCHAR(255),
+
+    password_hash VARCHAR(255) NOT NULL,
+
+    display_name VARCHAR(100),
+
+    provider VARCHAR(50) DEFAULT 'custom',
+
+    status VARCHAR(20) DEFAULT 'active'
+        CHECK (status IN ('active','suspended','locked')),
+
+    imap_host VARCHAR(255),
+
+    imap_port INTEGER DEFAULT 993,
+
+    imap_user VARCHAR(255),
+
+    imap_password_enc TEXT,
+
+    gmail_client_id VARCHAR(255),
+
+    gmail_client_secret_enc TEXT,
+
+    gmail_refresh_token_enc TEXT,
+
+    -- Usage tracking fields
+
+    action VARCHAR(20)
+        CHECK (action IN ('signup','login','verification_sent','verified','failed')),
+
+    usage_status VARCHAR(20)
+        CHECK (usage_status IN ('success','failed','pending')),
+
+    error_message TEXT,
+
+    portal_config JSONB,
+
+    -- Timestamps
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    last_used_at TIMESTAMP,
+
+    CONSTRAINT pk_credential_usage PRIMARY KEY (email, domain),
+
+    CONSTRAINT uq_credential_usage_email UNIQUE (email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_usage_domain ON credential_usage(domain);
+CREATE INDEX IF NOT EXISTS idx_credential_usage_status ON credential_usage(status);

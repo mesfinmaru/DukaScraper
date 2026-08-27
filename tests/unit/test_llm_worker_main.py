@@ -8,13 +8,13 @@ SPEC = importlib.util.spec_from_file_location("llm_worker_main", MODULE_PATH)
 llm_worker_main = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None and SPEC.loader is not None
 SPEC.loader.exec_module(llm_worker_main)
-OllamaLLMClient = llm_worker_main.OllamaLLMClient
+HostedLLMClient = llm_worker_main.HostedLLMClient
 
 
-class TestOllamaLLMClient:
+class TestHostedLLMClient:
     def test_parse_intelligence_response_valid_json(self):
         text = '{"source_type":"news","category":"gov_issue","threat_severity":3,"entities":["Ethiopia","Prime Minister"],"summary":"Political report."}'
-        parsed = OllamaLLMClient._parse_intelligence_response(text)
+        parsed = HostedLLMClient._parse_intelligence_response(text)
 
         assert parsed["source_type"] == "news"
         assert parsed["category"] == "gov_issue"
@@ -24,7 +24,7 @@ class TestOllamaLLMClient:
 
     def test_parse_intelligence_response_with_extra_text(self):
         text = 'Result:\n{"source_type":"blog","category":"other","threat_severity":1,"entities":"foo,bar","summary":"General content."}\nThanks.'
-        parsed = OllamaLLMClient._parse_intelligence_response(text)
+        parsed = HostedLLMClient._parse_intelligence_response(text)
 
         assert parsed["category"] == "other"
         assert parsed["summary"] == "General content."
@@ -37,7 +37,7 @@ class TestOllamaLLMClient:
             "entities": "192.168.0.1, example.com; user@example.com",
             "summary": "Detected suspicious indicators.",
         }
-        validated = OllamaLLMClient._validate_intelligence(data)
+        validated = HostedLLMClient._validate_intelligence(data)
 
         assert validated["entities"] == ["192.168.0.1", "example.com", "user@example.com"]
         assert validated["summary"].startswith("Detected suspicious")
@@ -50,7 +50,7 @@ class TestOllamaLLMClient:
             "entities": [],
             "summary": "Fallback summary.",
         }
-        validated = OllamaLLMClient._validate_intelligence(data)
+        validated = HostedLLMClient._validate_intelligence(data)
 
         assert validated["category"] != "invalid_category"
         assert validated["threat_severity"] == 5
@@ -64,7 +64,7 @@ class TestOllamaLLMClient:
             "entities": ["Ethiopia", "Parliament"],
             "summary": "This article explains the policy proposal, the reaction from public institutions, and the broader economic impact on citizens across the region in a full and detailed summary that highlights the underlying political tension, fiscal implications, and public response over several weeks.",
         }
-        validated = OllamaLLMClient._validate_intelligence(data)
+        validated = HostedLLMClient._validate_intelligence(data)
 
         assert validated["source_type"] == "news"
         assert len(validated["summary"]) > 200
@@ -85,7 +85,7 @@ def test_hosted_llm_extracts_groq_content_text():
 
 
 def test_fallback_intelligence_includes_source_type():
-    result = llm_worker_main.OllamaLLMClient._fallback_analyze(
+    result = llm_worker_main.HostedLLMClient._fallback_analyze(
         parsed_text="The government announced a new policy and agencies are responding.",
         url="https://example.com/news/policy-update",
     )

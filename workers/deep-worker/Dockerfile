@@ -36,12 +36,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY workers/requirements.txt .
 RUN pip install --no-cache-dir --requirement requirements.txt
 
-# Install the Chromium browser binary at BUILD time (not at container startup).
-# Doing this at runtime (previous approach) re-ran apt-get on every container
-# start and failed because Playwright's Debian package list assumes an
-# unavailable font package on newer Debian bases. Using --with-deps here,
-# during the build, avoids the runtime apt-get entirely.
-RUN python -m playwright install chromium
+# Install Patchright's patched Chromium binary at BUILD time.
+# Patchright strips CDP signatures, C++ automation markers, and TLS/JA3
+# fingerprints that Cloudflare/Akamai use to detect headless browsers.
+# NOTE: --with-deps is a Playwright flag, NOT supported by Patchright.
+RUN python -m patchright install chromium
+
+# Verify patchright is importable after install
+RUN python -c "from patchright.sync_api import sync_playwright; print('✅ patchright importable')"
 
 COPY . .
 COPY workers/wait_for_kafka.sh /wait_for_kafka.sh

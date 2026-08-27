@@ -20,8 +20,12 @@ beautifulsoup4==4.12.3
 lxml==5.2.1
 selenium==4.20.0
 scrapy==2.11.2
-playwright==1.43.0
+patchright>=1.0.0
 stem==1.8.0
+
+# --- Auth & Encryption ---
+bcrypt>=4.1.0
+cryptography>=42.0.0
 
 # --- Utilities & Logging ---
 colorama==0.4.6

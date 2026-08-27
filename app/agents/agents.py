@@ -9,10 +9,12 @@ This module also owns shared fetch retry/rotation behavior.
 from __future__ import annotations
 
 import asyncio
-import httpx
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Tuple
+from typing import Any
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +47,6 @@ AGENTS: list[Agent] = [
         },
         proxy_pref=None,
     ),
-    Agent(
-        name="scrapy_renderer",
-        fetcher="scrapy",
-        headers={
-            "User-Agent": "Scrapy/2.11.0 (+https://scrapy.org)",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        proxy_pref="local",
-    ),
 ]
 
 
@@ -81,7 +74,7 @@ async def _httpx_fetch(
     headers: dict | None = None,
     proxy: str | None = None,
     timeout: int = 30,
-) -> Tuple[int, str, str]:
+) -> tuple[int, str, str]:
     async with httpx.AsyncClient(
         proxies=proxy,
         headers=headers,
@@ -97,9 +90,8 @@ async def _scrapy_fetch(
     headers: dict | None = None,
     proxy: str | None = None,
     timeout: int = 30,
-) -> Tuple[int, str, str]:
-    await asyncio.sleep(0)
-    return 599, "", url
+) -> tuple[int, str, str]:
+    raise RuntimeError("The Scrapy fetch backend is not configured for this worker")
 
 
 async def _perform_fetch(
@@ -108,7 +100,7 @@ async def _perform_fetch(
     headers: dict | None,
     proxy: str | None,
     timeout: int,
-) -> Tuple[int, str, str]:
+) -> tuple[int, str, str]:
     if fetcher == "httpx":
         return await _httpx_fetch(url, headers=headers, proxy=proxy, timeout=timeout)
     if fetcher == "scrapy":
@@ -131,7 +123,7 @@ async def fetch_with_retry(
     retry_status_codes: set[int] | None = None,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     rotate_agent_callback: Callable[[], Any] | None = None,
-) -> Tuple[int, str, str]:
+) -> tuple[int, str, str]:
     retry_status_codes = retry_status_codes or RETRY_STATUS_CODES
     attempt = 1
     current_fetcher = fetcher
@@ -205,7 +197,7 @@ async def fetch_with_agent_rotation(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_status_codes: set[int] | None = None,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
-) -> Tuple[int, str, str]:
+) -> tuple[int, str, str]:
     agent = get_agent_for_job(job_id)
 
     def _rotate_agent() -> Agent | None:

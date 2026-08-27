@@ -28,6 +28,7 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.utils.minio_naming import parsed_name
 from app.pipeline.schemas import ParsedItem
 from app.pipeline.topics import topics
 from app.storage.postgres.client import pg_client
@@ -54,16 +55,8 @@ es_client = AsyncElasticsearch(hosts=[settings.ELASTICSEARCH_URL])
 ch_client = None
 
 
-def _normalize_item_suffix(item_id: str) -> str:
-    digits = re.sub(r"[^0-9]", "", str(item_id or ""))
-    return digits.zfill(8) if digits else "00000000"
-
-
-def _item_object_name(prefix: str, item_id: str, extension: str = ".json") -> str:
-    normalized_prefix = prefix.strip().lower()
-    if normalized_prefix == "parsed":
-        normalized_prefix = "parse"
-    return f"{normalized_prefix}_item{_normalize_item_suffix(item_id)}{extension}"
+# _item_object_name and _normalize_item_suffix removed —
+# use app.common.utils.minio_naming instead.
 
 
 def _minio_put_object_sync(bucket_name: str, object_name: str, payload_bytes: bytes, content_type: str):
@@ -202,7 +195,7 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
     parsed_payload["data"] = data
     payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
-    parsed_object_name = _item_object_name("parsed", item_id)
+    parsed_object_name = parsed_name(parsed_item.worker, job_id, item_id)
     await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, parsed_object_name, payload_bytes, "application/json")
     logger.info(f"Saved parsed JSON for {item_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
 

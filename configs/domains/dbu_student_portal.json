@@ -1,0 +1,67 @@
+{
+    "domain": "studentportal.dbu.edu.et",
+    "name": "Debre Berhan University Student Portal",
+    "description": "DBU student portal — login, academic summary, and registration extraction via DevExpress AJAX APIs.",
+    "handle_http_interstitial": false,
+    "login_url": "https://studentportal.dbu.edu.et/Account/Login",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "#Input_UserName, input[name='Input.UserName']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill student ID (Input.UserName)"
+        },
+        {
+            "action": "fill",
+            "selector": "#Input_Password, input[name='Input.Password'], input[type='password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password (Input.Password)"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], button.login-button, button:has-text('Log in'), input[type='submit']",
+            "wait_after_ms": 8000,
+            "description": "Click Log in button and wait for dashboard"
+        }
+    ],
+    "post_login_targets": [
+        "/Report/StudentLevel/AcademicSumamry"
+    ],
+    "post_login_steps": [
+        {
+            "action": "dx_select",
+            "selector": "#ddlCurriculum",
+            "optional": true,
+            "wait_after_ms": 5000,
+            "description": "Select curriculum from DevExpress SelectBox dropdown (optional — API extraction handles this internally)"
+        }
+    ],
+    "extraction_targets": [
+        {
+            "name": "curriculum_info",
+            "type": "api_data",
+            "container_selector": "/RegistrationSummary/GetCurriculumInfo",
+            "description": "Fetch curriculum list from DevExpress API"
+        },
+        {
+            "name": "student_basic_info",
+            "type": "api_data",
+            "container_selector": "/RegistrationSummary/GetCurriculumInfo",
+            "table_selector": "/RegistrationSummary/GetStudentBasicInfo?curriculumCode={CurriculumTblCode}",
+            "description": "Fetch student basic info for each curriculum"
+        },
+        {
+            "name": "academic_summary",
+            "type": "custom",
+            "js_extract": "(async () => { const unwrap = async (url) => { const r = await fetch(url); const j = await r.json(); return (j && j.data && Array.isArray(j.data)) ? j.data : j; }; const curricula = await unwrap('/RegistrationSummary/GetCurriculumInfo'); if (!curricula.length) return { error: 'no curricula found', curricula }; const curr = curricula[0]; const students = await unwrap('/RegistrationSummary/GetStudentBasicInfo?curriculumCode=' + curr.CurriculumTblCode); if (!students.length) return { error: 'no students found', curricula, students }; const stu = students[0]; const registrations = await unwrap('/RegistrationSummary/GetStudentRegistration?studentCurriculumCode=' + stu.StudentCurriculumTblCode); return { curriculum: curr, student: stu, registrations: registrations }; })()",
+            "description": "Chain-fetch: curriculum -> student info -> semester registrations with SGPA/CGPA"
+        },
+        {
+            "name": "page_content",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 10000) : '' }; })()"
+        }
+    ]
+}

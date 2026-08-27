@@ -25,6 +25,7 @@ ORDER BY (source_domain, crawl_timestamp);
 
 CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
     job_id String,
+    item_id String,
     worker LowCardinality(String),
     status_code UInt16,
     latency_ms UInt32,
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
     payload_size_bytes UInt32,
     created_at DateTime DEFAULT now()
 ) ENGINE = MergeTree()
-ORDER BY (worker, job_id);
+ORDER BY (worker, job_id, item_id);
 
 CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_analytics (
     job_id String,

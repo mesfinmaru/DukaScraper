@@ -69,6 +69,7 @@ def test_crawl_request_escalation_fields():
 def test_crawl_result_validation():
 	result = CrawlResult(
 		job_id="JOB00000001",
+		item_id="ITEM00000001",
 		url="https://example.com",
 		html="<html><body>Hello</body></html>",
 		status_code=200,
@@ -87,6 +88,7 @@ def test_crawl_result_missing_required_field():
 	with pytest.raises(ValidationError):
 		CrawlResult(
 			job_id="JOB00000001",
+			item_id="ITEM00000001",
 			url="https://example.com",
 			status_code=200,
 			worker="surface",

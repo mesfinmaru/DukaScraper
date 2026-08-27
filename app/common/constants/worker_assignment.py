@@ -16,8 +16,7 @@ Priority chain (highest to lowest):
 
 import re
 from enum import StrEnum
-from typing import Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from app.common.logger.logger import logger
 
@@ -169,6 +168,8 @@ SKIP_DOMAINS = {
 
 DEEP_PATH_PATTERNS = [
     r"/login", r"/signin", r"/sign-in", r"/log-in",
+    r"/signup", r"/sign-up", r"/register", r"/registration",
+    r"/organizer/register",
     r"/auth", r"/authenticate", r"/authorization",
     r"/account", r"/my-account", r"/dashboard", r"/admin",
     r"/wp-admin", r"/wp-login",
@@ -197,28 +198,48 @@ DEEP_QUERY_PARAMS = {
 ESCALATION_STATUS_CODES = {401, 403, 407, 429, 451}
 
 # HTML patterns indicating login/auth requirement or bot defense challenge
+#
+# IMPORTANT: These patterns are matched against the full raw HTML of a page.
+# They must be specific enough to avoid false positives on pages that merely
+# MENTION these words in visible text (e.g. a page listing scraping challenges
+# like "Login", "Cloudflare Turnstile", "Antibot Challenge").
+#
+# Rule of thumb: match HTML *elements* (forms, inputs, iframes, scripts),
+# not bare words in visible text.
 AUTH_PATTERNS = [
-    r'<form[^>]*(?:method\s*=\s*["\']?post["\']?)[^>]*>.*?(?:password|username|email)[^<]*</form>',
-    r'<input[^>]*type\s*=\s*["\']?password["\']?',
-    r'login|signin|sign-in|authenticate|authorization',
-    r'cloudflare|captcha|recaptcha|hcaptcha|challenge-platform',
-    r'perimeterx|px-captcha|_px3',
-    r'datadome',
-    r'akamai.*bot|bm-verify',
+    # Actual <form> with a password input — real auth barrier
+    r'<form[^>]*(?:method\s*=\s*["\']?post["\']?)[^>]*>.*?<input[^>]*type\s*=\s*["\']?password["\']?',
+    # Password input inside any form
+    r'<form[\s>].*?<input[^>]*type\s*=\s*["\']?password["\']?.*?</form>',
+    # Registration/signup links or forms (actual HTML elements, not plain text)
+    r'<(?:form|input|button|a)[^>]*(?:register|signup|sign-up|create-account)[^>]*>',
+    # Cloudflare challenge detection — require actual challenge HTML structure
+    r'checking\s+your\s+browser.*(?:cloudflare|captcha|challenge)',
+    r'(?:verify\s+you\s+are\s+human|attention\s+required).*?(?:cloudflare|captcha|challenge)',
+    # Challenge provider scripts/iframe markers (require HTML element context)
+    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*(?:cf-chl|challenge-platform|hcaptcha|recaptcha)',
+    r'<iframe[^>]*src\s*=\s*["\']?https?://[^"\'>]*(?:turnstile|challenge|hcaptcha|recaptcha)',
+    r'recaptcha/api\.js',
+    # PerimeterX / DataDome / Akamai bot manager script markers
+    r'<script[^>]*>.*?(?:perimeterx|px-captcha|_px3)',
+    r'datadome[^<]*(?:\.js|\.min\.js)',
+    r'akamai[^<]*bot|bm-verify',
     r'incapsula|imperva',
-    r'<script[^>]*src\s*=\s*["\']?.*?cloudflare',
+    # Cloudflare challenge scripts — match cf-chl/challenge-platform in script src,
+    # but NOT the Turnstile v0 API library (challenges.cloudflare.com/turnstile/v0/api.js)
+    # which is included on normal pages that merely USE Turnstile on sub-pages.
+    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*cloudflare[^"\'>]*cf-chl',
+    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*challenge-platform',
 ]
 AUTH_REGEX_PATTERNS = [re.compile(pat, re.IGNORECASE) for pat in AUTH_PATTERNS]
 
 # HTML patterns indicating empty/skeleton shell (JS-rendered SPA)
+# Only match truly empty shells — not pages with short but real content.
 EMPTY_HTML_PATTERNS = [
-    r'^<html>\s*<head>\s*</head>\s*<body>\s*</body>\s*</html>$',
-    r'loading\.\.\.|please wait|enabling javascript|you need to enable javascript',
-    r'<div\s+id=["\']?(root|app|__next)["\']?\s*>\s*</div>',  # React/Vue/Next.js empty shells
+    r'^<html>(\s*<head>\s*</head>)?\s*<body>\s*</body>\s*</html>$',  # Completely empty HTML document (with or without <head>)
+    r'<div\s+id=["\']?(root|app|__next)["\']?\s*>\s*</div>',  # React/Vue/Next.js empty root shells
 ]
 EMPTY_HTML_REGEX = [re.compile(pat, re.IGNORECASE) for pat in EMPTY_HTML_PATTERNS]
-
-MIN_TEXT_LENGTH_THRESHOLD = 200  # chars of visible text below which we suspect JS rendering
 
 
 # ============================================================================
@@ -328,7 +349,7 @@ class WorkerAssignmentEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def initial_assignment(url: str, user_override: Optional[str] = None) -> tuple[WorkerType, str]:
+    def initial_assignment(url: str, user_override: str | None = None) -> tuple[WorkerType, str]:
         """
         Assign worker type using a multi-signal priority chain (NOT whitelist-only).
 
@@ -338,10 +359,15 @@ class WorkerAssignmentEngine:
         3. Known WAF/CDN-protected domains -> DEEP
         4. Known auth/JS-heavy platform whitelist (global) -> DEEP
         5. Ethiopian gov/telecom domains (WAF/session heavy) -> DEEP
-        6. URL path heuristics (login/admin/checkout/sso/etc.) -> DEEP
-        7. Query parameter heuristics (oauth/sso/token/etc.) -> DEEP
-        8. Ethiopian curated SURFACE-safe domains (news/academic) -> SURFACE
-        9. Default fallback -> SURFACE
+        6. Ethiopian curated SURFACE-safe domains (news/academic) -> SURFACE
+        7. URL path heuristics (login/admin/checkout/sso/etc.) -> DEEP  [unknown domains only]
+        8. Query parameter heuristics (oauth/sso/token/etc.) -> DEEP  [unknown domains only]
+        9. Generic .et TLD fallback -> SURFACE
+        10. Default fallback -> SURFACE
+
+        Domain-based classification takes priority over path heuristics
+        to prevent known surface domains (e.g. fanabc.com/login) from
+        being incorrectly routed to the deep worker.
 
         Returns:
             (WorkerType, reason_string)
@@ -364,14 +390,16 @@ class WorkerAssignmentEngine:
         if WorkerAssignmentEngine.is_ethiopian_deep_domain(url):
             return WorkerType.DEEP, "ethiopian_gov_telecom_domain"
 
+        # Domain-based surface classification BEFORE path heuristics
+        if WorkerAssignmentEngine.is_ethiopian_surface_domain(url):
+            return WorkerType.SURFACE, "ethiopian_surface_domain"
+
+        # Path/query heuristics only apply to unknown domains
         if WorkerAssignmentEngine.matches_deep_path(url):
             return WorkerType.DEEP, "url_path_heuristic"
 
         if WorkerAssignmentEngine.matches_deep_query(url):
             return WorkerType.DEEP, "query_param_heuristic"
-
-        if WorkerAssignmentEngine.is_ethiopian_surface_domain(url):
-            return WorkerType.SURFACE, "ethiopian_surface_domain"
 
         # Generic .et fallback: treat as SURFACE by default (escalates automatically if wrong)
         if WorkerAssignmentEngine.is_ethiopian_tld(url):
@@ -386,7 +414,7 @@ class WorkerAssignmentEngine:
     @staticmethod
     def should_escalate_to_deep(
         status_code: int, html_content: str, current_worker: str = "surface"
-    ) -> tuple[bool, Optional[str]]:
+    ) -> tuple[bool, str | None]:
         """
         Determine if a fetch result should trigger escalation (SURFACE -> DEEP).
 
@@ -416,10 +444,6 @@ class WorkerAssignmentEngine:
             }
             return True, reason_map.get(status_code, f"http_{status_code}")
 
-        text_content = re.sub(r"<[^>]+>", "", html_content or "").strip()
-        if len(text_content) < MIN_TEXT_LENGTH_THRESHOLD:
-            return True, "empty_html_skeleton"
-
         if html_content:
             for pattern in AUTH_REGEX_PATTERNS:
                 if pattern.search(html_content):
@@ -432,7 +456,7 @@ class WorkerAssignmentEngine:
         return False, None
 
     @staticmethod
-    def log_assignment(url: str, worker_type: WorkerType, reason: Optional[str] = None):
+    def log_assignment(url: str, worker_type: WorkerType, reason: str | None = None):
         msg = f"Assigned URL to {worker_type.value} worker: {url}"
         if reason:
             msg += f" (reason: {reason})"
@@ -444,19 +468,19 @@ class WorkerAssignmentEngine:
 # ============================================================================
 
 
-def assign_worker(url: str, user_override: Optional[str] = None) -> str:
+def assign_worker(url: str, user_override: str | None = None) -> str:
     """Public convenience function: assign worker type for a URL. Returns string."""
     worker, reason = WorkerAssignmentEngine.initial_assignment(url, user_override)
     WorkerAssignmentEngine.log_assignment(url, worker, reason)
     return worker.value
 
 
-def assign_worker_with_reason(url: str, user_override: Optional[str] = None) -> tuple[str, str]:
+def assign_worker_with_reason(url: str, user_override: str | None = None) -> tuple[str, str]:
     """Public convenience function: assign worker type + reason for a URL."""
     worker, reason = WorkerAssignmentEngine.initial_assignment(url, user_override)
     return worker.value, reason
 
 
-def check_escalation(status_code: int, html: str, current_worker: str = "surface") -> tuple[bool, Optional[str]]:
+def check_escalation(status_code: int, html: str, current_worker: str = "surface") -> tuple[bool, str | None]:
     """Public convenience function: check if result warrants escalation."""
     return WorkerAssignmentEngine.should_escalate_to_deep(status_code, html, current_worker)

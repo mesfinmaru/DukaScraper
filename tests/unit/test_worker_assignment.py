@@ -78,6 +78,14 @@ class TestUrlPathHeuristics:
         assert worker == "deep"
         assert reason == "url_path_heuristic"
 
+    def test_register_path(self):
+        worker, reason = assign_worker_with_reason("https://signup.com/Organizer/Register/")
+        assert worker == "deep"
+        assert reason == "url_path_heuristic"
+
+    def test_signup_path(self):
+        assert assign_worker("https://example.com/sign-up") == "deep"
+
     def test_admin_path(self):
         assert assign_worker("https://randomsite.com/admin/dashboard") == "deep"
 
@@ -146,17 +154,35 @@ class TestEscalation:
     def test_empty_html_escalates(self):
         should, reason = check_escalation(200, "<html><body></body></html>", "surface")
         assert should is True
-        assert reason == "empty_html_skeleton"
+        assert reason == "js_rendered_spa_shell"
 
     def test_login_form_escalates(self):
         html = '<form method="post"><input type="password" name="pwd"></form>'
         should, reason = check_escalation(200, html, "surface")
         assert should is True
 
+    def test_registration_form_escalates(self):
+        html = "<html><body>" + ("Useful article content. " * 20) + '<form action="/Organizer/Register">Create Account</form></body></html>'
+        should, reason = check_escalation(200, html, "surface")
+        assert should is True
+        assert reason == "auth_form_or_bot_challenge_detected"
+
+    def test_normal_login_link_does_not_escalate(self):
+        html = "<html><body>" + ("Useful article content. " * 20) + '<a href="/login">Login</a></body></html>'
+        should, reason = check_escalation(200, html, "surface")
+        assert should is False
+        assert reason is None
+
     def test_cloudflare_challenge_escalates(self):
         html = "<html><body>Checking your browser - cloudflare challenge-platform</body></html>"
         should, reason = check_escalation(200, html, "surface")
         assert should is True
+
+    def test_captcha_word_in_normal_content_does_not_escalate(self):
+        html = "<html><body>" + ("Useful article content. " * 20) + "This guide explains captcha accessibility.</body></html>"
+        should, reason = check_escalation(200, html, "surface")
+        assert should is False
+        assert reason is None
 
     def test_perimeterx_escalates(self):
         html = "<script>window._px3 = {};</script>"

@@ -23,6 +23,10 @@ scrapy==2.11.1
 playwright==1.42.0
 stem==1.8.0
 
+# --- Auth & Encryption ---
+bcrypt==4.1.2
+cryptography==42.0.5
+
 # --- Utilities & Logging ---
 colorama==0.4.6
 

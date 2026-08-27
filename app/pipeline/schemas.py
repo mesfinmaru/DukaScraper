@@ -21,11 +21,11 @@ All workers (SURFACE, DEEP, DARK) now support depth-limited recursive crawling.
 New fields: depth, max_depth, parent_url, recursive_config.
 """
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.constants.content_topics import DEFAULT_CONTENT_TOPIC
 from app.common.constants.intelligence_categories import DEFAULT_INTELLIGENCE_CATEGORY
 
 # ============================================================================
@@ -55,7 +55,7 @@ class CrawlRequest(BaseModel):
     max_depth: int = Field(
         default=5, description="Circuit-breaker ceiling; standard recursion depth is 5"
     )
-    parent_url: Optional[str] = Field(
+    parent_url: str | None = Field(
         default=None, description="Lineage tracking: URL that led to this child task"
     )
     recursive_config: dict = Field(
@@ -67,8 +67,20 @@ class CrawlRequest(BaseModel):
     # WORKER ESCALATION (SURFACE → DEEP AUTO-REQUEUE)
     # ========================================================================
     retry_count: int = Field(default=0, description="Number of retries (incremented on escalation)")
-    escalation_reason: Optional[str] = Field(
+    escalation_reason: str | None = Field(
         default=None, description="Why escalated (e.g., 'http_403', 'cloudflare_challenge', 'empty_html')"
+    )
+
+    # ========================================================================
+    # AUTO-SIGNUP FREDENTIALS
+    # ========================================================================
+    auto_signup: bool = Field(
+        default=False,
+        description="Enable auto-signup: detect login vs signup, handle email verification",
+    )
+    credential_email: str | None = Field(
+        default=None,
+        description="Explicit credential email to use. If None and auto_signup=True, auto-assigns one.",
     )
 
 
@@ -80,13 +92,14 @@ class CrawlResult(BaseModel):
     """
 
     job_id: str = Field(..., description="job_id of the originating CrawlRequest")
+    item_id: str = Field(..., description="Per-page item identifier, e.g. 'ITEM00000001'")
     url: str
     html: str  # Raw HTML content
     status_code: int
     worker: str  # Which worker produced this ('surface', 'deep', 'dark')
     language: str
     network: str = Field(default="surface", description="Network used: surface, deep, dark")
-    fetch_duration: Optional[float] = None  # Crawl time in seconds
+    fetch_duration: float | None = None  # Crawl time in seconds
 
     # ========================================================================
     # RECURSIVE CRAWLING FIELDS
@@ -104,7 +117,7 @@ class CrawlResult(BaseModel):
     # WORKER ESCALATION METADATA
     # ========================================================================
     was_escalated: bool = Field(default=False, description="Was this escalated from another worker?")
-    escalation_reason: Optional[str] = Field(default=None, description="Reason for escalation")
+    escalation_reason: str | None = Field(default=None, description="Reason for escalation")
 
 
 class ParsedItemData(BaseModel):
@@ -116,24 +129,40 @@ class ParsedItemData(BaseModel):
     extracted_text: str = Field(..., description="Clean extracted text")
     character_count: int = Field(..., description="Number of characters")
     original_status_code: int = Field(..., description="HTTP status code")
-    title: Optional[str] = Field(default=None, description="Extracted article title")
-    publish_date: Optional[str] = Field(
+    title: str | None = Field(default=None, description="Extracted article title")
+    publish_date: str | None = Field(
         default=None, description="Extracted publish date in ISO format"
     )
-    detected_language: Optional[str] = Field(
+    detected_language: str | None = Field(
         default=None, description="Detected language from parsed content"
     )
-    fetch_duration: Optional[float] = Field(
+    fetch_duration: float | None = Field(
         default=None, description="Time taken to fetch the data in seconds"
     )
-    payload_size_bytes: Optional[int] = Field(
+    payload_size_bytes: int | None = Field(
         default=None, description="Size of the raw HTML payload in bytes"
     )
-    proxy_ip: Optional[str] = Field(
+    proxy_ip: str | None = Field(
         default=None, description="The active proxy endpoint used during the request"
     )
-    retry_count: Optional[int] = Field(
+    retry_count: int | None = Field(
         default=None, description="Number of retries triggered before successful ingestion"
+    )
+    portal_structured_data: dict | None = Field(
+        default=None,
+        description="Structured data extracted from portal pages (grades, student info, etc.)",
+    )
+    requested_language: str | None = Field(
+        default=None,
+        description="Language the job was requested in (e.g. 'am', 'en')",
+    )
+    language_mismatch: bool = Field(
+        default=False,
+        description="True when detected_language differs from requested_language",
+    )
+    language_rejection_reason: str | None = Field(
+        default=None,
+        description="Why the content was flagged: 'language_mismatch' or 'unsupported_language'",
     )
 
 
@@ -153,7 +182,7 @@ class ParsedItem(BaseModel):
     language: str  # resolved ISO language code or 'unknown'
     data: ParsedItemData | dict = Field(..., description="Extracted text + metadata")
     status: str = "completed"  # completed or failed
-    parse_duration: Optional[float] = None  # Parse time in seconds
+    parse_duration: float | None = None  # Parse time in seconds
 
 
 class IntelligenceAnalytics(BaseModel):
@@ -176,6 +205,10 @@ class IntelligenceAnalytics(BaseModel):
     source_type: str = Field(
         ..., description="Inferred by LLM: 'news', 'forum', 'blog', 'social', 'gov', 'academic', 'ecommerce', 'other', etc."
     )
+    topic: str = Field(
+        default=DEFAULT_CONTENT_TOPIC,
+        description="Subject matter, independent of threat category: economics, politics, health, technology, security, environment, society, other",
+    )
     category: str = Field(
         default=DEFAULT_INTELLIGENCE_CATEGORY,
         description="LLM classification: 'data_leak', 'gov_issue', 'cyber_threat', 'physical_threat', 'misinformation', 'other'",
@@ -189,8 +222,8 @@ class IntelligenceAnalytics(BaseModel):
     summary: str = Field(..., description="LLM-generated summary of findings")
     language: str = Field(default="unknown", description="Resolved content language")
     llm_model: str = Field(default="qwen2:8b", description="Which LLM model performed analysis")
-    llm_score: float = Field(default=0.0, description="Model confidence (0-1)")
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Analysis timestamp")
+    llm_score: float | None = Field(default=None, description="Deprecated: no per-response confidence is inferred")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Analysis timestamp")
 
 
 # ============================================================================
@@ -205,13 +238,13 @@ class JobRecord(BaseModel):
     parsed-item level because each job can be processed by multiple workers.
     """
 
-    job_id: Optional[str] = None  # Auto-generated: JOB00000001
+    job_id: str | None = None  # Auto-generated: JOB00000001
     user_id: str  # References users.user_id, e.g. USR12345
     url: str
     language: str = "unknown"  # requested language or resolved content language
     status: str = "pending"  # pending, running, completed, failed
-    created_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 class UserRecord(BaseModel):
@@ -219,12 +252,12 @@ class UserRecord(BaseModel):
     Schema for PostgreSQL duka_system.users table
     """
 
-    user_id: Optional[str] = None  # Auto-generated: USR12345
+    user_id: str | None = None  # Auto-generated: USR12345
     full_name: str
     username: str
     email: str
     password_hash: str
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
 
 
 class ParsedItemRecord(BaseModel):
@@ -235,7 +268,7 @@ class ParsedItemRecord(BaseModel):
     even though a job can flow through multiple worker stages across items.
     """
 
-    item_id: Optional[str] = None  # Auto-generated: ITEM00000001
+    item_id: str | None = None  # Auto-generated: ITEM00000001
     job_id: str
     source_url: str
     language: str = "unknown"
@@ -243,13 +276,13 @@ class ParsedItemRecord(BaseModel):
         default="surface",
         description="Worker that processed this parsed item: 'surface', 'deep', or 'dark'",
     )
-    title: Optional[str] = None
-    publish_date: Optional[str] = None
-    character_count: Optional[int] = None
-    word_count: Optional[int] = None
+    title: str | None = None
+    publish_date: str | None = None
+    character_count: int | None = None
+    word_count: int | None = None
     raw_html_path: str
     parsed_json_path: str
-    parsed_at: Optional[datetime] = None
+    parsed_at: datetime | None = None
     is_exported: bool = False
     intelligence_processed: bool = Field(
         default=False, description="Has LLM worker processed this for intelligence?"
@@ -261,14 +294,14 @@ class ExportRecord(BaseModel):
     Schema for PostgreSQL duka_db.exports table
     """
 
-    export_id: Optional[str] = None  # Auto-generated: EXP00000001
+    export_id: str | None = None  # Auto-generated: EXP00000001
     job_id: str
     export_type: str  # "csv", "json", "parquet"
     file_path: str
     status: str = "pending"  # pending, completed, failed
-    file_size_mb: Optional[float] = None
-    item_count: Optional[int] = None
-    created_at: Optional[datetime] = None
+    file_size_mb: float | None = None
+    item_count: int | None = None
+    created_at: datetime | None = None
 
 
 class ElasticsearchArticle(BaseModel):
@@ -280,7 +313,7 @@ class ElasticsearchArticle(BaseModel):
     job_id: str
     item_id: str
     url: str
-    title: Optional[str] = None
+    title: str | None = None
     language: str
     extracted_text: str  # Full-text indexed
     character_count: int
@@ -341,7 +374,7 @@ class JobResponse(BaseModel):
     language: str
     status: str
     created_at: str
-    assigned_worker: Optional[str] = None
+    assigned_worker: str | None = None
 
 
 class SearchResponse(BaseModel):

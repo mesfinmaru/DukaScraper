@@ -23,12 +23,17 @@ if APP_ENV == "wsl":
 from app.common.config.settings import settings
 from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
-from workers.common import check_escalation
+from workers.common import check_escalation, extract_and_queue_children
 from app.pipeline.schemas import CrawlRequest, CrawlResult
-from workers.common import extract_and_queue_children
 from app.services.link_extraction_service import LinkExtractionService
 from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import detect_language_from_text
+from app.services.page_validation_service import PageValidationService
+from app.services.dead_letter_service import publish_crawl_dead_letter
+from app.services.politeness_service import PolitenessService
+from app.services.content_fingerprint_service import (
+    generate_fingerprint, url_fingerprint, content_hash, simhash,
+)
 from app.agents import fetch_with_agent_rotation
 
 # --- Logging Setup ---
@@ -55,15 +60,9 @@ minio_client = Minio(
     secure=settings.MINIO_SECURE,
 )
 
-MAX_CONCURRENT_TASKS = 50
+MAX_CONCURRENT_TASKS = settings.SURFACE_MAX_CONCURRENT_TASKS
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,am;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+DEFAULT_HEADERS = settings.SURFACE_DEFAULT_HEADERS
 
 # --- Rule-Based Proxy Manager ---
 class RuleBasedProxyManager:
@@ -110,7 +109,7 @@ def _upload_to_minio_sync(job_id: str, payload_bytes: bytes):
         if not minio_client.bucket_exists(BUCKET_NAME):
             minio_client.make_bucket(BUCKET_NAME)
 
-        filename = f"crawl_{job_id}.json"
+        filename = f"{WORKER_TYPE}_raw_{job_id}.json"
         minio_client.put_object(
             bucket_name=BUCKET_NAME,
             object_name=filename,
@@ -155,21 +154,6 @@ async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, re
     )
 
 
-async def extract_and_queue_children_local(
-    producer: AIOKafkaProducer,
-    request: CrawlRequest,
-    html: str,
-) -> tuple[list[str], int, int]:
-    """Thin wrapper around the shared recursive_crawl_service for this worker's topics."""
-    return await extract_and_queue_children(
-        producer=producer,
-        request=request,
-        html=html,
-        consume_topic=CONSUME_TOPIC,
-        redis_url=settings.REDIS_URL,
-    )
-
-
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
     """Processes a single incoming crawl request from Kafka using dynamic proxies."""
     try:
@@ -184,6 +168,37 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             f"for URL: {request.url}"
         )
         await pg_client.update_job_status(request.job_id, "running")
+        item_id = await pg_client.allocate_item_id()
+        politeness = PolitenessService(settings.REDIS_URL, DEFAULT_HEADERS["User-Agent"])
+        try:
+            if not await politeness.allowed(request.url):
+                await pg_client.record_crawl_log(request.job_id, item_id, request.url, WORKER_TYPE, "robots_disallowed", "skipped", request.retry_count)
+                await pg_client.update_job_status(request.job_id, "skipped")
+                return
+            await politeness.wait_for_turn(request.url)
+        finally:
+            await politeness.close()
+
+        # --- Content Deduplication (3-tier) ---
+        # Check if we've already crawled this exact URL or similar content.
+        if settings.DEDUP_ENABLED and request.depth > 0:
+            try:
+                u_fp = url_fingerprint(request.url)
+                existing = await pg_client.check_url_duplicate(
+                    u_fp, stale_hours=settings.DEDUP_STALE_HOURS,
+                )
+                if existing:
+                    logger.info(
+                        "Dedup hit (URL exact) for %s -> reusing item %s",
+                        request.url, existing.get("item_id", "?"),
+                    )
+                    await pg_client.record_crawl_log(
+                        request.job_id, item_id, request.url, WORKER_TYPE,
+                        "dedup_url_exact", "skipped", request.retry_count,
+                    )
+                    return
+            except Exception as dedup_err:
+                logger.debug("Dedup check failed (non-fatal): %s", dedup_err)
 
         # Select rule-based proxy for this specific request
         proxy_url = proxy_manager.get_proxy(request.language, request.url)
@@ -207,26 +222,32 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
         latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-        preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
-        if preferred_feed and preferred_feed != request.url:
-            logger.info(
-                f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
-            )
-            try:
-                async with httpx.AsyncClient(
-                    headers=DEFAULT_HEADERS,
-                    follow_redirects=True,
-                    timeout=settings.http_timeout_seconds,
-                ) as feed_client:
-                    feed_response = await feed_client.get(preferred_feed)
-                    feed_response.raise_for_status()
-                    html = feed_response.text
-                    status_code = feed_response.status_code
-                    final_url = str(feed_response.url)
-            except httpx.HTTPError as feed_exc:
-                logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}")
-
-        # --- Auto-escalation check (SURFACE -> DEEP) ---
+        # DISABLED: RSS feed extraction
+        # preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
+        preferred_feed = None
+        # if preferred_feed and preferred_feed != request.url:
+        #     logger.info(
+        #         f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
+        #     )
+        #     try:
+        #         async with httpx.AsyncClient(
+        #             headers=DEFAULT_HEADERS,
+        #             follow_redirects=True,
+        #             timeout=settings.http_timeout_seconds,
+        #         ) as feed_client:
+        #             feed_response = await feed_client.get(preferred_feed)
+        #             feed_response.raise_for_status()
+        #             html = feed_response.text
+        #             status_code = feed_response.status_code
+        #             final_url = str(feed_response.url)
+        #     except httpx.HTTPError as feed_exc:
+        #         logger.warning(f"Failed to fetch preferred RSS feed {preferred_feed}: {feed_exc}")
+        # --- Escalation check (SURFACE -> DEEP) ---
+        # Only escalate on hard signals: HTTP auth/WAF blocks or bot challenge patterns.
+        # URL path heuristics (e.g. /login, /account) are already handled at
+        # initial assignment time in recursive_crawl_service — no need to
+        # re-check after fetching, which would waste the fetch and forward
+        # to the deep worker with empty/unnecessary content.
         should_escalate, reason = check_escalation(status_code, html, WORKER_TYPE)
         if should_escalate:
             await escalate_to_deep(producer, request, reason)
@@ -235,6 +256,7 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         try:
             ch_client.write_crawler_performance(
                 job_id=request.job_id,
+                item_id=item_id,
                 worker=WORKER_TYPE,
                 status_code=status_code,
                 latency_ms=latency_ms,
@@ -245,23 +267,50 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         except Exception as perf_err:
             logger.warning(f"Unable to write crawler performance metric for {request.job_id}: {perf_err}")
 
-        # --- Recursive link extraction (shared logic, all workers) ---
-        extracted_links, queued_count, skipped_count = await extract_and_queue_children_local(producer, request, html)
+        validation = PageValidationService.validate(final_url, html, status_code, request.language)
 
-        requested_text = clean_and_extract_text(html, request.language, preserve_amharic=False)
-        fallback_text = requested_text or clean_and_extract_text(html, "other", preserve_amharic=False)
-        resolved_language = detect_language_from_text(fallback_text, "unknown")
-        if resolved_language not in {"am", "en"}:
-            await pg_client.update_job_status(request.job_id, "completed")
-            logger.info(
-                f"Skipped {request.url}: resolved language '{resolved_language}' is outside the am/en allowlist"
-            )
+        # --- ALWAYS publish a CrawlResult for successful fetches ---
+        # Validation only affects whether to queue children and the status
+        # label.  Discarding fetched content upstream means the job gets
+        # stuck with no output (the bug that caused surface→deep empty
+        # forwarding).  Let the parser/downstream handle quality.
+        if validation.status == "failed":
+            await pg_client.record_crawl_log(request.job_id, item_id, final_url, WORKER_TYPE, validation.reason, validation.status, request.retry_count)
+            await pg_client.update_job_status(request.job_id, "failed")
+            await publish_crawl_dead_letter(producer, request, validation.reason, WORKER_TYPE)
+            logger.info("Hard failure %s: %s", request.url, validation.reason)
             return
+
+        # Queue children for all non-failed pages (homepages, valid, needs_review)
+        extracted_links, queued_count, skipped_count = [], 0, 0
+        if html and validation.reason != "homepage":
+            extracted_links, queued_count, skipped_count = await extract_and_queue_children(
+                producer=producer,
+                request=request,
+                html=html,
+                consume_topic=CONSUME_TOPIC,
+                redis_url=settings.REDIS_URL,
+            )
+        elif validation.reason == "homepage":
+            # Homepage: queue children but also publish the homepage content
+            extracted_links, queued_count, skipped_count = await extract_and_queue_children(
+                producer=producer,
+                request=request,
+                html=html,
+                consume_topic=CONSUME_TOPIC,
+                redis_url=settings.REDIS_URL,
+            )
+            logger.info(
+                "Homepage %s: publishing content + queued %d children",
+                request.url, queued_count,
+            )
+
         result = CrawlResult(
             job_id=request.job_id,
+            item_id=item_id,
             url=final_url,
             worker=WORKER_TYPE,
-            language=resolved_language,
+            language=validation.language,
             html=html,
             status_code=status_code,
             network="surface",
@@ -273,18 +322,73 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             escalation_reason=request.escalation_reason,
         )
 
+        # --- Store content fingerprint for deduplication ---
+        if settings.DEDUP_ENABLED:
+            try:
+                # Extract visible text for fingerprinting
+                fp_text = clean_and_extract_text(html, request.url) if html else ""
+                fp = generate_fingerprint(request.url, fp_text)
+
+                # Check for content/near-duplicate
+                dup_type = None
+                dup_of = None
+
+                # Tier 2: exact content hash
+                content_match = await pg_client.check_content_duplicate(
+                    fp.content_fp, stale_hours=settings.DEDUP_STALE_HOURS,
+                )
+                if content_match and content_match.get("item_id") != item_id:
+                    dup_type = "content_exact"
+                    dup_of = content_match["item_id"]
+                    logger.info(
+                        "Dedup hit (content exact) for %s -> duplicate of %s",
+                        request.url, dup_of,
+                    )
+
+                # Tier 3: near-duplicate (only if no exact match found)
+                if not dup_type:
+                    near_match = await pg_client.check_near_duplicate(
+                        fp.simhash_val,
+                        threshold=settings.DEDUP_SIMHASH_THRESHOLD,
+                        stale_hours=settings.DEDUP_STALE_HOURS,
+                    )
+                    if near_match and near_match.get("item_id") != item_id:
+                        dup_type = "near_duplicate"
+                        dup_of = near_match["item_id"]
+                        logger.info(
+                            "Dedup hit (near-duplicate, distance=%s) for %s -> duplicate of %s",
+                            near_match.get("hamming_distance", "?"),
+                            request.url, dup_of,
+                        )
+
+                await pg_client.store_fingerprint(
+                    job_id=request.job_id,
+                    item_id=item_id,
+                    url=request.url,
+                    url_fingerprint=fp.url_fp,
+                    content_fingerprint=fp.content_fp,
+                    simhash_val=fp.simhash_val,
+                    word_count=fp.word_count,
+                    char_count=fp.char_count,
+                    text_preview=fp.text_preview,
+                    duplicate_of=dup_of,
+                    duplicate_type=dup_type,
+                )
+            except Exception as fp_err:
+                logger.debug("Fingerprint storage failed (non-fatal): %s", fp_err)
+
         payload_bytes = result.model_dump_json().encode("utf-8")
 
-        # Parser-worker assigns the item ID and stores the authoritative raw object.
         await producer.send_and_wait(
             PRODUCE_TOPIC,
             value=payload_bytes,
             key=request.job_id.encode("utf-8"),
         )
+        await pg_client.record_crawl_log(request.job_id, item_id, final_url, WORKER_TYPE, validation.reason, validation.status, request.retry_count)
         await pg_client.update_job_status(request.job_id, "completed")
         logger.info(
-            f"Published raw result for {request.url} "
-            f"(extracted={len(extracted_links)}, queued={queued_count}, dedup_skipped={skipped_count})"
+            "Published result for %s (lang=%s, status=%s, children=%d)",
+            request.url, validation.language, validation.status, queued_count,
         )
 
     except ValidationError as e:

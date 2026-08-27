@@ -11,7 +11,13 @@ from typing import Any
 
 from app.language.cleaning.cleaner import clean_and_extract_text as clean_amharic_text
 from app.language.language_detection.detector import detect_language_from_text as detect_amharic_language
+from app.language.language_detection.detector import ETHIOPIC_LANGUAGES
 from app.language.quality.scorer import score_text_quality
+
+# All languages the pipeline can detect and store
+SUPPORTED_LANGUAGES = ETHIOPIC_LANGUAGES | {
+    "en", "fr", "es", "de", "it", "pt", "sw", "tr", "hi", "ar", "ru",
+}
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -27,17 +33,20 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.utils.minio_naming import parsed_name, raw_name
 from app.pipeline.schemas import CrawlResult, ParsedItem
 from app.storage.postgres.client import pg_client
 from app.services.link_extraction_service import LinkExtractionService
+from app.services.dedup_service import ContentDedupService
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-class UnsupportedLanguageError(Exception):
-    """Raised when content is outside the currently supported am/en scope."""
+
+class DuplicateContentError(Exception):
+    """Raised when equivalent normalized content was already accepted recently."""
 
 # --- Configuration ---
 KAFKA_BROKERS = settings.KAFKA_BOOTSTRAP_SERVERS
@@ -54,16 +63,41 @@ minio_client = Minio(
 )
 
 
-def _normalize_item_suffix(item_id: str) -> str:
-    digits = re.sub(r"[^0-9]", "", str(item_id or ""))
-    return digits.zfill(8) if digits else "00000000"
+# _item_object_name and _normalize_item_suffix removed —
+# use app.common.utils.minio_naming instead.
 
 
-def _item_object_name(prefix: str, item_id: str, extension: str = ".json") -> str:
-    normalized_prefix = prefix.strip().lower()
-    if normalized_prefix == "parsed":
-        normalized_prefix = "parse"
-    return f"{normalized_prefix}_item{_normalize_item_suffix(item_id)}{extension}"
+def extract_sections(raw_html: str, language: str) -> list[dict[str, Any]]:
+    """Return clean, heading-based content chunks without navigation/template noise."""
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+    except FeatureNotFound:
+        soup = BeautifulSoup(raw_html, "html.parser")
+    for tag in soup.select("script, style, nav, footer, header, aside, form, .mw-editsection, .navbox, .metadata, .ambox"):
+        tag.decompose()
+
+    sections: list[dict[str, Any]] = []
+    heading = "Introduction"
+    level = 1
+    buffer: list[str] = []
+
+    def flush() -> None:
+        text = clean_and_extract_text("\n".join(buffer), language)
+        if len(text.strip()) >= 80:
+            sections.append({"heading": heading, "level": level, "text": text})
+
+    for element in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
+        if element.name.startswith("h"):
+            flush()
+            heading = element.get_text(" ", strip=True)
+            level = int(element.name[1])
+            buffer = []
+        else:
+            value = element.get_text(" ", strip=True)
+            if value:
+                buffer.append(value)
+    flush()
+    return sections
 
 
 def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
@@ -74,6 +108,16 @@ def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
 def detect_language_from_text(text: str, fallback: str = "en") -> str:
     """Compatibility wrapper around the shared language detector."""
     return detect_amharic_language(text, fallback)
+
+
+def document_language(raw_html: str) -> str:
+    """Read a supported document language when navigation skews text detection."""
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+        language = (soup.html.get("lang", "") if soup.html else "").lower().split("-", 1)[0]
+        return language if language in SUPPORTED_LANGUAGES else "unknown"
+    except Exception:
+        return "unknown"
 
 
 def extract_title(raw_html_or_text: str) -> str | None:
@@ -164,30 +208,46 @@ def extract_publish_date(raw_html_or_text: str, visible_text: str = "") -> str |
     return None
 
 
-def _upload_to_minio_sync(object_name: str, payload_bytes: bytes):
+def _upload_to_minio_sync(
+    bucket_name: str,
+    object_name: str,
+    payload_bytes: bytes,
+    content_type: str,
+):
     """Synchronously uploads a payload to MinIO in a thread worker."""
     try:
         minio_client.put_object(
-            bucket_name=MINIO_PARSED_BUCKET,
+            bucket_name=bucket_name,
             object_name=object_name,
             data=io.BytesIO(payload_bytes),
             length=len(payload_bytes),
-            content_type="application/json",
+            content_type=content_type,
         )
-        logger.info(f"Saved {object_name} to MinIO bucket '{MINIO_PARSED_BUCKET}'")
+        logger.info(f"Saved {object_name} to MinIO bucket '{bucket_name}'")
     except Exception as e:
         logger.error(f"Failed to upload {object_name} to MinIO: {e}")
 
 
-async def save_to_minio(object_name: str, payload_bytes: bytes):
+async def save_to_minio(
+    bucket_name: str,
+    object_name: str,
+    payload_bytes: bytes,
+    content_type: str = "application/json",
+):
     """Async wrapper to prevent blocking the event loop during MinIO uploads."""
-    await asyncio.to_thread(_upload_to_minio_sync, object_name, payload_bytes)
+    await asyncio.to_thread(
+        _upload_to_minio_sync,
+        bucket_name,
+        object_name,
+        payload_bytes,
+        content_type,
+    )
 
 
-async def ensure_minio_bucket() -> None:
-    if not await asyncio.to_thread(minio_client.bucket_exists, MINIO_PARSED_BUCKET):
-        await asyncio.to_thread(minio_client.make_bucket, MINIO_PARSED_BUCKET)
-        logger.info(f"Created MinIO bucket: {MINIO_PARSED_BUCKET}")
+async def ensure_minio_bucket(bucket_name: str) -> None:
+    if not await asyncio.to_thread(minio_client.bucket_exists, bucket_name):
+        await asyncio.to_thread(minio_client.make_bucket, bucket_name)
+        logger.info(f"Created MinIO bucket: {bucket_name}")
 
 
 async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]:
@@ -211,16 +271,37 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
             preserve_amharic=False,
         )
     detected_language = detect_language_from_text(detection_text, "unknown")
+    if detected_language not in SUPPORTED_LANGUAGES:
+        detected_language = document_language(source_html)
     if not detection_text:
         detected_language = "unknown"
     if not extracted_text and detection_text:
         extracted_text = detection_text
-    if detected_language not in {"am", "en"}:
-        raise UnsupportedLanguageError(
-            f"Resolved language '{detected_language}' is outside the am/en allowlist"
-        )
+
+    # --- Language mismatch detection ---
+    language_mismatch = False
+    language_rejection_reason: str | None = None
+    if detected_language not in SUPPORTED_LANGUAGES:
+        language_mismatch = True
+        language_rejection_reason = "unsupported_language"
+        detected_language = "unknown"  # Keep data but mark as unknown
+    elif requested_language in SUPPORTED_LANGUAGES and detected_language != requested_language:
+        language_mismatch = True
+        language_rejection_reason = "language_mismatch"
+
+    content_dedup = ContentDedupService(settings.REDIS_URL, job_id=crawl_result.job_id)
+    try:
+        is_new, fingerprint = await content_dedup.reserve(extracted_text, detected_language)
+    finally:
+        await content_dedup.close()
+    if not is_new:
+        raise DuplicateContentError(f"content_hash={fingerprint}")
     title = await asyncio.to_thread(extract_title, source_html)
     publish_date = await asyncio.to_thread(extract_publish_date, source_html, extracted_text)
+    sections = await asyncio.to_thread(extract_sections, source_html, detected_language)
+    quality_score = score_text_quality(extracted_text)
+    banner_leakage = any(marker in extracted_text.lower() for marker in ("{{", "[edit", "ለማስተካከል"))
+    structure_valid = bool(sections) and not banner_leakage
     parse_duration = asyncio.get_running_loop().time() - start_time
 
     payload_data: dict[str, Any] = {
@@ -234,11 +315,22 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
         "payload_size_bytes": len(source_html.encode("utf-8")),
         "proxy_ip": None,
         "retry_count": None,
+        "sections": sections,
+        "content_quality_score": quality_score,
+        "structure_valid": structure_valid,
+        "banner_leakage": banner_leakage,
+        "requested_language": requested_language,
+        "language_mismatch": language_mismatch,
+        "language_rejection_reason": language_rejection_reason,
     }
 
     status = "failed" if crawl_result.status_code >= 400 and not extracted_text else "completed"
+    if status == "completed" and language_mismatch:
+        status = "needs_review"
+    if status == "completed" and (quality_score < 0.35 or not structure_valid):
+        status = "needs_review"
 
-    # --- Persist parsed_items metadata FIRST to obtain the auto-generated item_id ---
+    # --- Persist parsed_items metadata FIRST, preserving the item_id from crawl.raw ---
     canonical_url = LinkExtractionService.normalize_url(crawl_result.url)
     item_record = await pg_client.create_parsed_item(
         job_id=crawl_result.job_id,
@@ -247,6 +339,7 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
         parsed_json_path="",
         language=detected_language,
         worker_type=crawl_result.worker,
+        item_id=crawl_result.item_id,
         title=title,
         publish_date=publish_date,
         character_count=len(extracted_text),
@@ -254,13 +347,18 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     )
     item_id = item_record["item_id"]
 
-    raw_object_name = _item_object_name("raw", item_id)
-    parsed_object_name = _item_object_name("parsed", item_id)
+    raw_object_name = raw_name(crawl_result.worker, crawl_result.job_id, item_id)
+    parsed_object_name = parsed_name(crawl_result.worker, crawl_result.job_id, item_id)
     raw_html_path = f"s3://{MINIO_RAW_BUCKET}/{raw_object_name}"
     parsed_json_path = f"s3://{MINIO_PARSED_BUCKET}/{parsed_object_name}"
 
     raw_payload_bytes = (source_html or "").encode("utf-8")
-    await save_to_minio(raw_object_name, raw_payload_bytes)
+    await save_to_minio(
+        MINIO_RAW_BUCKET,
+        raw_object_name,
+        raw_payload_bytes,
+        content_type="text/html; charset=utf-8",
+    )
 
     await pg_client.db_pool.execute(
         "UPDATE parsed_items SET raw_html_path = $1, parsed_json_path = $2 WHERE item_id = $3",
@@ -285,7 +383,8 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
 async def consume_and_parse():
     logger.info(f"Connecting to Kafka brokers at: {KAFKA_BROKERS}, listening on topic: {KAFKA_INPUT_TOPIC}")
 
-    await ensure_minio_bucket()
+    await ensure_minio_bucket(MINIO_RAW_BUCKET)
+    await ensure_minio_bucket(MINIO_PARSED_BUCKET)
     await pg_client.connect()
 
     consumer = AIOKafkaConsumer(
@@ -326,13 +425,17 @@ async def consume_and_parse():
                 item_id, parsed_payload = await parse_message(crawl_result)
                 output_payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
-                # 1. Produce to Kafka for the downstream exporter/llm-worker
+                # 1. Always retain parsed evidence, including review items.
+                parsed_object_name = parsed_name(crawl_result.worker, crawl_result.job_id, item_id)
+                await save_to_minio(MINIO_PARSED_BUCKET, parsed_object_name, output_payload_bytes)
+                if parsed_payload["status"] != "completed":
+                    await pg_client.update_job_status(crawl_result.job_id, parsed_payload["status"])
+                    logger.info("Held item %s for review (status=%s)", item_id, parsed_payload["status"])
+                    continue
+
+                # 2. Only validated content reaches exporter, LLM, embeddings, and RAG.
                 await producer.send_and_wait(KAFKA_OUTPUT_TOPIC, output_payload_bytes, key=crawl_result.job_id.encode("utf-8"))
                 logger.info(f"Produced parsed item {item_id} to Kafka topic '{KAFKA_OUTPUT_TOPIC}'")
-
-                # 2. Save structured output to MinIO parsed bucket using the item-based prefix
-                parsed_object_name = _item_object_name("parsed", item_id)
-                await save_to_minio(parsed_object_name, output_payload_bytes)
                 await pg_client.update_job_status(crawl_result.job_id, "completed")
 
             except json.JSONDecodeError:
@@ -341,9 +444,9 @@ async def consume_and_parse():
             except ValidationError as e:
                 logger.warning(f"Skipping invalid crawl result payload: {e}")
                 await pg_client.update_job_status(crawl_result.job_id, "failed")
-            except UnsupportedLanguageError as e:
-                logger.info(f"Skipping unsupported-language content for {crawl_result.url}: {e}")
-                await pg_client.update_job_status(crawl_result.job_id, "completed")
+            except DuplicateContentError as e:
+                logger.info(f"Skipping duplicate content for {crawl_result.url}: {e}")
+                await pg_client.update_job_status(crawl_result.job_id, "skipped")
             except Exception as loop_err:
                 logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
                 await pg_client.update_job_status(crawl_result.job_id, "failed")

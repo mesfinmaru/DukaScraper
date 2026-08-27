@@ -70,3 +70,5 @@ Thumbs.db
 *.pem
 *.key
 credentials.json
+playwright-state*.json
+authorized_playwright_state*.json

@@ -16,6 +16,7 @@ def test_write_crawler_performance_calls_insert(monkeypatch):
 
     manager.write_crawler_performance(
         job_id="JOB1",
+        item_id="ITEM1",
         worker="surface",
         status_code=200,
         latency_ms=123,
@@ -26,8 +27,10 @@ def test_write_crawler_performance_calls_insert(monkeypatch):
 
     assert called["table"] == "crawler_performance"
     assert called["rows"][0][0] == "JOB1"
+    assert called["rows"][0][1] == "ITEM1"
     assert called["column_names"] == [
         "job_id",
+        "item_id",
         "worker",
         "status_code",
         "latency_ms",

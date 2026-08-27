@@ -1,16 +1,15 @@
 networks:
   duka-net:
     driver: bridge
-
 volumes:
-  postgres_data:
-  es_data:
-  clickhouse_data:
-  minio_data:
-  kafka_data:
-  pgadmin_data:
-  # ollama_data removed: using hosted Google AI
-
+  postgres_data: null
+  es_data: null
+  clickhouse_data: null
+  minio_data: null
+  kafka_data: null
+  pgadmin_data: null
+  qdrant_data: null
+  ollama_data: null
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,19 +19,20 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: duka
     ports:
-      - "5432:5432"
+    - 5432:5432
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./database/postgres:/docker-entrypoint-initdb.d
+    - postgres_data:/var/lib/postgresql/data
+    - ./database/postgres:/docker-entrypoint-initdb.d
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d duka"]
+      test:
+      - CMD-SHELL
+      - pg_isready -U postgres -d duka
       interval: 5s
       timeout: 5s
       retries: 5
-
   pgadmin:
     image: dpage/pgadmin4:9
     container_name: pgadmin
@@ -40,148 +40,166 @@ services:
       PGADMIN_DEFAULT_EMAIL: admin@example.com
       PGADMIN_DEFAULT_PASSWORD: admin
     ports:
-      - "5050:80"
+    - 5050:80
     volumes:
-      - pgadmin_data:/var/lib/pgadmin
-      - ./pgadmin_servers.json:/pgadmin4/servers.json
+    - pgadmin_data:/var/lib/pgadmin
+    - ./pgadmin_servers.json:/pgadmin4/servers.json
     networks:
-      - duka-net
+    - duka-net
     restart: always
     depends_on:
-      - postgres
-
+    - postgres
   kafka:
     image: apache/kafka:3.9.1
     container_name: kafka
     ports:
-      - "9092:9092"
-      - "29092:29092"
+    - 9092:9092
+    - 29092:29092
     environment:
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: 'broker,controller'
-      KAFKA_LISTENERS: 'PLAINTEXT://kafka:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://kafka:9093'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT'
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
     volumes:
-      - kafka_data:/var/lib/kafka/data
+    - kafka_data:/var/lib/kafka/data
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "test -f /proc/1/status || exit 1"]
+      test:
+      - CMD-SHELL
+      - test -f /proc/1/status || exit 1
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 20s
-
   kafka-topics-init:
     image: apache/kafka:3.9.1
     container_name: kafka-topics-init
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
+    entrypoint:
+    - /bin/bash
+    - -c
     command:
-      - |
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests --partitions 10 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.raw --partitions 10 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.parsed --partitions 10 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests.retry --partitions 5 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests.dlq --partitions 5 --replication-factor 1
-        echo "Kafka topics initialized successfully."
-    networks:
-      - duka-net
+    - '/opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server
+      kafka:9092 --topic crawl.requests --partitions 10 --replication-factor 1
 
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic crawl.raw --partitions 10 --replication-factor 1
+
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic crawl.parsed --partitions 10 --replication-factor 1
+
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic crawl.requests.retry --partitions 5 --replication-factor 1
+
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic crawl.requests.dlq --partitions 5 --replication-factor 1
+
+      echo "Kafka topics initialized successfully."
+
+      '
+    networks:
+    - duka-net
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     ports:
-      - "8088:8080"
+    - 8088:8080
     environment:
       KAFKA_CLUSTERS_0_NAME: local-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     networks:
-      - duka-net
+    - duka-net
     restart: always
     depends_on:
-      - kafka
-
+    - kafka
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
     container_name: elasticsearch
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    - discovery.type=single-node
+    - xpack.security.enabled=false
+    - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
-      - "9200:9200"
+    - 9200:9200
     volumes:
-      - es_data:/usr/share/elasticsearch/data
+    - es_data:/usr/share/elasticsearch/data
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200/ >/dev/null || exit 1"]
+      test:
+      - CMD-SHELL
+      - curl -s http://localhost:9200/ >/dev/null || exit 1
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 40s
-
   kibana:
     image: docker.elastic.co/kibana/kibana:8.12.0
     container_name: kibana
     ports:
-      - "5601:5601"
+    - 5601:5601
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     networks:
-      - duka-net
+    - duka-net
     restart: always
     depends_on:
-      - elasticsearch
-
+    - elasticsearch
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: clickhouse
     ports:
-      - "8123:8123"
-      - "9002:9000"
+    - 8123:8123
+    - 9002:9000
     environment:
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
     volumes:
-      - clickhouse_data:/var/lib/clickhouse
-      - ./database/clickhouse:/docker-entrypoint-initdb.d
+    - clickhouse_data:/var/lib/clickhouse
+    - ./database/clickhouse:/docker-entrypoint-initdb.d
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
-      interval: 5s
+      test:
+      - CMD
+      - wget
+      - --spider
+      - -q
+      - http://localhost:8123/ping
+      interval: 10s
       timeout: 5s
       retries: 5
-
+      start_period: 15s
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
-      - "6379:6379"
+    - 6379:6379
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD", "redis-cli ping"]
+      test:
+      - CMD-SHELL
+      - redis-cli ping || exit 1
       interval: 10s
       timeout: 5s
       retries: 5
-
+      start_period: 10s
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -189,22 +207,63 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+    - 9000:9000
+    - 9001:9001
     volumes:
-      - minio_data:/data
+    - minio_data:/data
     command: server /data --console-address ":9001"
     networks:
-      - duka-net
+    - duka-net
     restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test:
+      - CMD
+      - curl
+      - -f
+      - http://localhost:9000/minio/health/live
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # Ollama service removed: using hosted Google AI instead
-
+      start_period: 15s
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+    - 6333:6333
+    volumes:
+    - qdrant_data:/qdrant/storage
+    networks:
+    - duka-net
+    restart: always
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -f http://localhost:6333/health || exit 1
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+  ollama-embedding:
+    image: ollama/ollama:latest
+    container_name: ollama-embedding
+    ports:
+    - 11435:11434
+    volumes:
+    - ollama_data:/root/.ollama
+    networks:
+    - duka-net
+    restart: always
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -f http://localhost:11434/api/tags || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    command: serve
+    environment:
+    - OLLAMA_HOST=0.0.0.0:11434
   api:
     build:
       context: .
@@ -212,16 +271,16 @@ services:
     container_name: duka-api
     restart: always
     environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     ports:
-      - "8000:8000"
+    - 8000:8000
     volumes:
-      - .:/app
+    - .:/app
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+    - host.docker.internal:host-gateway
     networks:
-      - duka-net
+    - duka-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -229,7 +288,14 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -sf http://localhost:8000/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
   surface-worker:
     build:
       context: .
@@ -237,94 +303,15 @@ services:
     container_name: surface-worker
     restart: on-failure:5
     environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - PROXY_POOL=socks5h://tor:9050
     volumes:
-      - .:/app
+    - .:/app
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+    - host.docker.internal:host-gateway
     networks:
-      - duka-net
-    depends_on:
-      kafka:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-
-  parser-worker:
-    build:
-      context: .
-      dockerfile: workers/parser-worker/Dockerfile
-    container_name: parser-worker
-    restart: on-failure:5
-    environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_HTTP_PORT=8123
-      - CLICKHOUSE_DB=duka_scraper
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - duka-net
-    depends_on:
-      kafka:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-
-  deep-worker:
-    build:
-      context: .
-      dockerfile: workers/deep-worker/Dockerfile
-    container_name: deep-worker
-    restart: on-failure:5
-    environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - duka-net
-    depends_on:
-      kafka:
-        condition: service_healthy
-
-  tor:
-    image: dperson/torproxy:latest
-    container_name: tor
-    ports:
-      - "9050:9050"
-    networks:
-      - duka-net
-    restart: always
-    healthcheck:
-      test: ["CMD-SHELL", "echo -e 'GET / HTTP/1.0\\r\\n\\r\\n' | timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9050' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-
-  dark-worker:
-    build:
-      context: .
-      dockerfile: workers/dark-worker/Dockerfile
-    container_name: dark-worker
-    restart: on-failure:5
-    environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - TOR_SOCKS5_PROXY=socks5h://tor:9050
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - duka-net
+    - duka-net
     depends_on:
       kafka:
         condition: service_healthy
@@ -332,37 +319,120 @@ services:
         condition: service_healthy
       tor:
         condition: service_started
-
+  parser-worker:
+    build:
+      context: .
+      dockerfile: workers/parser-worker/Dockerfile
+    container_name: parser-worker
+    restart: on-failure:5
+    environment:
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - CLICKHOUSE_HOST=clickhouse
+    - CLICKHOUSE_HTTP_PORT=8123
+    - CLICKHOUSE_DB=duka_scraper
+    volumes:
+    - .:/app
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+  deep-worker:
+    image: duka_scraper-deep-worker-patched
+    container_name: deep-worker
+    restart: on-failure:5
+    environment:
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - PROXY_POOL=socks5h://tor:9050
+    volumes:
+    - .:/app
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      tor:
+        condition: service_started
+  tor:
+    image: dperson/torproxy:latest
+    container_name: tor
+    ports:
+    - 9050:9050
+    networks:
+    - duka-net
+    restart: always
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - echo -e 'GET / HTTP/1.0\r\n\r\n' | timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9050' || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+  dark-worker:
+    build:
+      context: .
+      dockerfile: workers/dark-worker/Dockerfile
+    container_name: dark-worker
+    restart: on-failure:5
+    environment:
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - TOR_SOCKS5_PROXY=socks5h://tor:9050
+    volumes:
+    - .:/app
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - duka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      tor:
+        condition: service_started
   llm-worker:
     build:
       context: .
       dockerfile: workers/llm-worker/Dockerfile
     container_name: llm-worker
-    restart: on-failure:5
+    restart: on-failure:10
     environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - LLM_PROVIDER=hosted
-      - HOSTED_LLM_URL=https://api.groq.com/openai/v1/chat/completions
-      - HOSTED_LLM_API_KEY=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
-      - HOSTED_LLM_MODEL=openai/gpt-oss-120b
-      - CH_HOST=clickhouse
-      - CH_PORT=8123
-      - CH_DATABASE=duka_scraper
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - LLM_PROVIDER=hosted
+    - HOSTED_LLM_URL=https://api.groq.com/openai/v1/chat/completions
+    - HOSTED_LLM_API_KEY=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
+    - HOSTED_LLM_MODEL=openai/gpt-oss-120b
+    - CH_HOST=clickhouse
+    - CH_PORT=8123
+    - CH_DATABASE=duka_scraper
+    - RAG_ENABLED=true
+    - EMBEDDING_PROVIDER=ollama
+    - EMBEDDING_BASE_URL=http://ollama-embedding:11434
+    - EMBEDDING_MODEL=nomic-embed-text
+    - VECTOR_DB_URL=http://qdrant:6333
+    - VECTOR_DB_COLLECTION=duka_articles
     volumes:
-      - .:/app
+    - .:/app
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+    - host.docker.internal:host-gateway
     networks:
-      - duka-net
+    - duka-net
     depends_on:
       kafka:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-
-  # ollama-pull helper removed
-
   exporter-worker:
     build:
       context: .
@@ -370,14 +440,14 @@ services:
     container_name: exporter-worker
     restart: on-failure:5
     environment:
-      - APP_ENV=docker
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     volumes:
-      - .:/app
+    - .:/app
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+    - host.docker.internal:host-gateway
     networks:
-      - duka-net
+    - duka-net
     depends_on:
       kafka:
         condition: service_healthy
@@ -385,25 +455,23 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
     ports:
-      - "9090:9090"
+    - 9090:9090
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     networks:
-      - duka-net
+    - duka-net
     restart: always
-
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
-      - "3000:3000"
+    - 3000:3000
     networks:
-      - duka-net
+    - duka-net
     restart: always
     depends_on:
-      - prometheus
+    - prometheus

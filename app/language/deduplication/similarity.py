@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-
 from app.language.normalization.normalize import normalize_text
 
 

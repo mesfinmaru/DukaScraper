@@ -5,17 +5,27 @@ This module contains common dependencies that all workers use:
 - Link extraction and deduplication (for recursive crawling)
 - Worker assignment rules
 - Shared configuration
+- Proxy management (shared across all workers)
 """
 
-from app.services.dedup_service import DedupService
-from app.services.link_extraction_service import LinkExtractionService
-from app.services.recursive_crawl_service import extract_and_queue_children
+import os
+
+from app.common.config.settings import settings
 from app.common.constants.worker_assignment import (
     WorkerAssignmentEngine,
     assign_worker,
     assign_worker_with_reason,
     check_escalation,
 )
+from app.common.proxy_manager import ProxyManager, parse_proxy_url
+from app.services.dedup_service import DedupService
+from app.services.link_extraction_service import LinkExtractionService
+from app.services.recursive_crawl_service import extract_and_queue_children
+
+# --- Shared proxy pool (all workers share this instance) ---
+_PROXY_RAW: str = os.getenv("PROXY_POOL", settings.proxy_pool)
+_proxy_list: list[str] = [p.strip() for p in _PROXY_RAW.split(",") if p.strip()] if _PROXY_RAW else []
+shared_proxy_manager = ProxyManager(_proxy_list)
 
 __all__ = [
     "DedupService",
@@ -25,4 +35,7 @@ __all__ = [
     "assign_worker",
     "assign_worker_with_reason",
     "check_escalation",
+    "ProxyManager",
+    "parse_proxy_url",
+    "shared_proxy_manager",
 ]

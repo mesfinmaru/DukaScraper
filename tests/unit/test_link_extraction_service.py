@@ -96,6 +96,30 @@ class TestExtractLinks:
         assert not any("fonts.googleapis.com" in link.lower() for link in links)
         assert not any("googletagmanager" in link.lower() for link in links)
 
+    def test_dedupes_tracking_and_repeated_links(self):
+        """The same content URL should only be returned once even with tracking params."""
+        html = """
+        <a href="https://example.com/article/1?utm_source=google&real=1">Article A</a>
+        <a href="https://example.com/article/1?real=1">Article A duplicate</a>
+        <a href="https://example.com/search?q=demo">Search</a>
+        """
+        links = LinkExtractionService.extract_links(html, "https://example.com")
+        article_count = sum(1 for link in links if "https://example.com/article/1" in link)
+        assert article_count == 1
+        assert not any("https://example.com/search" in link for link in links)
+
+    def test_skips_non_content_pages_like_login_and_search(self):
+        """Navigation and account pages should not be treated as content links."""
+        html = """
+        <a href="https://example.com/login">Login</a>
+        <a href="https://example.com/search?q=hello">Search</a>
+        <a href="https://example.com/article/story">Article</a>
+        """
+        links = LinkExtractionService.extract_links(html, "https://example.com")
+        assert "https://example.com/article/story" in links
+        assert not any("/login" in link for link in links)
+        assert not any("/search" in link for link in links)
+
 
 class TestNormalizeURL:
     """Test URL normalization for deduplication."""

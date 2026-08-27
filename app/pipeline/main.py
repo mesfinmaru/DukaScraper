@@ -59,6 +59,12 @@ async def submit_crawl_job(
         language=language,
     )
 
+    # Inject seed_url into recursive_config so recursive_crawl_service
+    # can restrict links to the same domain as the original seed.
+    effective_config = dict(recursive_config or {})
+    effective_config.setdefault("seed_url", url)
+    effective_config.setdefault("same_domain_only", True)
+
     job_event = CrawlRequest(
         job_id=job_row["job_id"],
         url=url,
@@ -67,7 +73,7 @@ async def submit_crawl_job(
         depth=0,
         max_depth=max_depth,
         parent_url=None,
-        recursive_config=recursive_config or {},
+        recursive_config=effective_config,
         job_params=job_params or {},
     )
 

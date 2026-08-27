@@ -53,6 +53,7 @@ class ClickHouseManager:
                     """
                     CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
                         job_id String,
+                        item_id String,
                         worker LowCardinality(String),
                         status_code UInt16,
                         latency_ms UInt32,
@@ -60,8 +61,12 @@ class ClickHouseManager:
                         retry_count UInt8,
                         payload_size_bytes UInt32,
                         created_at DateTime DEFAULT now()
-                    ) ENGINE = MergeTree() ORDER BY (worker, job_id);
+                    ) ENGINE = MergeTree() ORDER BY (worker, job_id, item_id);
                     """
+                )
+                self.client.command(
+                    "ALTER TABLE duka_scraper.crawler_performance "
+                    "ADD COLUMN IF NOT EXISTS item_id String AFTER job_id"
                 )
                 self.client.command(
                     """
@@ -70,15 +75,42 @@ class ClickHouseManager:
                         item_id String,
                         url String,
                         source_type String,
+                        topic LowCardinality(String) DEFAULT 'other',
                         category LowCardinality(String),
                         threat_severity UInt8,
                         entities Array(String),
                         summary String,
                         language LowCardinality(String),
                         llm_model String,
-                        llm_score Float32,
+                        llm_score Nullable(Float32),
                         created_at DateTime DEFAULT now()
                     ) ENGINE = MergeTree() ORDER BY (created_at, category);
+                    """
+                )
+                # Forward-compatible migrations for installations created before
+                # topic and nullable scores were introduced.
+                self.client.command(
+                    "ALTER TABLE duka_scraper.intelligence_analytics "
+                    "ADD COLUMN IF NOT EXISTS topic LowCardinality(String) DEFAULT 'other' AFTER source_type"
+                )
+                self.client.command(
+                    "ALTER TABLE duka_scraper.intelligence_analytics MODIFY COLUMN llm_score Nullable(Float32)"
+                )
+                self.client.command(
+                    """
+                    CREATE TABLE IF NOT EXISTS duka_scraper.model_evaluations (
+                        evaluation_id UUID,
+                        item_id String,
+                        job_id String,
+                        evaluated_by String,
+                        expected_source_type LowCardinality(String),
+                        predicted_source_type LowCardinality(String),
+                        expected_topic LowCardinality(String),
+                        predicted_topic LowCardinality(String),
+                        expected_category LowCardinality(String),
+                        predicted_category LowCardinality(String),
+                        created_at DateTime DEFAULT now()
+                    ) ENGINE = MergeTree() ORDER BY (created_at, item_id)
                     """
                 )
                 logger.info("ClickHouse schema verified/created.")
@@ -91,6 +123,7 @@ class ClickHouseManager:
     def write_crawler_performance(
         self,
         job_id: str,
+        item_id: str | None,
         worker: str,
         status_code: int,
         latency_ms: int,
@@ -106,6 +139,7 @@ class ClickHouseManager:
             "crawler_performance",
             [[
                 job_id,
+                item_id or "",
                 worker,
                 int(status_code),
                 int(latency_ms),
@@ -116,6 +150,7 @@ class ClickHouseManager:
             ]],
             column_names=[
                 "job_id",
+                "item_id",
                 "worker",
                 "status_code",
                 "latency_ms",

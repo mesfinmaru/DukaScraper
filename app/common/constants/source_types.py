@@ -18,6 +18,7 @@ class SourceType(StrEnum):
     SOCIAL = "social"
     GOVERNMENT = "government"
     ACADEMIC = "academic"
+    ENCYCLOPEDIA = "encyclopedia"
     ECOMMERCE = "ecommerce"
     OTHER = "other"
 
@@ -35,6 +36,7 @@ SOURCE_TYPE_DESCRIPTIONS = {
     SourceType.SOCIAL: "Social media platforms (e.g., Twitter, Facebook, Instagram)",
     SourceType.GOVERNMENT: "Official government websites, public records, legislative documents",
     SourceType.ACADEMIC: "Research papers, university websites, academic journals",
+    SourceType.ENCYCLOPEDIA: "Reference works and collaboratively maintained encyclopedias",
     SourceType.ECOMMERCE: "Online stores, product pages, retail sites",
     SourceType.OTHER: "Any other type of content source not fitting the above categories",
 }
