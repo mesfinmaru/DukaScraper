@@ -26,11 +26,13 @@ import io
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
 
 import httpx
+from httpx_socks import AsyncProxyTransport
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from minio import Minio
 from pydantic import ValidationError
@@ -44,6 +46,7 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.common.utils.url_utils import is_onion_url, is_valid_http_url
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 from app.services.dead_letter_service import publish_crawl_dead_letter
@@ -51,14 +54,37 @@ from app.services.page_validation_service import PageValidationService
 from app.services.politeness_service import PolitenessService
 from app.services.recursive_crawl_service import extract_and_queue_children
 from app.storage.postgres.client import pg_client
+from workers.health import HealthServer
+from workers.metrics import WorkerMetrics
+
+# --- Escalation ---
+MAX_RETRY_COUNT = 3  # Circuit-breaker on escalation loops
+
+# HTML patterns indicating anti-bot challenges that httpx can't solve
+CHALLENGE_PATTERNS = [
+    r'checking\s+your\s+browser',
+    r'verify\s+you\s+are\s+human',
+    r'attention\s+required',
+    r'just\s+a\s+moment',
+    r'cf-challenge|challenge-platform',
+    r'hcaptcha|recaptcha|turnstile',
+    r'perimeterx|px-captcha|datadome|akamai.*bot',
+]
+_CHALLENGE_RE = re.compile('|'.join(CHALLENGE_PATTERNS), re.IGNORECASE)
+
+# HTTP status codes that warrant escalation to browser-based deep worker
+ESCALATION_STATUS_CODES = {401, 403, 407, 429, 451}
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+if APP_ENV == "docker":
+    _setup_worker_logging(level=logging.INFO, json_output=True)
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -126,12 +152,19 @@ def _build_tor_http_client() -> httpx.AsyncClient:
         max_keepalive_connections=MAX_CONCURRENT_TASKS,
         keepalive_expiry=30.0,
     )
+    # python-socks doesn't support the "socks5h" scheme directly;
+    # use "socks5" + rdns=True to resolve DNS through Tor.
+    socks_url = TOR_PROXY_URL.replace("socks5h://", "socks5://")
+    transport = AsyncProxyTransport.from_url(
+        socks_url,
+        verify=False,          # Tor exit nodes may present untrusted certs
+        rdns=True,             # Resolve DNS through the Tor proxy (like socks5h)
+    )
     return httpx.AsyncClient(
-        proxy=TOR_PROXY_URL,
+        transport=transport,
         headers=DEFAULT_HEADERS,
         follow_redirects=True,
         timeout=timeout,
-        verify=False,          # Tor exit nodes may present untrusted certs
         trust_env=False,       # Do not pick up system proxy settings
         limits=limits,
     )
@@ -261,6 +294,57 @@ async def _extract_and_queue_children(
 
 
 # =========================================================================
+# Escalation: dark -> deep (for anti-bot challenges)
+# =========================================================================
+
+async def escalate_to_deep(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    reason: str,
+) -> None:
+    """Requeue a job to the DEEP worker when httpx can't handle the page.
+
+    The deep worker automatically detects .onion/.i2p URLs and creates
+    a Tor-proxied browser context — so the Tor routing is preserved.
+    """
+    if request.retry_count >= MAX_RETRY_COUNT:
+        logger.warning(
+            "[%s] Exceeded max escalation retries (%d); giving up on %s",
+            request.job_id, MAX_RETRY_COUNT, request.url,
+        )
+        return
+
+    escalated = request.model_copy(
+        update={
+            "worker_type": "deep",
+            "retry_count": request.retry_count + 1,
+            "escalation_reason": reason,
+        },
+    )
+    await producer.send_and_wait(
+        CONSUME_TOPIC,
+        value=escalated.model_dump_json().encode("utf-8"),
+        key=request.job_id.encode("utf-8"),
+    )
+    logger.warning(
+        "[%s] Escalated %s to DEEP worker (reason=%s, retry=%d)",
+        request.job_id, request.url, reason, escalated.retry_count,
+    )
+
+
+def _detect_challenge(html: str, status_code: int) -> str | None:
+    """Check if response indicates an anti-bot challenge.
+
+    Returns a reason string if escalation is warranted, else None.
+    """
+    if status_code in ESCALATION_STATUS_CODES:
+        return f"http_{status_code}"
+    if html and _CHALLENGE_RE.search(html):
+        return "anti_bot_challenge_detected"
+    return None
+
+
+# =========================================================================
 # MinIO upload (sync in thread)
 # =========================================================================
 
@@ -308,7 +392,21 @@ async def process_request(
         return
 
     if request.worker_type != WORKER_TYPE:
+        logger.debug("Skipping job %s — worker_type='%s' != '%s'",
+                     request.job_id, request.worker_type, WORKER_TYPE)
         return
+
+    # --- Dedup: skip jobs already completed (prevents re-processing on worker restart)
+    try:
+        existing_job = await pg_client.get_job(request.job_id)
+        if existing_job and existing_job["status"] in ("completed", "failed", "skipped"):
+            logger.info(
+                "Skipping already-%s job %s for %s (depth=%d) — no re-fetch",
+                existing_job["status"], request.job_id, request.url, request.depth,
+            )
+            return
+    except Exception as dedup_err:
+        logger.debug("Job status check failed (non-fatal): %s", dedup_err)
 
     item_id = await pg_client.allocate_item_id()
     logger.info(
@@ -338,24 +436,65 @@ async def process_request(
     # --- Fetch through Tor ---
     start_time = time.perf_counter()
     try:
-        status_code, html, final_url = await fetch_url(http_client, request.url)
+        html, status_code, final_url = await fetch_url(http_client, request.url)
     except Exception as exc:
         logger.warning("Request error for %s via Tor: %s", request.url, exc)
         html, status_code, final_url = "", 599, request.url
 
     latency_ms = int((time.perf_counter() - start_time) * 1000)
 
+    # --- Anti-bot detection + escalation to deep worker ---
+    # Before page validation, check if the response indicates a challenge
+    # that httpx can't solve. Escalate to deep worker (browser-based)
+    # which will auto-detect .onion and create a Tor-proxied browser.
+    challenge_reason = _detect_challenge(html, status_code)
+    if challenge_reason:
+        logger.warning(
+            "[%s] Anti-bot challenge detected (%s) — escalating to DEEP worker",
+            request.job_id, challenge_reason,
+        )
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, final_url, WORKER_TYPE,
+            challenge_reason, "escalated", request.retry_count,
+        )
+        await escalate_to_deep(producer, request, challenge_reason)
+        return
+
     # --- Page validation ---
     validation = PageValidationService.validate(final_url, html, status_code, request.language)
     if validation.status == "failed":
+        # Also escalate hard failures to deep worker (browser may handle it)
+        logger.warning(
+            "[%s] Page validation failed (%s) — escalating to DEEP worker",
+            request.job_id, validation.reason,
+        )
         await pg_client.record_crawl_log(
             request.job_id, item_id, final_url, WORKER_TYPE,
-            validation.reason, validation.status, request.retry_count,
+            validation.reason, "escalated", request.retry_count,
         )
-        await pg_client.update_job_status(request.job_id, "failed")
-        await publish_crawl_dead_letter(producer, request, validation.reason, WORKER_TYPE)
-        logger.info("Hard failure %s: %s", request.url, validation.reason)
+        await escalate_to_deep(producer, request, validation.reason)
         return
+    if validation.status == "needs_review":
+        # Only escalate actual anti-bot challenges — not insufficient content
+        # on .onion sites (httpx already fetched it, browser can't help)
+        if validation.reason == "insufficient_content":
+            logger.info(
+                "[%s] Page has insufficient extracted text (%s) — proceeding with raw HTML",
+                request.job_id, validation.reason,
+            )
+            # Fall through to process the content as-is
+        else:
+            # Actual challenge page — escalate to deep worker (browser-based)
+            logger.warning(
+                "[%s] Page needs review (%s) — escalating to DEEP worker",
+                request.job_id, validation.reason,
+            )
+            await pg_client.record_crawl_log(
+                request.job_id, item_id, final_url, WORKER_TYPE,
+                validation.reason, "escalated", request.retry_count,
+            )
+            await escalate_to_deep(producer, request, validation.reason)
+            return
 
     # --- Recursive link extraction ---
     extracted_links, queued_count, skipped_count = [], 0, 0
@@ -425,8 +564,11 @@ async def process_message_safely(
     message_value: bytes,
 ) -> None:
     """Enforce concurrency limits via semaphore."""
-    async with semaphore:
-        await process_request(producer, http_client, message_value)
+    try:
+        async with semaphore:
+            await process_request(producer, http_client, message_value)
+    except Exception as exc:
+        logger.error("Unhandled exception in dark worker task: %s", exc, exc_info=True)
 
 
 # =========================================================================
@@ -434,6 +576,12 @@ async def process_message_safely(
 # =========================================================================
 
 async def main() -> None:
+    # --- Health + Metrics servers ---
+    health = HealthServer(worker_name="dark")
+    await health.start()
+    metrics = WorkerMetrics(worker_name="dark", topic=CONSUME_TOPIC)
+    await metrics.start()
+
     logger.info(
         "STARTING DARK WORKER — Kafka=%s group=dark-group "
         "consume=%s produce=%s Tor=%s concurrency=%d",
@@ -452,7 +600,7 @@ async def main() -> None:
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{WORKER_TYPE}-group",
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         enable_auto_commit=True,
         auto_commit_interval_ms=5000,
         max_poll_records=MAX_CONCURRENT_TASKS,
@@ -472,6 +620,7 @@ async def main() -> None:
 
     await producer.start()
     await consumer.start()
+    health.mark_ready()
     logger.info(
         "DARK WORKER ONLINE — listening on '%s' "
         "(Tor=%s, persistent client, recursive crawling enabled)",
@@ -504,6 +653,9 @@ async def main() -> None:
             except TimeoutError:
                 continue
 
+            metrics.record_consumed()
+            logger.debug("Received message from topic '%s' (partition=%s, offset=%s)",
+                         CONSUME_TOPIC, message.partition, message.offset)
             task = asyncio.create_task(
                 process_message_safely(producer, http_client, message.value)
             )
@@ -526,6 +678,13 @@ async def main() -> None:
         logger.error("Dark worker stopped: %s", exc, exc_info=True)
     finally:
         shutdown_event.set()
+
+        # Stop health + metrics servers
+        try:
+            await health.stop()
+            await metrics.stop()
+        except Exception as exc:
+            logger.error("Health/metrics server shutdown error: %s", exc)
 
         # Wait for in-flight tasks
         if tasks:

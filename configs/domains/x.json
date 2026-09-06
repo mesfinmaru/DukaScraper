@@ -1,0 +1,51 @@
+{
+    "domain": "x.com",
+    "name": "X (Twitter)",
+    "description": "X/Twitter login — email/username + password. Multi-step: username first, then password on next screen.",
+    "handle_http_interstitial": false,
+    "login_url": "https://x.com/i/flow/login",
+    "login_steps": [
+        {
+            "action": "wait",
+            "wait_after_ms": 3000,
+            "description": "Wait for X login flow to load"
+        },
+        {
+            "action": "fill",
+            "selector": "input[autocomplete='username'], input[name='text'], input[type='text']",
+            "value": "$username",
+            "wait_after_ms": 800,
+            "description": "Fill username/email on first screen"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Next'), button:has-text('Continue'), div[role='button']:has-text('Next')",
+            "wait_after_ms": 2000,
+            "description": "Click Next to go to password screen"
+        },
+        {
+            "action": "fill",
+            "selector": "input[name='password'], input[type='password'], input[autocomplete='current-password']",
+            "value": "$password",
+            "wait_after_ms": 800,
+            "description": "Fill password on second screen"
+        },
+        {
+            "action": "click",
+            "selector": "button[data-testid='LoginForm_Login_Button'], button:has-text('Log in'), div[role='button']:has-text('Log in')",
+            "wait_after_ms": 5000,
+            "description": "Click Log in button"
+        }
+    ],
+    "post_login_targets": [
+        "/home"
+    ],
+    "extraction_targets": [
+        {
+            "name": "timeline_data",
+            "type": "custom",
+            "js_extract": "(() => { const tweets = document.querySelectorAll('article[data-testid=\"tweet\"]'); const items = []; tweets.forEach((t, i) => { if (i < 20) items.push(t.innerText.substring(0, 500)); }); return { url: window.location.href, tweet_count: items.length, tweets: items, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract timeline tweets after login"
+        }
+    ]
+}

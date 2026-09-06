@@ -81,8 +81,7 @@ def validate_language(language: str) -> str:
     Accepted: 'am', 'en', and other ISO 639-1 codes.
     """
     VALID_LANGUAGES = {
-        "am", "en", "om", "ti", "so", "ar", "fr", "es", "de",
-        "it", "pt", "sw", "tr", "hi", "ru", "zh", "ja", "ko",
+        "am", "en", "om", "ti", "so", "sg", "sid",
     }
     lang = language.strip().lower()
     if lang not in VALID_LANGUAGES:

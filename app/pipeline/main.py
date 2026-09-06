@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from fastapi import HTTPException
+
 from app.common.constants.worker_assignment import assign_worker_with_reason
 from app.common.logger.logger import logger
 from app.pipeline.producer.kafka_producer import kafka_producer
@@ -49,12 +51,41 @@ async def submit_crawl_job(
     optional and no longer required for correct routing.
     """
 
+    if kafka_producer is None or kafka_producer.producer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Kafka is unavailable; retry after the messaging service is ready",
+        )
+
+    from app.storage.postgres.client import _normalize_user_id
     worker_type, assignment_reason = assign_worker_with_reason(url, worker_override)
 
-    await pg_client.ensure_user(user_id)
+    # --- Force DEEP worker when auto_signup or credentials are requested ---
+    # These features require browser automation (Patchright) which only the
+    # deep worker provides.  Surface and dark workers are HTTP-only.
+    _job_params = job_params or {}
+    if (
+        _job_params.get("auto_signup")
+        or _job_params.get("allow_login")
+        or _job_params.get("allow_signup")
+        or _job_params.get("credentials")
+    ):
+        if worker_type != "deep":
+            logger.info(
+                "Routing %s to deep worker (auto_signup=%s, credentials=%s) — "
+                "overriding assignment from %s",
+                url, _job_params.get("auto_signup"), bool(_job_params.get("credentials")),
+                worker_type,
+            )
+            worker_type = "deep"
+            assignment_reason = "auto_signup_or_credentials"
+
+    normalized_user_id = _normalize_user_id(user_id)
+    existing_user = await pg_client.ensure_user(normalized_user_id)
+    actual_user_id = existing_user["user_id"]
 
     job_row = await pg_client.create_job(
-        user_id=user_id,
+        user_id=actual_user_id,
         url=url,
         language=language,
     )

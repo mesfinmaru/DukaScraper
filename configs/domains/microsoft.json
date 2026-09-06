@@ -1,0 +1,53 @@
+{
+    "domain": "login.microsoftonline.com",
+    "name": "Microsoft Account",
+    "description": "Microsoft/Office 365 login — email + password. Multi-step: email first, then password.",
+    "handle_http_interstitial": false,
+    "login_url": "https://login.microsoftonline.com/",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[type='email'], input[name='loginfmt'], #i0116",
+            "value": "$username",
+            "wait_after_ms": 800,
+            "description": "Fill email address"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Next'), #idSIButton9, input[type='submit']",
+            "wait_after_ms": 3000,
+            "description": "Click Next to go to password screen"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='passwd'], #i0118",
+            "value": "$password",
+            "wait_after_ms": 800,
+            "description": "Fill password"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Sign in'), #idSIButton9, input[type='submit']",
+            "wait_after_ms": 5000,
+            "description": "Click Sign in"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('No'), button:has-text('Don't show this again'), #idBtn_Back",
+            "wait_after_ms": 2000,
+            "optional": true,
+            "description": "Dismiss 'Stay signed in?' prompt"
+        }
+    ],
+    "post_login_targets": [
+        "https://outlook.office365.com/mail/"
+    ],
+    "extraction_targets": [
+        {
+            "name": "account_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 3000) : '' }; })()",
+            "description": "Extract Microsoft account data after login"
+        }
+    ]
+}

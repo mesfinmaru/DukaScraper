@@ -39,6 +39,7 @@ from patchright.async_api import (
     Response,
     async_playwright,
 )
+from browserforge.fingerprints import Screen
 from pydantic import ValidationError
 
 # --- Path Setup (matches surface/dark worker convention) ---
@@ -72,6 +73,7 @@ from app.services.auto_signup_handler import auto_signup_handler
 from app.services.credential_service import credential_service
 from app.storage.postgres.client import pg_client
 from workers.common import shared_proxy_manager
+from workers.health import HealthServer
 
 # Optional: audio solver for reCAPTCHA v2
 try:
@@ -90,13 +92,24 @@ try:
 except ImportError:
     HAS_OCR_LIB = False
 
+# Optional: Camoufox (Firefox-based anti-fingerprint browser) for Cloudflare fallback
+try:
+    from camoufox.async_api import AsyncCamoufox
+
+    HAS_CAMOUFOX: bool = True
+except ImportError:
+    HAS_CAMOUFOX = False
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Only configure root logging when executed as a script. When imported as a
+# module (tests, tooling), leave the host process's logging setup untouched.
+if __name__ == "__main__" or __name__ == "workers.deep-worker.main":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -147,6 +160,93 @@ BROWSER_CONTEXT_KWARGS: dict[str, object] = settings.DEEP_BROWSER_CONTEXT_KWARGS
 STEALTH_INIT_SCRIPT: str = settings.DEEP_STEALTH_INIT_SCRIPT
 
 # =========================================================================
+# Camoufox Fingerprint Profiles — Cloudflare bypass fallback
+# =========================================================================
+# When Patchright fails to clear a Cloudflare managed challenge, we fall back
+# to Camoufox (Firefox-based, anti-fingerprint) and rotate through these
+# profiles to avoid repeated detection by the same fingerprint.
+CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
+    {
+        "os": "windows",
+        "screen": (1920, 1080),
+        "window": (1920, 1040),
+        "locale": "en-US",
+        "webgl": ("Intel", "Intel(R) UHD Graphics 630"),
+    },
+    {
+        "os": "macos",
+        "screen": (2560, 1440),
+        "window": (2560, 1400),
+        "locale": "en-GB",
+        "webgl": ("Apple", "Apple M1"),
+    },
+    {
+        "os": "linux",
+        "screen": (1920, 1080),
+        "window": (1920, 1040),
+        "locale": "de-DE",
+        "webgl": ("Mesa", "Mesa OpenGL"),
+    },
+    {
+        "os": "windows",
+        "screen": (1366, 768),
+        "window": (1366, 728),
+        "locale": "fr-FR",
+        "webgl": ("NVIDIA", "NVIDIA GeForce GTX 1050 Ti"),
+    },
+    {
+        "os": "macos",
+        "screen": (1440, 900),
+        "window": (1440, 860),
+        "locale": "es-ES",
+        "webgl": ("Apple", "Apple M2"),
+    },
+    {
+        "os": "linux",
+        "screen": (2560, 1440),
+        "window": (2560, 1400),
+        "locale": "ja-JP",
+        "webgl": ("NVIDIA", "NVIDIA GeForce RTX 3060"),
+    },
+    {
+        "os": "windows",
+        "screen": (2560, 1440),
+        "window": (2560, 1400),
+        "locale": "pt-BR",
+        "webgl": ("AMD", "AMD Radeon RX 580"),
+    },
+]
+
+
+def _get_camoufox_profile(attempt: int) -> dict[str, object]:
+    """Select a fingerprint profile based on attempt number.
+
+    Profiles rotate with wrap-around so repeated retries never use the
+    same fingerprint twice in a row.
+    """
+    idx = attempt % len(CAMOUFOX_FINGERPRINT_PROFILES)
+    return CAMOUFOX_FINGERPRINT_PROFILES[idx]
+
+
+def _get_camoufox_webgl_config(
+    os_name: str, screen_size: tuple[int, int]
+) -> tuple[str, str] | None:
+    """Get a WebGL pair known to Camoufox, if its sampler is available."""
+    try:
+        from camoufox.fingerprints import sample_webgl_for_screen
+
+        sampler_os = {"windows": "win", "macos": "mac", "linux": "lin"}.get(os_name, os_name)
+        sampled = sample_webgl_for_screen(sampler_os, screen_size[0], screen_size[1])
+        vendor = sampled.get("webGl:vendor")
+        renderer = sampled.get("webGl:renderer")
+        if vendor and renderer:
+            return vendor, renderer
+    except Exception as exc:
+        logger.debug("Camoufox WebGL sampling unavailable: %s", exc)
+    return None
+
+
+# =========================================================================
 # Cloudflare Challenge Detection
 # =========================================================================
 
@@ -179,15 +279,65 @@ _CF_CHALLENGE_FAILURE_MARKERS: list[str] = [
 async def _is_cloudflare_challenge(page: Page) -> bool:
     """Returns True if the current page is a Cloudflare challenge page."""
     try:
-        html_snippet: str = await page.evaluate(
-            "() => document.title + ' ' + (document.body?.innerText || '').substring(0, 2000)"
+        page_state = await page.evaluate(
+            "() => ({title: document.title, text: (document.body?.innerText || '').substring(0, 2000)})"
         )
+        # Backward compatibility: mocks/older shims may return a plain string
+        # (the legacy "title + body" snippet). Treat it as the combined text.
+        if isinstance(page_state, str):
+            page_title = ""
+            html_snippet = page_state
+        else:
+            if not isinstance(page_state, dict):
+                page_state = {}
+            page_title = str(page_state.get("title", ""))
+            html_snippet = f"{page_title} {page_state.get('text', '')}"
+        snippet_lower = html_snippet.lower()
+
+        # The challenge <title> stays "Just a moment..." even on the
+        # transitional "Verification successful. Waiting for … to respond"
+        # screen, whose body text no longer matches the primary markers.
+        # Treating the title as a signal prevents the solver from declaring
+        # victory while the page is still mid-verification.
+        if page_title:
+            title_lower = page_title.lower()
+            for marker in ("just a moment", "attention required"):
+                if marker in title_lower:
+                    return True
+
         for marker in _CF_CHALLENGE_MARKERS:
-            if marker.lower() in html_snippet.lower():
+            if marker.lower() in snippet_lower:
                 return True
+
+        # Turnstile login pages can look like ordinary forms in visible text.
+        # Detect the active widget before credentials are submitted.
+        turnstile_state = await page.evaluate(
+            """() => {
+                const widget = Boolean(
+                    document.querySelector('.cf-turnstile') ||
+                    document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                    document.querySelector('iframe[src*="turnstile"]') ||
+                    document.querySelector('input[name="cf-turnstile-response"]')
+                );
+                const token = Array.from(
+                    document.querySelectorAll('input[name="cf-turnstile-response"]')
+                ).some(input => Boolean(input.value && input.value.trim()));
+                return {widget, token};
+            }"""
+        )
+        if isinstance(turnstile_state, dict) and turnstile_state.get("widget") and not turnstile_state.get("token"):
+            return True
     except Exception:
         pass
     return False
+
+
+def _html_has_cloudflare_challenge(html: str) -> bool:
+    """Return whether captured HTML contains an active Cloudflare challenge."""
+    if not html:
+        return False
+    lowered = html.lower()
+    return any(marker.lower() in lowered for marker in _CF_CHALLENGE_MARKERS)
 
 
 async def _wait_for_challenge_resolution(
@@ -296,6 +446,36 @@ class UniversalCaptchaSolver:
                 logger.debug("Turnstile iframe interaction error (selector %s): %s", sel, exc)
             if clicked:
                 break
+
+        if not clicked:
+            # The Turnstile checkbox often lives inside a deeply nested iframe
+            # whose internal selectors differ from the common ones. Locate any
+            # checkbox-like element by geometry inside each candidate frame
+            # and click it by screen coordinates.
+            for sel in iframe_selectors:
+                frame_element = await page.query_selector(sel)
+                if not frame_element:
+                    continue
+                try:
+                    box = await frame_element.bounding_box()
+                    if not box or box["width"] < 10 or box["height"] < 10:
+                        continue
+                    # The checkbox sits ~30px from the widget's left edge.
+                    target_x = box["x"] + min(30.0, box["width"] / 2)
+                    target_y = box["y"] + box["height"] / 2
+                    await page.mouse.move(target_x - 20, target_y - 10)
+                    await asyncio.sleep(0.2)
+                    await page.mouse.move(target_x, target_y, steps=8)
+                    await asyncio.sleep(0.3)
+                    await page.mouse.click(target_x, target_y)
+                    clicked = True
+                    logger.info(
+                        "Turnstile widget clicked by coordinates (%.0f, %.0f)",
+                        target_x, target_y,
+                    )
+                    break
+                except Exception as exc:
+                    logger.debug("Turnstile coordinate click failed (selector %s): %s", sel, exc)
 
         if not clicked:
             # Managed challenge — the JS may auto-solve without a visible click.
@@ -413,6 +593,8 @@ class DeepWorker:
 
     def __init__(self) -> None:
         self.captcha_solver: UniversalCaptchaSolver = UniversalCaptchaSolver()
+        self.camoufox_authenticated = False
+        self.camoufox_portal_data: dict[str, object] = {}
 
     # -- Authentication ------------------------------------------------------
 
@@ -533,6 +715,8 @@ class DeepWorker:
         url: str,
         job_id: str,
         timeout_ms: int,
+        credentials: dict[str, str] | None = None,
+        portal_config: PortalConfig | None = None,
     ) -> tuple[Response | None, str]:
         """Navigate to *url*, wait for full page load, solve challenges,
         return (response, html).
@@ -587,6 +771,14 @@ class DeepWorker:
             await self.captcha_solver.solve_cloudflare_turnstile(page)
             await asyncio.sleep(3.0)
 
+            # Re-check after solver — challenge may have resolved during wait
+            still_challenge = await _is_cloudflare_challenge(page)
+            if not still_challenge:
+                logger.info("[%s] Cloudflare challenge cleared after solver", job_id)
+            else:
+                logger.info("[%s] Challenge still present after solver — waiting for auto-resolve", job_id)
+                await asyncio.sleep(5.0)
+
         # --- Stage 5: Wait for JS-rendered content to settle ---
         try:
             await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -614,7 +806,252 @@ class DeepWorker:
         await self._log_page_state(page, job_id, "after_content_wait")
 
         content: str = await page.content()
+
+        # --- Camoufox fallback: if Patchright couldn't clear Cloudflare ---
+        still_challenge = await _is_cloudflare_challenge(page)
+        if still_challenge and HAS_CAMOUFOX:
+            logger.info(
+                "[%s] Patchright unable to clear Cloudflare — trying Camoufox fallback",
+                job_id,
+            )
+            try:
+                response, content = await self._try_camoufox_bypass(
+                    page, url, job_id, timeout_ms, credentials, portal_config,
+                )
+                # If the fallback also failed, the content is still the challenge
+                # page — flag it loudly so downstream never mistakes it for a
+                # successful Camoufox capture (response=None normally means
+                # "Camoufox cleared the challenge").
+                if response is None and _html_has_cloudflare_challenge(content):
+                    logger.error(
+                        "[%s] Camoufox fallback FAILED — content is still the "
+                        "challenge interstitial; job will be failed, not stored.",
+                        job_id,
+                    )
+            except Exception as cf_err:
+                logger.error(
+                    "[%s] Camoufox fallback error: %s — returning Patchright content",
+                    job_id, cf_err,
+                )
+
         return response, content
+
+    async def _try_camoufox_bypass(
+        self,
+        patchright_page: Page,
+        url: str,
+        job_id: str,
+        timeout_ms: int,
+        credentials: dict[str, str] | None = None,
+        portal_config: PortalConfig | None = None,
+    ) -> tuple[Response | None, str]:
+        """Fall back to Camoufox (Firefox-based anti-fingerprint browser)
+        when Patchright cannot clear a Cloudflare managed challenge.
+
+        Strategy:
+          1. Launch Camoufox with a rotating fingerprint profile.
+          2. Navigate to the URL and wait for content to settle.
+          3. If Camoufox gets past Cloudflare, transfer `cf_clearance` cookies
+             back to the Patchright context and re-navigate.
+          4. If re-navigation is still blocked, return Camoufox content directly.
+          5. Retry with a different fingerprint profile on failure.
+
+        Returns (response, html_content). The html_content is always a string,
+        even when all fallbacks fail.
+        """
+        if not HAS_CAMOUFOX:
+            logger.warning(
+                "[%s] Camoufox not installed — cannot fall back. "
+                "Install with: pip install camoufox && python -m camoufox fetch",
+                job_id,
+            )
+            return patchright_page.main_frame._redirected_url if hasattr(patchright_page, "main_frame") else None, await patchright_page.content()
+
+        max_retries = min(len(CAMOUFOX_FINGERPRINT_PROFILES), 3)
+        best_content: str = await patchright_page.content()
+        best_response: Response | None = None
+
+        for attempt in range(max_retries):
+            profile = _get_camoufox_profile(attempt)
+            os_name = profile["os"]
+            screen_size = profile["screen"]
+            locale = profile["locale"]
+            webgl_vendor, webgl_renderer = profile["webgl"]
+            window_size = profile["window"]
+            webgl_config = _get_camoufox_webgl_config(os_name, screen_size)
+
+            logger.info(
+                "[%s] 🦊 Camoufox attempt %d/%d — os=%s screen=%s locale=%s",
+                job_id, attempt + 1, max_retries, os_name, screen_size, locale,
+            )
+
+            try:                    # Access AsyncCamoufox via sys.modules at call time so
+                    # monkeypatching in tests (and runtime hot-swap) takes effect.
+                    import sys as _sys
+                    _cam_mod = _sys.modules.get("camoufox.async_api")
+                    _AsyncCamoufox = getattr(_cam_mod, "AsyncCamoufox") if _cam_mod else AsyncCamoufox
+
+                    async with _AsyncCamoufox(
+                        headless=False,
+                        humanize=True,
+                        os=os_name,
+                        screen=Screen(
+                            max_width=screen_size[0],
+                            max_height=screen_size[1],
+                        ),
+                        window=(window_size[0], window_size[1]),
+                        locale=locale,
+                        **({"webgl_config": webgl_config} if webgl_config else {}),
+                    ) as cf_browser:
+                        cf_page = await cf_browser.new_page()
+
+                        try:
+                            response = await cf_page.goto(
+                                url, wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                        except Exception as nav_err:
+                            logger.warning(
+                                "[%s] Camoufox navigation failed (attempt %d): %s",
+                                job_id, attempt + 1, nav_err,
+                            )
+                            continue
+
+                    # Wait for Cloudflare to clear inside Camoufox
+                    # Call _is_cloudflare_challenge directly (not via
+                    # _wait_for_challenge_resolution) so that patched mocks
+                    # and runtime hot-swaps are always respected.
+                        cf_cleared = False
+                        _poll_elapsed = 0.0
+                        _poll_interval = 1.0
+                        _max_poll = 25.0
+                        while _poll_elapsed < _max_poll:
+                            await asyncio.sleep(_poll_interval)
+                            _poll_elapsed += _poll_interval
+                            if not await _is_cloudflare_challenge(cf_page):
+                                cf_cleared = True
+                                break
+
+                        if not cf_cleared:
+                            logger.warning(
+                                "[%s] Camoufox attempt %d still on challenge page",
+                                job_id, attempt + 1,
+                            )
+                            thin_content = await cf_page.content()
+                            if len(thin_content) > len(best_content):
+                                best_content = thin_content
+                                best_response = response
+                            continue
+
+                        logger.info(
+                            "[%s] Camoufox cleared Cloudflare on attempt %d",
+                            job_id, attempt + 1,
+                        )
+
+                        if credentials and portal_config and portal_config.login_steps:
+                            logger.info(
+                                "[%s] Running configured portal login inside Camoufox",
+                                job_id,
+                            )
+                            portal_result = await PortalHandler(
+                                cf_page, portal_config
+                            ).run(credentials)
+                            if portal_result.get("login_successful"):
+                                self.camoufox_authenticated = True
+                                self.camoufox_portal_data = dict(
+                                    portal_result.get("extracted_data", {})
+                                )
+                                logger.info(
+                                    "[%s] Camoufox portal login succeeded",
+                                    job_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "[%s] Camoufox portal login did not succeed",
+                                    job_id,
+                                )
+
+                    # Wait for content to settle
+                        try:
+                            await cf_page.wait_for_load_state(
+                                "networkidle", timeout=15_000,
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0)
+
+                        camoufox_content = await cf_page.content()
+                        camoufox_cookies = await cf_page.context.cookies()
+
+                    # Find cf_clearance cookie for transfer
+                        clearance_cookie = next(
+                            (cookie for cookie in camoufox_cookies if cookie.get("name") == "cf_clearance"),
+                            None,
+                        )
+
+                        if clearance_cookie:
+                        # Transfer cookies to Patchright and re-navigate
+                            logger.info(
+                                "[%s] Transferring cf_clearance cookie to Patchright",
+                                job_id,
+                            )
+                            try:
+                                await patchright_page.context.add_cookies(
+                                    [clearance_cookie]
+                                )
+                            except Exception as cookie_err:
+                                logger.warning(
+                                    "[%s] Cookie transfer failed: %s — using Camoufox content",
+                                    job_id, cookie_err,
+                                )
+                                best_content = camoufox_content
+                                best_response = response
+                                continue
+
+                        # Re-navigate with Patchright using the transferred cookie
+                            try:
+                                renav_response = await patchright_page.goto(
+                                    url, wait_until="domcontentloaded",
+                                    timeout=timeout_ms,
+                                )
+                                await asyncio.sleep(3.0)
+                                renav_content = await patchright_page.content()
+
+                                still_challenge = await _is_cloudflare_challenge(
+                                    patchright_page,
+                                )
+                                if not still_challenge and len(renav_content) > 500:
+                                    logger.info(
+                                        "[%s] Patchright re-navigation succeeded after cookie transfer",
+                                        job_id,
+                                    )
+                                    return renav_response, renav_content
+                                else:
+                                    logger.warning(
+                                        "[%s] Patchright re-nav still blocked — using Camoufox content",
+                                        job_id,
+                                    )
+                            except Exception as renav_err:
+                                logger.warning(
+                                    "[%s] Patchright re-navigation failed: %s",
+                                    job_id, renav_err,
+                                )
+
+                    # No clearance cookie or re-nav failed — use Camoufox content
+                        best_content = camoufox_content
+                        # Camoufox content is captured from a successful page;
+                        # the initial Patchright response may still be 403.
+                        best_response = None
+                        break
+
+            except Exception as cam_err:
+                logger.error(
+                    "[%s] Camoufox attempt %d error: %s",
+                    job_id, attempt + 1, cam_err,
+                )
+                continue
+
+        return best_response, best_content
 
     async def process_job(
         self,
@@ -642,10 +1079,22 @@ class DeepWorker:
         try:
             logger.info("[%s] Navigating to: %s", job_id, url)
 
-            response, content = await self._navigate_and_solve(
-                page, url, job_id, timeout_ms
+            portal_config_dict = payload.get("portal_config")
+            portal_config = (
+                PortalConfig.from_dict(portal_config_dict)
+                if isinstance(portal_config_dict, dict)
+                else find_config_for_url(url)
             )
-            status_code: int = response.status if response else 200
+            if isinstance(portal_config, dict):
+                portal_config = PortalConfig.from_dict(portal_config)
+
+            response, content = await self._navigate_and_solve(
+                page, url, job_id, timeout_ms, credentials, portal_config
+            )
+            # A None response with substantial content is the explicit signal
+            # that the content came from the successful Camoufox fallback.
+            used_camoufox_content = response is None and len(content) > 500
+            status_code: int = 200 if used_camoufox_content else (response.status if response else 200)
 
             # --- Content retry: if first attempt yielded thin HTML, retry once ---
             # This handles cases where commit-only returns before the page renders
@@ -716,18 +1165,13 @@ class DeepWorker:
 
             # --- Portal-aware login & data extraction ---
             portal_config_dict = payload.get("portal_config")  # type: ignore[assignment]
-            portal_config: PortalConfig | None = None
-            if portal_config_dict and isinstance(portal_config_dict, dict):
-                portal_config = PortalConfig.from_dict(portal_config_dict)
-            elif not portal_config_dict:
-                # Auto-discover portal config from domain
+            if not portal_config_dict:
                 portal_config_dict = find_config_for_url(url)
-                if portal_config_dict:
-                    portal_config = PortalConfig.from_dict(portal_config_dict)
-                    logger.info(
-                        "[%s] Auto-discovered portal config for %s",
-                        job_id, portal_config.domain,
-                    )
+            if portal_config:
+                logger.info(
+                    "[%s] Auto-discovered portal config for %s",
+                    job_id, portal_config.domain,
+                )
 
             is_still_challenge = await _is_cloudflare_challenge(page)
             portal_structured_data: dict[str, object] = {}
@@ -736,7 +1180,7 @@ class DeepWorker:
             # --- Auto-signup handler (optional pre-crawl step) ---
             auto_signup_enabled = bool(payload.get("auto_signup"))  # type: ignore[arg-type]
             auto_signup_credential_email = payload.get("credential_email")  # type: ignore[arg-type]
-            if auto_signup_enabled:
+            if auto_signup_enabled and not self.camoufox_authenticated:
                 # If Cloudflare is still blocking, try one more aggressive solve attempt
                 if is_still_challenge:
                     logger.info("[%s] Cloudflare still blocking — attempting pre-signup solve", job_id)
@@ -753,20 +1197,30 @@ class DeepWorker:
 
                 # Auto-assign credential if not explicitly provided
                 if not credentials or not auto_signup_credential_email:
-                    assigned = await credential_service.get_credential_for_domain(_signup_domain)
-                    if assigned:
-                        auto_signup_credential_email = assigned["email"]
-                        # We need the plaintext password — it should be in job_params
-                        _auto_password = payload.get("auto_password")  # type: ignore[arg-type]
-                        if _auto_password:
-                            credentials = {
-                                "username": assigned["email"],
-                                "password": str(_auto_password),
-                            }
-                            logger.info(
-                                "[%s] Auto-assigned credential %s for %s",
-                                job_id, assigned["email"], _signup_domain,
-                            )
+                    # Prefer the generated signup identity (dukaXXXXX) from
+                    # process_request when present.
+                    _gen_email = payload.get("auto_signup_email")  # type: ignore[assignment]
+                    if _gen_email and credentials:
+                        auto_signup_credential_email = str(_gen_email)
+                        logger.info(
+                            "[%s] Using generated signup identity %s for %s",
+                            job_id, _gen_email, _signup_domain,
+                        )
+                    else:
+                        assigned = await credential_service.get_credential_for_domain(_signup_domain)
+                        if assigned:
+                            auto_signup_credential_email = assigned["email"]
+                            # We need the plaintext password — it should be in job_params
+                            _auto_password = payload.get("auto_password")  # type: ignore[arg-type]
+                            if _auto_password:
+                                credentials = {
+                                    "username": assigned["email"],
+                                    "password": str(_auto_password),
+                                }
+                                logger.info(
+                                    "[%s] Auto-assigned credential %s for %s",
+                                    job_id, assigned["email"], _signup_domain,
+                                )
 
                 if credentials and auto_signup_credential_email:
                     logger.info(
@@ -774,12 +1228,24 @@ class DeepWorker:
                         job_id, _signup_domain,
                     )
                     try:
+                        # Signup forms need an EMAIL address in the email field;
+                        # prefer the generated inbox alias, fall back to the
+                        # username field value.
+                        _signup_email = (
+                            str(payload.get("auto_signup_email") or "").strip()
+                            or str(credentials["username"])
+                        )
+                        _want_verification = bool(
+                            payload.get("auto_email_verification")
+                            or payload.get("allow_email_verification")
+                        )
                         signup_result = await auto_signup_handler.handle(
                             page=page,
-                            email=credentials["username"],
+                            email=_signup_email,
                             password=credentials["password"],
                             domain=_signup_domain,
                             portal_config=portal_config_dict if isinstance(portal_config_dict, dict) else None,
+                            perform_verification=_want_verification,
                         )
                         logger.info(
                             "[%s] Auto-signup result: action=%s success=%s "
@@ -799,7 +1265,7 @@ class DeepWorker:
                             job_id, signup_err,
                         )
 
-            if not is_still_challenge and credentials:
+            if not self.camoufox_authenticated and not is_still_challenge and credentials:
                 await self._log_page_state(page, job_id, "pre_login")
 
                 if portal_config:
@@ -839,6 +1305,12 @@ class DeepWorker:
                 # --- Diagnostic after login ---
                 await self._log_page_state(page, job_id, "post_login")
 
+            elif self.camoufox_authenticated:
+                logger.info(
+                    "[%s] Login already completed inside Camoufox; using captured authenticated content",
+                    job_id,
+                )
+                portal_structured_data = self.camoufox_portal_data
             elif is_still_challenge:
                 logger.warning(
                     "[%s] Page is STILL a Cloudflare challenge after all retries — "
@@ -848,13 +1320,23 @@ class DeepWorker:
 
             # --- Extract JS-rendered visible text (for SPAs / dynamic content) ---
             rendered_text: str = ""
-            try:
-                rendered_text = await page.evaluate(
-                    "() => document.body ? document.body.innerText : ''"
-                )
-                rendered_text = (rendered_text or "").strip()
-            except Exception as js_err:
-                logger.debug("[%s] JS text extraction failed: %s", job_id, js_err)
+            if used_camoufox_content and still_challenge:
+                try:
+                    from bs4 import BeautifulSoup
+
+                    rendered_text = BeautifulSoup(content, "html.parser").get_text(
+                        "\n", strip=True
+                    )
+                except Exception as html_err:
+                    logger.debug("[%s] Camoufox HTML text extraction failed: %s", job_id, html_err)
+            else:
+                try:
+                    rendered_text = await page.evaluate(
+                        "() => document.body ? document.body.innerText : ''"
+                    )
+                    rendered_text = (rendered_text or "").strip()
+                except Exception as js_err:
+                    logger.debug("[%s] JS text extraction failed: %s", job_id, js_err)
 
             logger.info(
                 "[%s] 📊 Extraction results: html=%d chars, rendered_text=%d chars",
@@ -1025,6 +1507,62 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 )
                 _job_context = _browser_context
 
+    # Resolve an explicitly selected encrypted credential first, then reuse
+    # the most recent successful credential for this domain.
+    if (
+        (request.job_params.get("allow_login") or request.job_params.get("allow_signup"))
+        and not request.job_params.get("credentials")
+    ):
+        selected_email = request.job_params.get("credential_email")
+        if selected_email:
+            secrets = await credential_service.get_credential_secrets(str(selected_email))
+            if secrets.get("password"):
+                request.job_params["credentials"] = {
+                    "username": str(selected_email),
+                    "password": secrets["password"],
+                }
+                logger.info("[%s] Using selected credential profile", request.job_id)
+        if not request.job_params.get("credentials") and request.job_params.get("allow_login"):
+            stored = await credential_service.get_stored_credential_for_domain(_hostname)
+            if stored and stored.get("password"):
+                request.job_params["credentials"] = {
+                    "username": stored.get("username") or stored.get("email"),
+                    "password": stored["password"],
+                }
+                logger.info("[%s] Reusing stored credential for %s", request.job_id, _hostname)
+        if not request.job_params.get("credentials") and request.job_params.get("allow_signup"):
+            # Full-auto signup: synthesize a new identity (dukaXXXXX / Duka@12345).
+            # auto_signup_handler persists it to credential_usage after a
+            # successful signup so the next crawl logs in instead.
+            import random as _random
+            _gen_user = f"duka{_random.randint(10000, 99999)}"
+            request.job_params["credentials"] = {
+                "username": _gen_user,
+                "password": credential_service._DEFAULT_PASSWORD,
+            }
+            # Signup email: use a plus-alias of the seed Gmail inbox when one is
+            # configured, so verification emails land in a real, pollable inbox.
+            # (Gmail ignores everything after '+', and signup forms treat it as
+            # a distinct address.) Otherwise fall back to a placeholder that
+            # cannot receive verification mail.
+            _seed_inbox = getattr(settings, "SEED_GMAIL_EMAIL", "")
+            if _seed_inbox and "@gmail.com" in _seed_inbox.lower():
+                _seed_local, _, _seed_domain = _seed_inbox.partition("@")
+                request.job_params["auto_signup_email"] = f"{_seed_local}+{_gen_user}@{_seed_domain}"
+            else:
+                request.job_params["auto_signup_email"] = f"{_gen_user}@dukascraper.local"
+            request.job_params["auto_password"] = credential_service._DEFAULT_PASSWORD
+            # Whether the caller asked for automatic email verification.
+            request.job_params.setdefault(
+                "auto_email_verification",
+                bool(request.job_params.get("allow_email_verification")),
+            )
+            logger.info(
+                "[%s] No stored credential for %s — signup identity generated (user=%s, inbox=%s)",
+                request.job_id, _hostname, _gen_user,
+                request.job_params["auto_signup_email"],
+            )
+
     # Build the payload for the browser renderer
     payload: dict[str, object] = {
         "job_id": request.job_id,
@@ -1033,8 +1571,12 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         "depth": request.depth,
         "max_depth": request.max_depth,
         "credentials": request.job_params.get("credentials"),
-        "auto_signup": request.job_params.get("auto_signup"),
+        "auto_signup": request.job_params.get("auto_signup") or request.job_params.get("allow_signup"),
         "auto_password": request.job_params.get("auto_password"),
+        "credential_email": request.job_params.get("credential_email"),
+        "auto_signup_email": request.job_params.get("auto_signup_email"),
+        "auto_email_verification": request.job_params.get("auto_email_verification")
+            or request.job_params.get("allow_email_verification"),
     }
 
     worker = DeepWorker()
@@ -1127,9 +1669,8 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         except Exception:
             pass
 
-    canonical_url = LinkExtractionService.normalize_url(request.url)
-
     # Extract title from meta tags / <title> / first heading
+    # (needed by the interstitial guard below AND stored on the parsed item)
     title: str | None = None
     try:
         from bs4 import BeautifulSoup as _BS
@@ -1153,6 +1694,68 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                     break
     except Exception:
         pass
+
+    # A captured challenge interstitial is NOT article content. Persisting it
+    # would store "Just a moment..." as a parsed item, so fail the job instead.
+    # We check the *visible text* for interstitial phrases (not raw-HTML
+    # structural markers) so thin login pages that legitimately embed a
+    # Turnstile widget are not misclassified.
+    # NOTE: no length cap here. Challenge pages include long help text ("Why is
+    # this verification taking longer?", "What to do next?", ...) that can push
+    # them well past 500 chars — the earlier cap let an 813-char interstitial
+    # through and got published as a completed item. The title check below
+    # guards against false positives from pages that legitimately quote these
+    # phrases, since a real interstitial always ships the challenge <title>.
+    _text_lower = (extracted_text or "").lower()
+    _interstitial = any(
+        marker in _text_lower
+        for marker in (
+            "just a moment",
+            "verifying you are human",
+            "performing security verification",
+            "checking your browser",
+            "enable javascript and cookies to continue",
+            "why is this verification taking longer",
+        )
+    )
+    if _interstitial:
+        _title_lower = (title or "").lower()
+        _challenge_title = (
+            "just a moment" in _title_lower
+            or "attention required" in _title_lower
+            or "one more step" in _title_lower
+        )
+        # The <title> on a challenge page is always the interstitial boilerplate
+        # ("Just a moment..." etc.) — require it to avoid misclassifying an
+        # article that merely quotes these phrases in its body text.
+        if not _challenge_title:
+            logger.warning(
+                "[%s] Interstitial marker found in text but page title %r is not "
+                "challenge-like — treating as real content.",
+                request.job_id, title,
+            )
+            _interstitial = False
+    if _interstitial:
+        logger.error(
+            "[%s] Captured page is still a Cloudflare challenge interstitial after "
+            "all solver attempts (Patchright + Camoufox) — failing job instead of "
+            "storing challenge content.",
+            request.job_id,
+        )
+        await pg_client.record_crawl_log(
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            worker_type=WORKER_TYPE,
+            event_type="browser_render",
+            status="failed",
+            retry_count=request.retry_count,
+            details="Cloudflare challenge not solved: page content is the challenge interstitial",
+        )
+        await pg_client.update_job_status(request.job_id, "failed")
+        return
+
+    canonical_url = LinkExtractionService.normalize_url(request.url)
 
     payload_size = len(html.encode("utf-8"))
     quality_score = score_text_quality(extracted_text or "")
@@ -1209,7 +1812,7 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
     # Update parsed_items with MinIO paths
     raw_html_path = f"s3://{RAW_BUCKET}/{raw_object}"
     parsed_json_path = f"s3://{PARSED_BUCKET}/{parsed_object}"
-    await pg_client.db_pool.execute(
+    await pg_client.system_pool.execute(
         "UPDATE parsed_items SET raw_html_path = $1, parsed_json_path = $2 WHERE item_id = $3",
         raw_html_path,
         parsed_json_path,
@@ -1223,13 +1826,13 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         key=request.job_id.encode("utf-8"),
     )
     await pg_client.record_crawl_log(
-        job_id=request.job_id,
-        item_id=resolved_item_id,
-        url=request.url,
-        worker_type=WORKER_TYPE,
-        event_type="browser_render",
-        status="completed",
-        retry_count=request.retry_count,
+        request.job_id,
+        resolved_item_id,
+        request.url,
+        WORKER_TYPE,
+        "browser_render",
+        "completed",
+        request.retry_count,
     )
     await pg_client.update_job_status(request.job_id, "completed")
     logger.info(
@@ -1244,7 +1847,12 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes) -> None:
     """Enforces concurrency limits using the global semaphore."""
     async with _semaphore:
-        await process_request(producer, message_value)
+        try:
+            await process_request(producer, message_value)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Deep-worker message task failed")
 
 
 # =========================================================================
@@ -1361,6 +1969,12 @@ async def main() -> None:
     """Main worker lifecycle — consumes from Kafka, renders via Patchright,
     and publishes structured results."""
 
+    health_server = HealthServer(
+        worker_name="deep",
+        port=int(os.getenv("HEALTH_PORT", "8080")),
+    )
+    await health_server.start()
+
     # --- Step 1: Connect to PostgreSQL ---
     logger.info("Connecting to PostgreSQL …")
     try:
@@ -1407,11 +2021,12 @@ async def main() -> None:
         raise
 
     logger.info(
-        "✅ Deep worker ONLINE — listening on topic '%s' (group=%s, concurrency=%d).",
+        "Deep worker ONLINE — listening on topic '%s' (group=%s, concurrency=%d).",
         CONSUME_TOPIC,
         "deep-worker-group",
         MAX_CONCURRENT_JOBS,
     )
+    health_server.mark_ready()
 
     # --- Graceful shutdown on SIGTERM / SIGINT ---
     loop = asyncio.get_running_loop()
@@ -1430,17 +2045,34 @@ async def main() -> None:
                 # Windows does not support add_signal_handler
                 pass
 
+    tasks: set[asyncio.Task] = set()
+
+    def _task_done(task: asyncio.Task) -> None:
+        tasks.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception:
+            logger.error("Deep-worker task exited with error: %s", exception)
+
     try:
         async for msg in consumer:
-            asyncio.create_task(process_message_safely(producer, msg.value))
+            task = asyncio.create_task(process_message_safely(producer, msg.value))
+            tasks.add(task)
+            task.add_done_callback(_task_done)
     except asyncio.CancelledError:
         logger.info("Deep worker cancellation requested.")
     finally:
         logger.info("Shutting down deep worker gracefully …")
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await consumer.stop()
         await producer.stop()
         await shutdown_browser()
         await pg_client.close()
+        await health_server.stop()
         logger.info("Deep worker shutdown complete.")
 
 

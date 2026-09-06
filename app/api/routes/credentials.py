@@ -20,7 +20,7 @@ from app.services.credential_service import credential_service
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["credentials"])
+router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,45 @@ async def get_credential_for_domain(domain: str):
 async def get_domain_usage_history(domain: str):
     """Get all credential usage records for a domain."""
     return await credential_service.get_usage_for_domain(domain)
+
+
+class SiteCredentialRequest(BaseModel):
+    """Save a known site credential (e.g. a site that publishes test creds).
+
+    Reused automatically by the deep worker for login on future crawls.
+    """
+    email: str = Field(..., description="Login email/username for the site")
+    password: str = Field(..., min_length=1, description="Login password (stored encrypted)")
+    username: str | None = Field(None, description="Optional separate username if different from email")
+
+
+@router.post("/domain/{domain}/site-credential")
+async def save_site_credential(domain: str, req: SiteCredentialRequest):
+    """Store (or update) a reusable credential for a specific site domain."""
+    domain = domain.strip().lower().lstrip(".")
+    result = await credential_service.store_site_credential(
+        email=req.email.strip().lower(),
+        domain=domain,
+        username=(req.username or req.email).strip(),
+        password=req.password,
+        action="login",
+    )
+    return {"message": f"Credential saved for {domain}", **result}
+
+
+@router.get("/domain/{domain}/site-credential")
+async def get_site_credential(domain: str):
+    """Check whether a reusable credential exists for a domain (no secrets returned)."""
+    domain = domain.strip().lower().lstrip(".")
+    cred = await credential_service.get_stored_credential_for_domain(domain)
+    if not cred:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "email": cred["email"],
+        "username": cred["username"],
+        "source": "stored",
+    }
 
 
 @router.patch("/{email}/status")

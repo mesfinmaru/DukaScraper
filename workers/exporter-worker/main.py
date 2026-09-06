@@ -28,13 +28,19 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.common.utils.minio_naming import parsed_name
 from app.pipeline.schemas import ParsedItem
 from app.pipeline.topics import topics
 from app.storage.postgres.client import pg_client
+from workers.health import HealthServer
+from workers.metrics import WorkerMetrics
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+if APP_ENV == "docker":
+    _setup_worker_logging(level=logging.INFO, json_output=True)
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- Configuration & Clients ---
@@ -136,7 +142,7 @@ async def init_databases():
         logger.error(f"Failed to initialize ClickHouse table: {e}")
 
     await pg_client.connect()
-    logger.info("PostgreSQL connections established (duka_system + duka_db).")
+    logger.info("PostgreSQL connection established (duka_system).")
 
     try:
         if not await es_client.indices.exists(index=ES_INDEX):
@@ -222,7 +228,7 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
 
     try:
         await pg_client.mark_item_exported(item_id)
-        logger.info(f"Marked parsed_items row {item_id} as exported (duka_db.parsed_items)")
+        logger.info(f"Marked parsed_items row {item_id} as exported (duka_system.parsed_items)")
     except Exception as e:
         logger.error(f"PostgreSQL Export Error [{item_id}]: {e}")
 
@@ -358,6 +364,12 @@ class BatchExportManager:
 
 
 async def consume_and_export():
+    # --- Health + Metrics servers ---
+    health = HealthServer(worker_name="exporter")
+    await health.start()
+    metrics = WorkerMetrics(worker_name="exporter", topic=KAFKA_INPUT_TOPIC)
+    await metrics.start()
+
     logger.info("Waiting for Kafka to be fully ready...")
     await asyncio.sleep(10)
 
@@ -366,10 +378,12 @@ async def consume_and_export():
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BROKERS,
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         group_id="exporter-group",
     )
     await consumer.start()
+    health.mark_ready()
+    metrics.record_consumed()  # Initial signal that consumer is live
     logger.info(f"Multi-Sink Exporter Worker is online, listening on '{KAFKA_INPUT_TOPIC}'...")
 
     stop_event = asyncio.Event()
@@ -394,6 +408,7 @@ async def consume_and_export():
 
     try:
         async for message in consumer:
+            metrics.record_consumed()
             try:
                 parsed_item = ParsedItem(**json.loads(message.value.decode("utf-8")))
                 normalized = await store_single_item(parsed_item)
@@ -417,6 +432,8 @@ async def consume_and_export():
             pass
         await batch_manager.flush()
         logger.info("Shutting down exporter worker...")
+        await health.stop()
+        await metrics.stop()
         await consumer.stop()
         await es_client.close()
         await pg_client.close()

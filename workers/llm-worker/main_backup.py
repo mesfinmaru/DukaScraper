@@ -725,7 +725,7 @@ async def main():
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{WORKER_TYPE}-group",
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
     )
 
     await consumer.start()

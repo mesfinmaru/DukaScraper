@@ -1,0 +1,46 @@
+{
+    "domain": "accounts.google.com",
+    "name": "Google Account",
+    "description": "Google account login — email + password. Multi-step: email first, then password. Useful for OAuth/SSO flows on GitHub, GitLab, etc.",
+    "handle_http_interstitial": false,
+    "login_url": "https://accounts.google.com/signin",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[type='email'], input[name='identifier'], #identifierId",
+            "value": "$username",
+            "wait_after_ms": 800,
+            "description": "Fill email address"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Next'), #identifierNext button, div[role='button']:has-text('Next')",
+            "wait_after_ms": 3000,
+            "description": "Click Next to go to password screen"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='Passwd']",
+            "value": "$password",
+            "wait_after_ms": 800,
+            "description": "Fill password on second screen"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Next'), #passwordNext button, div[role='button']:has-text('Next')",
+            "wait_after_ms": 5000,
+            "description": "Click Next to complete login"
+        }
+    ],
+    "post_login_targets": [
+        "https://myaccount.google.com/"
+    ],
+    "extraction_targets": [
+        {
+            "name": "account_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 3000) : '' }; })()",
+            "description": "Extract Google account info after login"
+        }
+    ]
+}

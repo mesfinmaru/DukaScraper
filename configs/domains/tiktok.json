@@ -1,0 +1,47 @@
+{
+    "domain": "tiktok.com",
+    "name": "TikTok",
+    "description": "TikTok web login — email/username + password. Multi-step flow.",
+    "handle_http_interstitial": false,
+    "login_url": "https://www.tiktok.com/login/phone-or-email/email",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[name='username'], input[type='email'], input[data-e2e='email-login-input']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill email/username field"
+        },
+        {
+            "action": "click",
+            "selector": "button:has-text('Send code'), button[data-e2e='send-code-btn']",
+            "wait_after_ms": 2000,
+            "optional": true,
+            "description": "Click Send code (may be required for some accounts)"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='password'], input[data-e2e='password-input']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password field"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], button:has-text('Log in'), button[data-e2e='login-button']",
+            "wait_after_ms": 5000,
+            "description": "Click Log in button"
+        }
+    ],
+    "post_login_targets": [
+        "/foryou"
+    ],
+    "extraction_targets": [
+        {
+            "name": "feed_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract TikTok feed data after login"
+        }
+    ]
+}

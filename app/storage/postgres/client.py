@@ -1,9 +1,8 @@
 """
 PostgreSQL Client
-Connection and queries for both duka_system and duka_db databases
+Connection and queries for the duka_system database.
 
-Schema reference (unchanged, as created in database/01_duka_system.sql
-and database/02_duka_db.sql):
+Schema reference (created in database/01_duka_system.sql):
 
 duka_system.users:
     user_id (VARCHAR8 PK, auto), full_name, username, email,
@@ -14,23 +13,39 @@ duka_system.jobs:
     language, status, created_at, completed_at
 
 duka_system.credential_usage:
-    (email, domain) PK, password_hash, display_name, provider,
+    email, domain, password_hash, display_name, provider,
     status, imap_*, gmail_*, action, usage_status,
     error_message, portal_config, created_at, last_used_at
+    UNIQUE (email), base rows have domain=NULL
 
-duka_db.parsed_items:
+duka_system.parsed_items:
     item_id (VARCHAR12 PK, auto), job_id, source_url, language,
     worker_type, title, publish_date, character_count, word_count,
     raw_html_path, parsed_json_path, parsed_at, is_exported
 
-duka_db.exports:
+duka_system.exports:
     export_id (VARCHAR11 PK, auto), job_id, export_type, file_path,
     status, file_size_mb, item_count, created_at
+
+duka_system.crawl_log:
+    log_id (BIGSERIAL PK), job_id, item_id, url, worker_type,
+    event_type, status, retry_count, details, created_at
+
+duka_system.discovered_external_links:
+    id (BIGSERIAL PK), job_id, parent_url, discovered_url,
+    discovered_domain, anchor_text, status, created_at, reviewed_at
+
+duka_system.content_fingerprints:
+    id (BIGSERIAL PK), job_id, item_id, url, url_fingerprint,
+    content_fingerprint, simhash, word_count, char_count,
+    text_preview, duplicate_of, duplicate_type, created_at
 """
 
 import logging
 import re
+import secrets
 from datetime import date, datetime
+from uuid import uuid4
 
 import asyncpg
 
@@ -65,14 +80,13 @@ def _normalize_user_id(value: str) -> str:
 
 
 class PostgreSQLClient:
-    """PostgreSQL client for both duka_system and duka_db"""
+    """PostgreSQL client for duka_system database"""
 
     def __init__(self):
         self.system_pool = None
-        self.db_pool = None
 
     async def connect(self):
-        """Connect to both PostgreSQL databases and auto-create missing database/schema objects."""
+        """Connect to PostgreSQL and auto-create missing database/schema objects."""
         admin_conn = None
         try:
             # Connect to the default Postgres database for admin tasks.
@@ -86,13 +100,12 @@ class PostgreSQLClient:
             logger.info("Connected to PostgreSQL admin database for initialization.")
 
             await self._create_database_if_missing(admin_conn, settings.DUKA_SYSTEM_DB)
-            await self._create_database_if_missing(admin_conn, settings.DUKA_DB)
 
             if admin_conn is not None:
                 await admin_conn.close()
                 admin_conn = None
 
-            # Use connection pools to safely allow concurrent queries from async tasks
+            # Use connection pool to safely allow concurrent queries from async tasks
             self.system_pool = await asyncpg.create_pool(
                 host=settings.POSTGRES_HOST,
                 port=settings.POSTGRES_PORT,
@@ -104,19 +117,7 @@ class PostgreSQLClient:
             )
             logger.info(f"Connected to PostgreSQL pool {settings.DUKA_SYSTEM_DB}")
 
-            self.db_pool = await asyncpg.create_pool(
-                host=settings.POSTGRES_HOST,
-                port=settings.POSTGRES_PORT,
-                user=settings.POSTGRES_USER,
-                password=settings.POSTGRES_PASSWORD,
-                database=settings.DUKA_DB,
-                min_size=1,
-                max_size=10,
-            )
-            logger.info(f"Connected to PostgreSQL pool {settings.DUKA_DB}")
-
             await self._ensure_duka_system_schema()
-            await self._ensure_duka_db_schema()
 
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
@@ -126,14 +127,10 @@ class PostgreSQLClient:
                 await admin_conn.close()
 
     async def close(self):
-        """Close both database connections"""
+        """Close the database connection"""
         if self.system_pool:
             await self.system_pool.close()
             logger.info("Closed duka_system pool")
-
-        if self.db_pool:
-            await self.db_pool.close()
-            logger.info("Closed duka_db pool")
 
     # ========== duka_system queries (users) ==========
 
@@ -151,12 +148,21 @@ class PostgreSQLClient:
         async with self.system_pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
 
+    async def get_user_by_email(self, email: str):
+        """Get a user by their login email address."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE email = $1", email)
+
     async def create_user(
         self,
         full_name: str,
         username: str,
         email: str,
         password_hash: str,
+        role: str = "user",
+        email_verified: bool = False,
         user_id: str | None = None,
     ):
         """Create a new user in duka_system.users.
@@ -169,20 +175,61 @@ class PostgreSQLClient:
         async with self.system_pool.acquire() as conn:
             if user_id:
                 return await conn.fetchrow(
-                    """INSERT INTO users (user_id, full_name, username, email, password_hash)
-                       VALUES ($1, $2, $3, $4, $5)
-                       RETURNING user_id, full_name, username, email, created_at""",
+                    """INSERT INTO users (user_id, full_name, username, email, password_hash, role, email_verified)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)
+                       RETURNING user_id, full_name, username, email, role, is_active, email_verified, created_at""",
                     user_id,
                     full_name,
                     username,
                     email,
                     password_hash,
+                    role,
+                    email_verified,
                 )
 
             return await conn.fetchrow(
-                """INSERT INTO users (full_name, username, email, password_hash)
-                   VALUES ($1, $2, $3, $4)
-                   RETURNING user_id, full_name, username, email, created_at""",
+                """INSERT INTO users (full_name, username, email, password_hash, role, email_verified)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified, created_at""",
+                full_name,
+                username,
+                email,
+                password_hash,
+                role,
+                email_verified,
+            )
+
+    async def ensure_initial_admin(
+        self,
+        *,
+        username: str,
+        email: str,
+        full_name: str,
+        password_hash: str,
+    ):
+        """Create the configured bootstrap admin once, without resetting passwords."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT * FROM users WHERE username = $1 OR email = $2",
+                username,
+                email,
+            )
+            if existing:
+                return await conn.fetchrow(
+                    """UPDATE users
+                       SET role = 'admin', is_active = TRUE, email_verified = TRUE,
+                           updated_at = CURRENT_TIMESTAMP
+                       WHERE user_id = $1
+                       RETURNING *""",
+                    existing["user_id"],
+                )
+            return await conn.fetchrow(
+                """INSERT INTO users
+                   (full_name, username, email, password_hash, role, is_active, email_verified)
+                   VALUES ($1, $2, $3, $4, 'admin', TRUE, TRUE)
+                   RETURNING *""",
                 full_name,
                 username,
                 email,
@@ -203,13 +250,338 @@ class PostgreSQLClient:
         email = f"{username}@example.com"
         password_hash = "auto-generated"
 
+        try:
+            return await self.create_user(
+                full_name=f"Auto-created {normalized_id}",
+                username=username,
+                email=email,
+                password_hash=password_hash,
+                user_id=normalized_id,
+            )
+        except asyncpg.exceptions.UniqueViolationError:
+            # Username or email already exists from a prior run;
+            # find and return the existing user by username.
+            async with self.system_pool.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT * FROM users WHERE username = $1 OR email = $2",
+                    username, email,
+                )
+                if existing:
+                    logger.info(
+                        "User %s already exists as %s — reusing",
+                        normalized_id, existing["user_id"],
+                    )
+                    return existing
+                raise
+
+    # ========== User management (auth overhaul) ==========
+
+    async def list_users(self):
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT user_id, full_name, username, email, role, is_active, email_verified, "
+                "must_change_password, created_at "
+                "FROM users ORDER BY created_at DESC"
+            )
+
+    async def update_user_profile(self, user_id: str, *, full_name: str | None, email: str | None, password_hash: str | None):
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """UPDATE users SET full_name = COALESCE($2, full_name), email = COALESCE($3, email),
+                   username = COALESCE($3, username), password_hash = COALESCE($4, password_hash), updated_at = NOW()
+                   WHERE user_id = $1
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified, created_at""",
+                user_id, full_name, email, password_hash,
+            )
+
+    async def update_admin_user(self, user_id: str, *, full_name: str | None, role: str | None, is_active: bool | None):
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """UPDATE users SET full_name = COALESCE($2, full_name), role = COALESCE($3, role),
+                   is_active = COALESCE($4, is_active), updated_at = NOW() WHERE user_id = $1
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified, created_at""",
+                user_id, full_name, role, is_active,
+            )
+
+    async def delete_user(self, user_id: str) -> bool:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchval(
+                "DELETE FROM users WHERE user_id = $1 RETURNING TRUE", user_id
+            ) is True
+
+    async def user_has_jobs(self, user_id: str) -> bool:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE user_id = $1)", user_id
+            ))
+
+    async def create_pending_user(self, email: str, password_hash: str):
+        """Create a placeholder (inactive, unverified) row keyed by email.
+
+        Used by the admin signup flow: the account is finalized once the
+        emailed 6-digit code has been confirmed (username/role/active set).
+        """
+        placeholder_username = f"pending_{secrets.token_hex(6)}"
         return await self.create_user(
-            full_name=f"Auto-created {normalized_id}",
-            username=username,
+            full_name=f"Pending {email}",
+            username=placeholder_username,
             email=email,
             password_hash=password_hash,
-            user_id=normalized_id,
+            role="user",
+            email_verified=False,
         )
+
+    async def is_valid_verification_code(self, user_id: str, token_type: str, token_hash: str) -> bool:
+        """Return True when an unused, unexpired token matches for this user."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM verification_tokens "
+                "WHERE user_id = $1 AND token_type = $2 AND token_hash = $3 "
+                "AND used_at IS NULL AND expires_at > NOW())",
+                user_id, token_type, token_hash,
+            ))
+
+    async def update_user_credentials(
+        self, user_id: str, *, password_hash: str | None, must_change_password: bool | None
+    ):
+        """Update a user's password and/or force-password-change flag."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """UPDATE users SET
+                       password_hash = COALESCE($2, password_hash),
+                       must_change_password = COALESCE($3, must_change_password),
+                       updated_at = NOW()
+                   WHERE user_id = $1
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified,
+                             must_change_password, created_at""",
+                user_id, password_hash, must_change_password,
+            )
+
+    async def set_must_change_password(self, user_id: str, value: bool):
+        """Force (or clear) the password-change requirement for a user."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """UPDATE users SET must_change_password = $2, updated_at = NOW()
+                   WHERE user_id = $1
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified,
+                             must_change_password, created_at""",
+                user_id, value,
+            )
+
+    async def finalize_pending_user(
+        self, user_id: str, *, username: str, full_name: str | None, role: str, must_change_password: bool
+    ):
+        """Promote an email-verified placeholder into a real, active account."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """UPDATE users SET
+                       username = $2,
+                       full_name = COALESCE(NULLIF($3, ''), full_name),
+                       role = $4,
+                       must_change_password = $5,
+                       is_active = TRUE,
+                       email_verified = TRUE,
+                       updated_at = NOW()
+                   WHERE user_id = $1
+                   RETURNING user_id, full_name, username, email, role, is_active, email_verified,
+                             must_change_password, created_at""",
+                user_id, username, full_name, role, must_change_password,
+            )
+
+    # ========== Verification tokens (merged: password_reset + email_verification) ==========
+
+    async def store_email_verification_token(self, user_id: str, token_hash: str, expires_minutes: int | None = None) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        minutes = expires_minutes if expires_minutes is not None else 24 * 60
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM verification_tokens WHERE user_id = $1 AND token_type = 'email_verification'",
+                user_id,
+            )
+            await conn.execute(
+                "INSERT INTO verification_tokens (token_id, user_id, token_type, token_hash, expires_at) "
+                "VALUES ($1, $2, 'email_verification', $3, NOW() + ($4 * INTERVAL '1 minute'))",
+                uuid4(), user_id, token_hash, minutes,
+            )
+
+    async def verify_email_token(self, token_hash: str) -> str | None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            async with conn.transaction():
+                token = await conn.fetchrow(
+                    "SELECT t.token_id, t.user_id, u.email FROM verification_tokens t "
+                    "JOIN users u ON u.user_id = t.user_id "
+                    "WHERE t.token_hash = $1 AND t.token_type = 'email_verification' "
+                    "AND t.used_at IS NULL AND t.expires_at > NOW() FOR UPDATE",
+                    token_hash,
+                )
+                if not token:
+                    return None
+                await conn.execute(
+                    "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE user_id = $1",
+                    token["user_id"],
+                )
+                await conn.execute(
+                    "UPDATE verification_tokens SET used_at = NOW() WHERE token_id = $1",
+                    token["token_id"],
+                )
+                return token["email"]
+
+    async def mark_email_verified(self, user_id: str) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE user_id = $1",
+                user_id,
+            )
+
+    async def email_verification_was_completed(self, token_hash: str) -> bool:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM verification_tokens "
+                "WHERE token_hash = $1 AND token_type = 'email_verification' AND used_at IS NOT NULL)",
+                token_hash,
+            ))
+
+    async def store_password_reset_token(self, user_id: str, token_hash: str, expires_minutes: int) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM verification_tokens WHERE user_id = $1 AND token_type = 'password_reset' OR expires_at <= NOW()",
+                user_id,
+            )
+            await conn.execute(
+                "INSERT INTO verification_tokens (token_id, user_id, token_type, token_hash, expires_at) "
+                "VALUES ($1, $2, 'password_reset', $3, NOW() + ($4 * INTERVAL '1 minute'))",
+                uuid4(), user_id, token_hash, expires_minutes,
+            )
+
+    async def consume_password_reset_token(self, token_hash: str, password_hash: str) -> str | None:
+        """Use a valid one-time token and update the password atomically."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            async with conn.transaction():
+                token = await conn.fetchrow(
+                    "SELECT t.token_id, t.user_id, u.email FROM verification_tokens t "
+                    "JOIN users u ON u.user_id = t.user_id "
+                    "WHERE t.token_hash = $1 AND t.token_type = 'password_reset' "
+                    "AND t.used_at IS NULL AND t.expires_at > NOW() FOR UPDATE",
+                    token_hash,
+                )
+                if not token:
+                    return None
+                await conn.execute(
+                    "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE user_id = $2",
+                    password_hash, token["user_id"],
+                )
+                await conn.execute(
+                    "UPDATE verification_tokens SET used_at = NOW() WHERE token_id = $1",
+                    token["token_id"],
+                )
+                await conn.execute(
+                    "UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+                    token["user_id"],
+                )
+                return token["email"]
+
+    # ========== Auth sessions (DB-backed refresh tokens) ==========
+
+    async def create_auth_session(self, user_id: str, session_id: str, expires_days: int) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO auth_sessions (session_id, user_id, expires_at) "
+                "VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 day'))",
+                session_id, user_id, expires_days,
+            )
+
+    async def is_auth_session_active(self, session_id: str) -> bool:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM auth_sessions "
+                "WHERE session_id = $1 AND revoked_at IS NULL AND expires_at > NOW())",
+                session_id,
+            ))
+
+    async def revoke_auth_session(self, session_id: str) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE auth_sessions SET revoked_at = NOW() WHERE session_id = $1",
+                session_id,
+            )
+
+    async def revoke_all_auth_sessions(self, user_id: str) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+                user_id,
+            )
+
+    # ========== Audit logs ==========
+
+    async def record_audit_event(
+        self, *, actor_user_id: str | None, action: str,
+        target_type: str, target_id: str | None, details: str = ""
+    ) -> None:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, details) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                actor_user_id, action, target_type, target_id, details,
+            )
+
+    async def list_audit_logs(self, limit: int = 100):
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT audit_id, actor_user_id, action, target_type, target_id, details, created_at "
+                "FROM audit_logs ORDER BY created_at DESC LIMIT $1",
+                limit,
+            )
+
+    async def count_jobs_today(self, user_id: str) -> int:
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM jobs WHERE user_id = $1 AND created_at >= CURRENT_DATE",
+                user_id,
+            )
 
     # Note: callers should provide a valid existing `user_id` (e.g. 'USR12345')
     # or call `ensure_user()` first to auto-create a placeholder collaborator.
@@ -230,7 +602,7 @@ class PostgreSQLClient:
         if not self.system_pool:
             raise RuntimeError("Database not connected")
         async with self.system_pool.acquire() as conn:
-            return await conn.fetchrow(
+            row = await conn.fetchrow(
                 """INSERT INTO jobs (user_id, url, language, status)
                    VALUES ($1, $2, $3, 'pending')
                    RETURNING job_id, user_id, url, language, status, created_at""",
@@ -238,6 +610,15 @@ class PostgreSQLClient:
                 url,
                 language,
             )
+        await self._publish_job_event(
+            event="job_created",
+            job_id=row["job_id"],
+            status=row["status"],
+            user_id=row["user_id"],
+            url=row["url"],
+            created_at=row["created_at"].isoformat() if row["created_at"] else None,
+        )
+        return row
 
     async def get_job(self, job_id: str):
         """Get job from duka_system.jobs by job_id (e.g. 'JOB00000001')"""
@@ -273,12 +654,27 @@ class PostgreSQLClient:
                     )
             else:
                 await conn.execute("UPDATE jobs SET status = $1 WHERE job_id = $2", status, job_id)
+        await self._publish_job_event(event="job_status", job_id=job_id, status=status)
+
+    async def get_job_failure_reason(self, job_id: str) -> str | None:
+        """Return the most recent crawl_log error detail for a failed job."""
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchval(
+                """SELECT details FROM crawl_log
+                   WHERE job_id = $1
+                     AND (status = 'failed' OR event_type ILIKE '%error%' OR event_type ILIKE '%failed%')
+                     AND details IS NOT NULL AND details <> ''
+                   ORDER BY created_at DESC LIMIT 1""",
+                job_id,
+            )
 
     async def allocate_item_id(self) -> str:
-        """Allocate a duka_db item_id before raw/log records are written."""
-        if not self.db_pool:
+        """Allocate an item_id before raw/log records are written."""
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             return await conn.fetchval("SELECT 'ITEM' || LPAD(nextval('item_seq')::TEXT, 8, '0')")
 
     async def record_crawl_log(
@@ -292,10 +688,10 @@ class PostgreSQLClient:
         retry_count: int = 0,
         details: str | None = None,
     ):
-        """Persist a structured crawl outcome in duka_db.crawl_log."""
-        if not self.db_pool:
+        """Persist a structured crawl outcome in crawl_log."""
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO crawl_log (job_id, item_id, url, worker_type, event_type, status, retry_count, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 job_id, item_id, url, worker_type, event_type, status, retry_count, details,
@@ -325,12 +721,12 @@ class PostgreSQLClient:
             external_links: List of {url, domain, anchor_text} dicts
             auto_approved_domains: Domains to auto-approve (e.g. ['github.com'])
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
 
         auto_approved_domains = [d.lower() for d in (auto_approved_domains or [])]
 
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             for link in external_links:
                 domain = link.get("domain", "")
                 status = "auto_approved" if domain.lower() in auto_approved_domains else "pending"
@@ -352,9 +748,9 @@ class PostgreSQLClient:
         status: str | None = None,
     ) -> list[dict]:
         """Get discovered external links for a job, optionally filtered by status."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             if status:
                 rows = await conn.fetch(
                     "SELECT id, parent_url, discovered_url, discovered_domain, "
@@ -382,9 +778,9 @@ class PostgreSQLClient:
         Returns a list of {domain, link_count, status_summary} dicts,
         grouped by domain so the user can approve/reject entire domains.
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT discovered_domain,
                           COUNT(*) AS link_count,
@@ -407,9 +803,9 @@ class PostgreSQLClient:
         domains: list[str] | None = None,
     ) -> int:
         """Approve external links by ID or by domain. Returns count approved."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             if link_ids:
                 result = await conn.execute(
                     """UPDATE discovered_external_links
@@ -436,9 +832,9 @@ class PostgreSQLClient:
         domains: list[str] | None = None,
     ) -> int:
         """Reject external links by ID or by domain. Returns count rejected."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             if link_ids:
                 result = await conn.execute(
                     """UPDATE discovered_external_links
@@ -462,9 +858,9 @@ class PostgreSQLClient:
         job_id: str,
     ) -> list[str]:
         """Get all approved (including auto_approved) external URLs for a job."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT discovered_url FROM discovered_external_links
                    WHERE job_id = $1 AND status IN ('approved', 'auto_approved')""",
@@ -484,9 +880,9 @@ class PostgreSQLClient:
         Returns the existing fingerprint row if found and fresh,
         None if not found or stale.
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT cf.*, pi.title, pi.parsed_json_path, pi.raw_html_path,
                           pi.source_url, pi.worker_type
@@ -515,9 +911,9 @@ class PostgreSQLClient:
 
         Returns the existing fingerprint row if content matches and is fresh.
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT cf.*, pi.title, pi.parsed_json_path, pi.raw_html_path,
                           pi.source_url, pi.worker_type
@@ -548,9 +944,9 @@ class PostgreSQLClient:
         For production scale, this would use a dedicated LSH index;
         for current volumes, a sequential scan is fine.
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             # Fetch recent fingerprints (last 7 days max for scan efficiency)
             rows = await conn.fetch(
                 """SELECT cf.*, pi.title, pi.parsed_json_path, pi.raw_html_path,
@@ -610,9 +1006,9 @@ class PostgreSQLClient:
             duplicate_of: If this is a duplicate, the original item_id
             duplicate_type: 'url_exact', 'content_exact', or 'near_duplicate'
         """
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO content_fingerprints
                    (job_id, item_id, url, url_fingerprint, content_fingerprint,
@@ -627,9 +1023,9 @@ class PostgreSQLClient:
 
     async def get_fingerprint_by_item(self, item_id: str) -> dict | None:
         """Get the fingerprint record for a parsed item."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM content_fingerprints WHERE item_id = $1",
                 item_id,
@@ -638,9 +1034,9 @@ class PostgreSQLClient:
 
     async def get_duplicates_of(self, item_id: str) -> list[dict]:
         """Get all items that are duplicates of a given item."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT cf.*, pi.title, pi.source_url
                    FROM content_fingerprints cf
@@ -653,9 +1049,9 @@ class PostgreSQLClient:
 
     async def get_dedup_stats(self, job_id: str) -> dict:
         """Get deduplication statistics for a job."""
-        if not self.db_pool:
+        if not self.system_pool:
             await self.connect()
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             total = await conn.fetchval(
                 "SELECT COUNT(*) FROM content_fingerprints WHERE job_id = $1",
                 job_id,
@@ -686,7 +1082,16 @@ class PostgreSQLClient:
             "dedup_rate": round((url_dups + content_dups + near_dups) / max(total, 1) * 100, 1),
         }
 
-    # ========== duka_db queries (parsed items) ==========
+    # ========== duka_system queries (parsed items) ==========
+
+    async def _publish_job_event(self, **payload) -> None:
+        """Best-effort Redis notification of a job event (never raises)."""
+        try:
+            from app.common.job_events import publish_job_event
+
+            await publish_job_event(**payload)
+        except Exception:
+            pass
 
     async def create_parsed_item(
         self,
@@ -702,18 +1107,18 @@ class PostgreSQLClient:
         character_count: int | None = None,
         word_count: int | None = None,
     ):
-        """Create parsed item metadata in duka_db.parsed_items.
+        """Create parsed item metadata in duka_system.parsed_items.
 
         The worker assignment is stored here because the same job can contain
         multiple parsed items, each processed by a single worker.
         """
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
 
         normalized_publish_date = _coerce_publish_date(publish_date)
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             if item_id:
-                return await conn.fetchrow(
+                row = await conn.fetchrow(
                     """INSERT INTO parsed_items (
                           item_id, job_id, source_url, language, worker_type, title, publish_date,
                           character_count, word_count, raw_html_path, parsed_json_path
@@ -733,62 +1138,70 @@ class PostgreSQLClient:
                     raw_html_path,
                     parsed_json_path,
                 )
+            else:
+                row = await conn.fetchrow(
+                    """INSERT INTO parsed_items (
+                          job_id, source_url, language, worker_type, title, publish_date,
+                          character_count, word_count, raw_html_path, parsed_json_path
+                       )
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                       ON CONFLICT (job_id, source_url) DO UPDATE SET source_url = EXCLUDED.source_url
+                       RETURNING item_id, job_id, source_url, language, worker_type, parsed_at""",
+                    job_id,
+                    source_url,
+                    language,
+                    worker_type,
+                    title,
+                    normalized_publish_date,
+                    character_count,
+                    word_count,
+                    raw_html_path,
+                    parsed_json_path,
+                )
 
-            return await conn.fetchrow(
-                """INSERT INTO parsed_items (
-                      job_id, source_url, language, worker_type, title, publish_date,
-                      character_count, word_count, raw_html_path, parsed_json_path
-                   )
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                   ON CONFLICT (job_id, source_url) DO UPDATE SET source_url = EXCLUDED.source_url
-                   RETURNING item_id, job_id, source_url, language, worker_type, parsed_at""",
-                job_id,
-                source_url,
-                language,
-                worker_type,
-                title,
-                normalized_publish_date,
-                character_count,
-                word_count,
-                raw_html_path,
-                parsed_json_path,
+        if row:
+            await self._publish_job_event(
+                event="item_parsed",
+                job_id=row["job_id"],
+                item_id=row["item_id"],
             )
+        return row
 
     async def mark_item_intelligence_processed(self, item_id: str):
         """Flag a parsed item as processed by the LLM intelligence worker."""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute("UPDATE parsed_items SET intelligence_processed = TRUE WHERE item_id = $1", item_id)
 
     async def get_parsed_item(self, item_id: str):
-        """Get parsed item from duka_db.parsed_items by item_id (e.g. 'ITEM00000001')"""
-        if not self.db_pool:
+        """Get parsed item from duka_system.parsed_items by item_id (e.g. 'ITEM00000001')"""
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM parsed_items WHERE item_id = $1", item_id)
 
     async def get_parsed_items_by_job(self, job_id: str):
         """Get all parsed items for a job"""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM parsed_items WHERE job_id = $1", job_id)
 
     async def mark_item_exported(self, item_id: str):
         """Mark a parsed item as exported"""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute("UPDATE parsed_items SET is_exported = TRUE WHERE item_id = $1", item_id)
 
-    # ========== duka_db queries (exports) ==========
+    # ========== duka_system queries (exports) ==========
 
     async def create_export(self, job_id: str, export_type: str, file_path: str, item_count: int | None = None):
-        """Create export record in duka_db.exports. export_id is auto-generated (e.g. EXP00000001)."""
-        if not self.db_pool:
+        """Create export record in duka_system.exports. export_id is auto-generated (e.g. EXP00000001)."""
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             return await conn.fetchrow(
                 """INSERT INTO exports (job_id, export_type, file_path, status, item_count)
                    VALUES ($1, $2, $3, 'pending', $4)
@@ -801,9 +1214,9 @@ class PostgreSQLClient:
 
     async def update_export_status(self, export_id: str, status: str, file_size_mb: float | None = None):
         """Update export status and optional file size"""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE exports SET status = $1, file_size_mb = COALESCE($2, file_size_mb) WHERE export_id = $3",
                 status,
@@ -813,16 +1226,16 @@ class PostgreSQLClient:
 
     async def update_export_file_path(self, export_id: str, file_path: str):
         """Update the stored MinIO path for an export."""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             await conn.execute("UPDATE exports SET file_path = $1 WHERE export_id = $2", file_path, export_id)
 
     async def get_exports_by_job(self, job_id: str):
         """Get all exports for a job"""
-        if not self.db_pool:
+        if not self.system_pool:
             raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+        async with self.system_pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM exports WHERE job_id = $1", job_id)
 
     async def _create_database_if_missing(self, admin_conn, database_name: str):
@@ -839,18 +1252,30 @@ class PostgreSQLClient:
             logger.info(f"PostgreSQL database already exists: {database_name}")
 
     async def _ensure_duka_system_schema(self):
-        """Create the duka_system schema objects if they are missing."""
+        """Create the duka_system schema objects if they are missing.
+
+        This is a safety net for when the SQL init file didn't run
+        (e.g. connecting to an existing database). The SQL file at
+        database/postgres/01_duka_system.sql is the primary source of truth.
+        """
         if not self.system_pool:
             raise RuntimeError("Database not connected")
         async with self.system_pool.acquire() as conn:
+            # --- Sequences ---
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS job_seq START 1 INCREMENT 1")
+            await conn.execute("CREATE SEQUENCE IF NOT EXISTS item_seq START 1 INCREMENT 1")
+            await conn.execute("CREATE SEQUENCE IF NOT EXISTS export_seq START 1 INCREMENT 1")
+
+            # --- Helper function ---
             await conn.execute(
-                    "CREATE OR REPLACE FUNCTION generate_user_id() "
-                    "RETURNS VARCHAR AS $$ DECLARE new_id VARCHAR(8); "
-                    "BEGIN LOOP new_id := 'USR' || LPAD((FLOOR(RANDOM() * 90000) + 10000)::TEXT, 5, '0'); "
-                    "EXIT WHEN NOT EXISTS (SELECT 1 FROM users WHERE user_id = new_id); "
-                    "END LOOP; RETURN new_id; END; $$ LANGUAGE plpgsql;"
+                "CREATE OR REPLACE FUNCTION generate_user_id() "
+                "RETURNS VARCHAR AS $$ DECLARE new_id VARCHAR(8); "
+                "BEGIN LOOP new_id := 'USR' || LPAD((FLOOR(RANDOM() * 90000) + 10000)::TEXT, 5, '0'); "
+                "EXIT WHEN NOT EXISTS (SELECT 1 FROM users WHERE user_id = new_id); "
+                "END LOOP; RETURN new_id; END; $$ LANGUAGE plpgsql;"
             )
+
+            # --- Users (with RBAC columns) ---
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS users ("
                 "    user_id VARCHAR(8) PRIMARY KEY DEFAULT generate_user_id(),"
@@ -858,8 +1283,80 @@ class PostgreSQLClient:
                 "    username VARCHAR(100) NOT NULL UNIQUE,"
                 "    email VARCHAR(255) NOT NULL UNIQUE,"
                 "    password_hash VARCHAR(255) NOT NULL,"
-                "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                "    role VARCHAR(20) DEFAULT 'user',"
+                "    is_active BOOLEAN DEFAULT TRUE,"
+                "    email_verified BOOLEAN DEFAULT FALSE,"
+                "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                "    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ")"
+            )
+            # Add missing columns to existing users table (idempotent)
+            for col_ddl in [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user'",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            ]:
+                await conn.execute(col_ddl)
+
+            # --- Verification tokens (email verification + password reset) ---
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS verification_tokens (
+    token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(8) NOT NULL,
+    token_type VARCHAR(30) NOT NULL CHECK (token_type IN ('email_verification', 'password_reset')),
+    token_hash VARCHAR(255) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_vt_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+)"""
+            )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_vt_token_hash ON verification_tokens(token_hash)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_vt_user_type ON verification_tokens(user_id, token_type)")
+
+            # --- Auth sessions (DB-backed refresh token revocation) ---
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS auth_sessions (
+    session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(8) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    revoked_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_session_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+)"""
+            )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_session_user ON auth_sessions(user_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_session_active ON auth_sessions(user_id, revoked_at, expires_at)")
+
+            # --- Audit logs ---
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS audit_logs (
+    audit_id BIGSERIAL PRIMARY KEY,
+    actor_user_id VARCHAR(8),
+    action VARCHAR(100) NOT NULL,
+    target_type VARCHAR(50) NOT NULL,
+    target_id VARCHAR(100),
+    details TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)"""
+            )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_user_id, created_at DESC)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, created_at DESC)")
+
+            # --- Jobs ---
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS jobs (
+    job_id VARCHAR(11) PRIMARY KEY DEFAULT ('JOB' || LPAD(nextval('job_seq')::TEXT, 8, '0')),
+    user_id VARCHAR(8) NOT NULL,
+    url TEXT NOT NULL,
+    language VARCHAR(10) DEFAULT 'am',
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','skipped','needs_review')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    CONSTRAINT fk_jobs_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+)"""
             )
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (
@@ -883,6 +1380,7 @@ class PostgreSQLClient:
                 """CREATE TABLE IF NOT EXISTS credential_usage (
     email VARCHAR(255) NOT NULL,
     domain VARCHAR(255),
+    username VARCHAR(100),
     password_hash VARCHAR(255) NOT NULL,
     display_name VARCHAR(100),
     provider VARCHAR(50) DEFAULT 'custom',
@@ -899,9 +1397,7 @@ class PostgreSQLClient:
     error_message TEXT,
     portal_config JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_used_at TIMESTAMP,
-    CONSTRAINT pk_credential_usage PRIMARY KEY (email, domain),
-    CONSTRAINT uq_credential_usage_email UNIQUE (email)
+    last_used_at TIMESTAMP,                   CONSTRAINT uq_credential_usage_email UNIQUE (email, domain)
 )
 """
             )
@@ -911,14 +1407,17 @@ class PostgreSQLClient:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_credential_usage_status ON credential_usage(status)"
             )
+            # Add username column if missing (migration for existing databases)
+            await conn.execute(
+                "ALTER TABLE credential_usage ADD COLUMN IF NOT EXISTS username VARCHAR(100)"
+            )
+            # Reversible encrypted site password so stored credentials can be
+            # reused for automatic logins on later crawls (bcrypt hashes cannot).
+            await conn.execute(
+                "ALTER TABLE credential_usage ADD COLUMN IF NOT EXISTS password_enc TEXT"
+            )
 
-        logger.info("Ensured duka_system schema exists.")
-
-    async def _ensure_duka_db_schema(self):
-        """Create the duka_db schema objects if they are missing."""
-        if not self.db_pool:
-            raise RuntimeError("Database not connected")
-        async with self.db_pool.acquire() as conn:
+            # --- Parsed items ---
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS item_seq START 1 INCREMENT 1")
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS export_seq START 1 INCREMENT 1")
             await conn.execute(
@@ -949,6 +1448,14 @@ class PostgreSQLClient:
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_parsed_items_job_source_url
                    ON parsed_items(job_id, source_url)"""
             )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_job ON parsed_items(job_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_url ON parsed_items(source_url)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_language ON parsed_items(language)")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_parsed_items_intelligence_processed ON parsed_items(intelligence_processed)"
+            )
+
+            # --- Exports ---
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS exports (
     export_id VARCHAR(11) PRIMARY KEY DEFAULT ('EXP' || LPAD(nextval('export_seq')::TEXT, 8, '0')),
@@ -962,6 +1469,9 @@ class PostgreSQLClient:
 )
 """
             )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_exports_job ON exports(job_id)")
+
+            # --- Crawl log ---
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS crawl_log (
     log_id BIGSERIAL PRIMARY KEY,
@@ -977,13 +1487,6 @@ class PostgreSQLClient:
 )
 """
             )
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_job ON parsed_items(job_id)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_url ON parsed_items(source_url)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_parsed_items_language ON parsed_items(language)")
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_parsed_items_intelligence_processed ON parsed_items(intelligence_processed)"
-            )
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_exports_job ON exports(job_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_crawl_log_job ON crawl_log(job_id, created_at DESC)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_crawl_log_item ON crawl_log(item_id, created_at DESC)")
 
@@ -1045,7 +1548,8 @@ class PostgreSQLClient:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fp_job ON content_fingerprints(job_id)"
             )
-            logger.info("Ensured duka_db schema exists.")
+
+        logger.info("Ensured duka_system schema exists.")
 
 
 # Global PostgreSQL client instance

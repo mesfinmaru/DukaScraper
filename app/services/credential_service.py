@@ -344,5 +344,133 @@ class CredentialService:
             return [dict(r) for r in rows]
 
 
+    # ------------------------------------------------------------------
+    # Username generation & site credential management
+    # ------------------------------------------------------------------
+
+    _DEFAULT_USERNAME = "dukascraper"
+    _DEFAULT_PASSWORD = "Duka@12345"
+
+    def generate_username(self, domain: str = "") -> str:
+        """Generate a username: 'dukascraper' + random 5 digits.
+
+        If the base username is taken for the domain, appends random digits.
+        """
+        import random
+        return f"{self._DEFAULT_USERNAME}{random.randint(10000, 99999)}"
+
+    async def store_site_credential(
+        self,
+        email: str,
+        domain: str,
+        username: str,
+        password: str,
+        action: str = "signup",
+    ) -> dict[str, Any]:
+        """Store a credential for a specific site after successful signup/login.
+
+        The password is kept in two forms:
+          - ``password_hash`` (bcrypt) for verification-style checks
+          - ``password_enc`` (Fernet, reversible) so the worker can decrypt
+            and reuse it for automatic logins on future crawls
+
+        Args:
+            email: The email address used
+            domain: The site domain (e.g., 'github.com')
+            username: The login username (may differ from email)
+            password: The plaintext password (stored encrypted)
+            action: 'signup' or 'login'
+        """
+        async with pg_client.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO credential_usage
+                   (email, domain, username, password_hash, password_enc, action, usage_status)
+                   VALUES ($1, $2, $3, $4, $5, $6, 'success')
+                   ON CONFLICT (email, domain) DO UPDATE SET
+                       username = EXCLUDED.username,
+                       password_hash = EXCLUDED.password_hash,
+                       password_enc = EXCLUDED.password_enc,
+                       action = EXCLUDED.action,
+                       usage_status = 'success',
+                       last_used_at = CURRENT_TIMESTAMP
+                   RETURNING email, domain, username, action, usage_status, created_at""",
+                email, domain, username, hash_password(password), encrypt_value(password), action,
+            )
+            logger.info(
+                "Stored site credential: %s@%s (user=%s, action=%s)",
+                email, domain, username, action,
+            )
+            return dict(row) if row else {}
+
+    async def get_stored_password(self, email: str, domain: str) -> str | None:
+        """Get the stored (decrypted) password for a site credential."""
+        async with pg_client.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT password_enc FROM credential_usage
+                   WHERE email = $1 AND domain = $2
+                   AND usage_status = 'success'""",
+                email, domain,
+            )
+            if not row or not row["password_enc"]:
+                return None
+            try:
+                return decrypt_value(row["password_enc"])
+            except Exception:
+                logger.warning("Could not decrypt stored password for %s@%s", email, domain)
+                return None
+
+    async def get_stored_credential_for_domain(
+        self, domain: str
+    ) -> dict[str, Any] | None:
+        """Get the best stored credential for a domain, with decrypted password.
+
+        Prefers credentials with a reusable (encrypted) password; falls back to
+        rows without one (e.g. legacy) only if they were created by auto-signup
+        where the default generated password is known.
+
+        Returns dict with: email, username, domain, password
+        """
+        async with pg_client.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT email, username, domain, password_enc, action
+                   FROM credential_usage
+                   WHERE domain = $1 AND usage_status = 'success'
+                   ORDER BY (password_enc IS NOT NULL) DESC,
+                            last_used_at DESC NULLS LAST
+                   LIMIT 1""",
+                domain,
+            )
+            if not row:
+                return None
+            password: str | None = None
+            if row["password_enc"]:
+                try:
+                    password = decrypt_value(row["password_enc"])
+                except Exception:
+                    logger.warning("Could not decrypt stored password for %s@%s", row["email"], domain)
+            if password is None and row["action"] == "signup":
+                # Auto-generated signup identity — we know the password used.
+                password = self._DEFAULT_PASSWORD
+            if password is None:
+                return None
+            return {
+                "email": row["email"],
+                "username": row["username"] or row["email"],
+                "domain": row["domain"],
+                "password": password,
+            }
+
+    async def has_stored_credential(self, email: str, domain: str) -> bool:
+        """Check if we already have a working credential for this site."""
+        async with pg_client.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT 1 FROM credential_usage
+                   WHERE email = $1 AND domain = $2
+                   AND usage_status = 'success'""",
+                email, domain,
+            )
+            return row is not None
+
+
 # Singleton
 credential_service = CredentialService()

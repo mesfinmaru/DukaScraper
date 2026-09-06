@@ -15,9 +15,9 @@ services:
     image: postgres:16-alpine
     container_name: postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: duka
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-duka_system}
     ports:
     - 5432:5432
     volumes:
@@ -29,7 +29,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - pg_isready -U postgres -d duka
+      - pg_isready -U postgres -d duka_system
       interval: 5s
       timeout: 5s
       retries: 5
@@ -38,7 +38,7 @@ services:
     container_name: pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
     ports:
     - 5050:80
     volumes:
@@ -204,8 +204,8 @@ services:
     image: minio/minio:latest
     container_name: minio
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
     - 9000:9000
     - 9001:9001
@@ -238,7 +238,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - curl -f http://localhost:6333/health || exit 1
+      - bash -c 'echo -e "GET /health HTTP/1.0\r\n\r\n" > /dev/tcp/127.0.0.1/6333'
       interval: 20s
       timeout: 10s
       retries: 10
@@ -256,7 +256,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - curl -f http://localhost:11434/api/tags || exit 1
+      - bash -c 'echo -e "GET /api/tags HTTP/1.0\r\n\r\n" > /dev/tcp/127.0.0.1/11434'
       interval: 30s
       timeout: 10s
       retries: 10
@@ -301,17 +301,24 @@ services:
       context: .
       dockerfile: workers/surface-worker/Dockerfile
     container_name: surface-worker
-    restart: on-failure:5
+    restart: unless-stopped
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     - PROXY_POOL=socks5h://tor:9050
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       kafka:
         condition: service_healthy
@@ -324,38 +331,56 @@ services:
       context: .
       dockerfile: workers/parser-worker/Dockerfile
     container_name: parser-worker
-    restart: on-failure:5
+    restart: unless-stopped
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     - CLICKHOUSE_HOST=clickhouse
     - CLICKHOUSE_HTTP_PORT=8123
     - CLICKHOUSE_DB=duka_scraper
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       kafka:
         condition: service_healthy
       minio:
         condition: service_healthy
   deep-worker:
-    image: duka_scraper-deep-worker-patched
+    build:
+      context: .
+      dockerfile: workers/deep-worker/Dockerfile
     container_name: deep-worker
-    restart: on-failure:5
+    restart: unless-stopped
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     - PROXY_POOL=socks5h://tor:9050
+    - RESIDENTIAL_PROXY=${RESIDENTIAL_PROXY:-}
+    - DISPLAY=:99
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
@@ -382,17 +407,25 @@ services:
       context: .
       dockerfile: workers/dark-worker/Dockerfile
     container_name: dark-worker
-    restart: on-failure:5
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "-c", "pip install httpx-socks socksio -q && exec /wait_for_kafka.sh python workers/dark-worker/main.py"]
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     - TOR_SOCKS5_PROXY=socks5h://tor:9050
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
@@ -405,13 +438,13 @@ services:
       context: .
       dockerfile: workers/llm-worker/Dockerfile
     container_name: llm-worker
-    restart: on-failure:10
+    restart: unless-stopped
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     - LLM_PROVIDER=hosted
     - HOSTED_LLM_URL=https://api.groq.com/openai/v1/chat/completions
-    - HOSTED_LLM_API_KEY=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
+    - HOSTED_LLM_API_KEY=${HOSTED_LLM_API_KEY}
     - HOSTED_LLM_MODEL=openai/gpt-oss-120b
     - CH_HOST=clickhouse
     - CH_PORT=8123
@@ -422,12 +455,19 @@ services:
     - EMBEDDING_MODEL=nomic-embed-text
     - VECTOR_DB_URL=http://qdrant:6333
     - VECTOR_DB_COLLECTION=duka_articles
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
@@ -438,16 +478,23 @@ services:
       context: .
       dockerfile: workers/exporter-worker/Dockerfile
     container_name: exporter-worker
-    restart: on-failure:5
+    restart: unless-stopped
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - HEALTH_PORT=8080
     volumes:
     - .:/app
     extra_hosts:
     - host.docker.internal:host-gateway
     networks:
     - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       kafka:
         condition: service_healthy
@@ -462,6 +509,22 @@ services:
     - 9090:9090
     volumes:
     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    - ./monitoring/alerts:/etc/prometheus/rules
+    networks:
+    - duka-net
+    restart: always
+    depends_on:
+    - alertmanager
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    ports:
+    - 9093:9093
+    volumes:
+    - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    environment:
+    - PAGERDUTY_SERVICE_KEY=${PAGERDUTY_SERVICE_KEY:-}
+    - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
     networks:
     - duka-net
     restart: always
@@ -470,6 +533,17 @@ services:
     container_name: grafana
     ports:
     - 3000:3000
+    volumes:
+    - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+    - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+    - GF_SECURITY_ADMIN_USER=admin
+    - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    # Allow the dashboard to be embedded in the UI's Monitoring page iframe.
+    - GF_ALLOW_EMBEDDING=true
+    - GF_AUTH_ANONYMOUS_ENABLED=true
+    - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    - GF_AUTH_BASIC_ENABLED=false
     networks:
     - duka-net
     restart: always

@@ -8,7 +8,9 @@ This module contains common dependencies that all workers use:
 - Proxy management (shared across all workers)
 """
 
+import hashlib
 import os
+from urllib.parse import urlparse
 
 from app.common.config.settings import settings
 from app.common.constants.worker_assignment import (
@@ -27,6 +29,14 @@ _PROXY_RAW: str = os.getenv("PROXY_POOL", settings.proxy_pool)
 _proxy_list: list[str] = [p.strip() for p in _PROXY_RAW.split(",") if p.strip()] if _PROXY_RAW else []
 shared_proxy_manager = ProxyManager(_proxy_list)
 
+
+def build_unique_crawl_object_name(job_id: str, url: str, *, extension: str = ".json") -> str:
+    """Return a stable, collision-resistant object name for one crawled URL."""
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    host = (urlparse(url).hostname or "unknown").replace(".", "_")
+    suffix = extension if extension.startswith(".") else f".{extension}"
+    return f"{job_id}/{host}_{digest}{suffix}"
+
 __all__ = [
     "DedupService",
     "LinkExtractionService",
@@ -38,4 +48,5 @@ __all__ = [
     "ProxyManager",
     "parse_proxy_url",
     "shared_proxy_manager",
+    "build_unique_crawl_object_name",
 ]

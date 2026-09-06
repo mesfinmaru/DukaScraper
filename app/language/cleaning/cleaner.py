@@ -67,8 +67,8 @@ def clean_and_extract_text(raw_html_or_text: str, language: str, *, preserve_amh
 
     # Ethiopic-script languages (Amharic, Tigrinya, Gurage, etc.)
     ETHIOOPIC_LANGS = {"am", "ti", "sg", "sid"}
-    # Latin-script languages
-    LATIN_LANGS = {"en", "om", "so", "fr", "es", "de", "it", "pt", "sw", "tr"}
+    # Latin-script languages the detector actually produces
+    LATIN_LANGS = {"en", "om", "so"}
 
     def _language_ratio(text: str, lang: str) -> float:
         if not text:
@@ -86,14 +86,20 @@ def clean_and_extract_text(raw_html_or_text: str, language: str, *, preserve_amh
             return (latin_chars / total_alpha) if total_alpha else 0.0
         return 0.0
 
+    # Threshold 0.25 (was 0.4): more permissive for mixed-language pages
+    # where Amharic content is interleaved with English dates, numbers,
+    # and navigation text.  Captures short Amharic sentences that the
+    # stricter threshold silently dropped.
+    _LANG_RATIO_THRESHOLD = 0.25
+
     if target_lang in ETHIOOPIC_LANGS:
-        ethiopic_paragraphs = [p for p in paragraphs if _language_ratio(p, target_lang) >= 0.4]
+        ethiopic_paragraphs = [p for p in paragraphs if _language_ratio(p, target_lang) >= _LANG_RATIO_THRESHOLD]
         if not ethiopic_paragraphs:
             return ""
         return normalize_text("\n".join(ethiopic_paragraphs))
 
     if target_lang in LATIN_LANGS:
-        latin_paragraphs = [p for p in paragraphs if _language_ratio(p, target_lang) >= 0.4]
+        latin_paragraphs = [p for p in paragraphs if _language_ratio(p, target_lang) >= _LANG_RATIO_THRESHOLD]
         if not latin_paragraphs:
             return ""
         return normalize_text("\n".join(latin_paragraphs))

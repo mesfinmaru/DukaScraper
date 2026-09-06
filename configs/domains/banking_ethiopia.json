@@ -1,0 +1,40 @@
+{
+    "domain": "mobilebanking.cbe.com.et",
+    "name": "CBE (Commercial Bank of Ethiopia)",
+    "description": "CBE mobile banking portal — username + PIN/password. Use with caution — banking sites have strong anti-bot measures.",
+    "handle_http_interstitial": true,
+    "login_url": "https://mobilebanking.cbe.com.et",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[type='text'], input[name='username'], input[name='user'], #username, input[placeholder*='user'], input[placeholder*='ID']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill username / account number"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='password'], input[name='pin'], #password",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password / PIN"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In')",
+            "wait_after_ms": 5000,
+            "description": "Click Login button"
+        }
+    ],
+    "post_login_targets": [
+        "/dashboard"
+    ],
+    "extraction_targets": [
+        {
+            "name": "account_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 10000) : '' }; })()",
+            "description": "Extract account balance and transaction data"
+        }
+    ]
+}

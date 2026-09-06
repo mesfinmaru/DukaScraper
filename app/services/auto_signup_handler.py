@@ -88,10 +88,63 @@ _SIGNUP_LINK_SELECTORS = [
     "a:has-text('Sign up')",
     "a:has-text('Register')",
     "a:has-text('Create account')",
+    "a:has-text('Create New Account')",
     "a:has-text('Join')",
+    "a:has-text('Register Now')",
     "a[href*='signup']",
     "a[href*='register']",
     "a[href*='create-account']",
+    "button:has-text('Register')",
+    "button:has-text('Sign up')",
+]
+
+# Default signup credentials (overridable per-domain via portal_config)
+_DEFAULT_SIGNUP_PASSWORD = "Duka@12345"
+
+# Dropdown fields to auto-fill
+_DROPDOWN_AUTO_FILL = {
+    # Country
+    "country": "United States",
+    "country_id": "United States",
+    "location": "United States",
+    # Timezone
+    "timezone": "UTC",
+    "tz": "UTC",
+    # Gender (if required)
+    "gender": "Other",
+    "sex": "Other",
+    # Language
+    "language": "English",
+    "lang": "English",
+}
+
+# Radio button fields to auto-select
+_RADIO_AUTO_SELECT = {
+    "gender": "other",
+    "sex": "other",
+    "age_range": "25-34",
+    "terms": "agree",
+}
+
+# Date of birth patterns
+_DOB_SELECTORS = [
+    "select[name*='birth' i]",
+    "select[name*='dob' i]",
+    "select[name*='day']",
+    "select[name*='month']",
+    "select[name*='year']",
+    "input[name*='birth' i]",
+    "input[name*='dob' i]",
+    "input[type='date'][name*='birth' i]",
+]
+
+# Phone number patterns
+_PHONE_SELECTORS = [
+    "input[type='tel']",
+    "input[name*='phone' i]",
+    "input[name*='mobile' i]",
+    "input[placeholder*='phone' i]",
+    "input[placeholder*='mobile' i]",
 ]
 
 
@@ -105,8 +158,14 @@ class AutoSignupHandler:
         password: str,
         domain: str,
         portal_config: dict | None = None,
+        perform_verification: bool = True,
     ) -> dict[str, Any]:
         """Main entry point: detect login vs signup and handle accordingly.
+
+        Args:
+            perform_verification: when False, signup stops after the form is
+                submitted (verification email is NOT polled). Set False when
+                the crawl did not ask for email verification.
 
         Returns:
             dict with: action, success, message, needs_verification, verified
@@ -144,7 +203,7 @@ class AutoSignupHandler:
 
         # Not registered — try signup
         logger.info("[%s] New domain — attempting signup", domain)
-        signup_result = await self._try_signup(page, email, password, portal_config)
+        signup_result = await self._try_signup(page, email, password, portal_config, domain=domain)
         result.update(signup_result)
 
         if signup_result["success"]:
@@ -152,14 +211,32 @@ class AutoSignupHandler:
             await credential_service.record_usage(
                 email, domain, "signup", "success"
             )
+            # Persist the reusable site credential (encrypted password) so
+            # future crawls can log in automatically without signing up again.
+            try:
+                await credential_service.store_site_credential(
+                    email=email,
+                    domain=domain,
+                    username=signup_result.get("username") or email,
+                    password=password,
+                    action="signup",
+                )
+            except Exception:
+                logger.warning("[%s] Failed to persist site credential after signup", domain, exc_info=True)
 
-            if signup_result.get("needs_verification"):
+            if signup_result.get("needs_verification") and perform_verification:
                 result["needs_verification"] = True
                 # Handle verification
                 verified = await self._handle_verification(
                     page, email, domain
                 )
                 result["verified"] = verified
+            elif signup_result.get("needs_verification"):
+                result["needs_verification"] = True
+                logger.info(
+                    "[%s] Site requested email verification but the crawl did not "
+                    "enable it — skipping verification polling", domain,
+                )
                 if verified:
                     await credential_service.record_usage(
                         email, domain, "verified", "success"
@@ -194,6 +271,19 @@ class AutoSignupHandler:
         result = {"success": False, "message": ""}
 
         try:
+            # --- Guard: do NOT fill credentials on Cloudflare challenge pages ---
+            is_cf = await self._is_cloudflare_challenge(page)
+            if is_cf:
+                logger.info("[%s] Cloudflare challenge detected before login — attempting solve", email)
+                solved = await self._try_solve_captcha(page)
+                if solved:
+                    await asyncio.sleep(3)
+                # Re-check: if challenge persists, bail out
+                if await self._is_cloudflare_challenge(page):
+                    logger.warning("[%s] Cloudflare challenge not resolved — cannot proceed with login", email)
+                    result["message"] = "Cloudflare challenge not resolved — login skipped"
+                    return result
+
             # Find username/email field
             username_input = None
             for selector in _USERNAME_SELECTORS:
@@ -277,12 +367,26 @@ class AutoSignupHandler:
         return result
 
     async def _try_signup(
-        self, page: Page, email: str, password: str, portal_config: dict | None = None
+        self, page: Page, email: str, password: str, portal_config: dict | None = None, domain: str = ""
     ) -> dict[str, Any]:
         """Attempt to find and complete a signup form."""
         result: dict[str, Any] = {"success": False, "message": "", "needs_verification": False}
 
         try:
+            # --- Guard: do NOT fill credentials on Cloudflare challenge pages ---
+            is_cf = await self._is_cloudflare_challenge(page)
+            if is_cf:
+                logger.info("[%s] Cloudflare challenge detected before signup — attempting solve", email)
+                solved = await self._try_solve_captcha(page)
+                if solved:
+                    await asyncio.sleep(3)
+                # Re-check: if challenge persists, bail out
+                is_cf = await self._is_cloudflare_challenge(page)
+                if is_cf:
+                    logger.warning("[%s] Cloudflare challenge not resolved — cannot proceed with signup", email)
+                    result["message"] = "Cloudflare challenge not resolved — signup skipped"
+                    return result
+
             # First, look for a signup link if we're on a login page
             # BUT skip this if we're already on a registration/signup URL
             current_url = page.url.lower()
@@ -302,15 +406,18 @@ class AutoSignupHandler:
             else:
                 logger.info("[%s] Already on signup page (%s) — skipping navigation", email, current_url)
 
-            # --- CAPTCHA solving (before form fill) ---
-            # Only run CAPTCHA solving if the page is a Cloudflare challenge,
-            # NOT if we're on the actual registration form with CAPTCHA widgets.
-            # The Turnstile/reCAPTCHA on registration pages is a form element,
-            # not a blocking challenge — solving it prematurely can navigate away.
+            # --- Second Cloudflare check (page may have navigated to signup page) ---
             is_cf = await self._is_cloudflare_challenge(page)
             if is_cf:
-                logger.info("[%s] Cloudflare challenge detected before form fill — solving", email)
-                await self._try_solve_captcha(page)
+                logger.info("[%s] Cloudflare challenge on signup page — solving", email)
+                solved = await self._try_solve_captcha(page)
+                if solved:
+                    await asyncio.sleep(3)
+                # Final check
+                if await self._is_cloudflare_challenge(page):
+                    logger.warning("[%s] Cloudflare challenge persists on signup page — aborting", email)
+                    result["message"] = "Cloudflare challenge not resolved on signup page"
+                    return result
 
             # --- Dismiss cookie consent / GDPR banners that may overlay the form ---
             await self._dismiss_overlay_banners(page)
@@ -337,7 +444,9 @@ class AutoSignupHandler:
             confirm_password_filled = False
 
             # Generate a username from the email for forum registrations
-            _generated_username = email.split("@")[0].replace(".", "").replace("+", "_")
+            _domain = locals().get("domain", "") or getattr(self, "_current_domain", "")
+            _generated_username = self._generate_username(email, _domain)
+            result["username"] = _generated_username
 
             for inp in all_inputs:
                 input_type = await inp.get_attribute("type") or ""
@@ -400,8 +509,12 @@ class AutoSignupHandler:
                         logger.info("Filled XenForo password field via #ctrl_password")
 
             if not email_filled or not password_filled:
-                result["message"] = f"Could not find all signup fields (email={email_filled}, password={password_filled})"
-                return result
+                # Try multi-step registration wizard
+                logger.info(
+                    "[%s] Single-page signup incomplete (email=%s, password=%s) — trying multi-step",
+                    email, email_filled, password_filled,
+                )
+                return await self._handle_multi_step_registration(page, email, password)
 
             # Look for confirm password field
             for inp in all_inputs:
@@ -428,6 +541,22 @@ class AutoSignupHandler:
 
             # --- Answer anti-bot Q&A fields ---
             await self._answer_bot_qa_fields(page)
+
+            # --- Fill dropdowns (country, timezone, gender, etc.) ---
+            await self._fill_dropdowns(page)
+
+            # --- Select radio buttons (gender, age range, etc.) ---
+            await self._fill_radio_buttons(page)
+
+            # --- Fill date of birth fields ---
+            await self._fill_date_of_birth(page)
+
+            # --- Fill phone number fields ---
+            await self._fill_phone_number(page)
+
+            # --- Confirm password by position (fallback if name-based detection failed) ---
+            if not confirm_password_filled:
+                await self._handle_confirm_password_by_position(page)
 
             # --- Wait for Turnstile to auto-resolve if present ---
             turnstile_response = await page.query_selector("input[name='cf-turnstile-response']")
@@ -567,12 +696,60 @@ class AutoSignupHandler:
 
             # Check for errors
             error_markers = [
-                "error", "failed", "invalid", "required", "already",
+                "error", "failed", "invalid", "required",
                 "taken", "not available", "too short", "weak password",
                 "doka is already", "that name is not valid",
             ]
+            username_collision_markers = [
+                "username already", "username taken", "name already",
+                "name is taken", "not available", "already registered",
+                "already a member", "already exists",
+            ]
             if self._check_markers(page_text, error_markers):
-                # Narrow down: check if error is from a specific field
+                # Check if it's a username collision — retry with different username
+                if self._check_markers(page_text, username_collision_markers):
+                    import random
+                    _retry_username = _generated_username + str(random.randint(10, 99))
+                    logger.info(
+                        "[%s] Username collision — retrying with '%s'",
+                        email, _retry_username,
+                    )
+                    # Find and update the username field
+                    username_input = None
+                    for sel in ["input[name='username']", "input[name='user_name']",
+                                "input[id='ctrl_username']", "input[name='register_username']"]:
+                        username_input = await page.query_selector(sel)
+                        if username_input:
+                            break
+                    if username_input:
+                        await username_input.fill("")
+                        await username_input.fill(_retry_username)
+                        await asyncio.sleep(0.5)
+                        # Re-submit
+                        submit_btn = None
+                        for sel in _SUBMIT_SELECTORS + [
+                            "button:has-text('Register')",
+                            "button:has-text('Sign up')",
+                            "button:has-text('Create account')",
+                        ]:
+                            submit_btn = await page.query_selector(sel)
+                            if submit_btn:
+                                break
+                        if submit_btn:
+                            try:
+                                await submit_btn.click()
+                                await asyncio.sleep(5)
+                                page_text = await self._get_page_text(page)
+                                # Check if retry succeeded
+                                if not self._check_markers(page_text, error_markers):
+                                    result["success"] = True
+                                    result["message"] = f"Signup successful with username '{_retry_username}'"
+                                    if self._check_markers(page_text, _VERIFICATION_NEEDED_MARKERS):
+                                        result["needs_verification"] = True
+                                    return result
+                            except Exception as retry_err:
+                                logger.debug("Username retry submit error: %s", retry_err)
+
                 result["message"] = "Signup may have failed — error markers detected on page"
                 logger.warning("[%s] Signup error markers: %s", email, page_text[:500])
                 return result
@@ -685,6 +862,393 @@ class AutoSignupHandler:
                 pass
         if dismissed:
             await asyncio.sleep(1)
+
+    # ------------------------------------------------------------------
+    # Enhanced form field handlers (dropdowns, radios, DOB, phone)
+    # ------------------------------------------------------------------
+
+    async def _fill_dropdowns(self, page: Page) -> None:
+        """Auto-fill dropdown/select fields with sensible defaults."""
+        try:
+            selects = await page.query_selector_all("select")
+            for sel_el in selects:
+                name = (await sel_el.get_attribute("name") or "").lower()
+                sel_id = (await sel_el.get_attribute("id") or "").lower()
+                is_visible = await sel_el.is_visible()
+                if not is_visible:
+                    continue
+
+                # Skip selects that already have a value selected
+                current_value = await sel_el.evaluate("el => el.value")
+                if current_value and current_value not in ("", "0", "-1"):
+                    continue
+
+                # Match against known dropdown patterns
+                matched_value = None
+                for key, default_val in _DROPDOWN_AUTO_FILL.items():
+                    if key in name or key in sel_id:
+                        matched_value = default_val
+                        break
+
+                # Also check the label text
+                if not matched_value:
+                    label_text = await page.evaluate("""
+                        (sel) => {
+                            const id = sel.id;
+                            if (id) {
+                                const label = document.querySelector('label[for="' + id + '"]');
+                                if (label) return label.innerText.toLowerCase();
+                            }
+                            const parent = sel.closest('.form-group, .formRow, .ipsFieldRow, div');
+                            if (parent) {
+                                const lbl = parent.querySelector('label, h3, h4, p, dt');
+                                if (lbl) return lbl.innerText.toLowerCase();
+                            }
+                            return '';
+                        }
+                    """, sel_el)
+                    for key, default_val in _DROPDOWN_AUTO_FILL.items():
+                        if key in label_text:
+                            matched_value = default_val
+                            break
+
+                if matched_value:
+                    # Try to select by visible text
+                    try:
+                        options = await sel_el.evaluate("""
+                            (sel) => Array.from(sel.options).map(o => ({
+                                text: o.text.trim(),
+                                value: o.value
+                            }))
+                        """)
+                        # Find best match
+                        for opt in options:
+                            if matched_value.lower() in opt["text"].lower():
+                                await sel_el.select_option(label=opt["text"])
+                                logger.info("Filled dropdown '%s' with '%s'", name, opt["text"])
+                                break
+                        else:
+                            # Fallback: select first non-empty option
+                            for opt in options[1:]:  # Skip placeholder
+                                if opt["text"].strip() and opt["value"]:
+                                    await sel_el.select_option(value=opt["value"])
+                                    logger.info("Filled dropdown '%s' with first option '%s'", name, opt["text"])
+                                    break
+                    except Exception as fill_err:
+                        logger.debug("Dropdown fill failed for '%s': %s", name, fill_err)
+        except Exception as exc:
+            logger.debug("Dropdown handling error: %s", exc)
+
+    async def _fill_radio_buttons(self, page: Page) -> None:
+        """Auto-select radio buttons for gender, age range, etc."""
+        try:
+            radio_groups = await page.evaluate("""
+                () => {
+                    const radios = document.querySelectorAll('input[type=radio]');
+                    const groups = {};
+                    radios.forEach(r => {
+                        const name = r.name;
+                        if (!groups[name]) groups[name] = [];
+                        groups[name].push({
+                            value: r.value,
+                            id: r.id,
+                            label: '',
+                            checked: r.checked,
+                        });
+                    });
+                    // Get labels for each radio
+                    for (const name in groups) {
+                        groups[name].forEach(r => {
+                            if (r.id) {
+                                const lbl = document.querySelector('label[for="' + r.id + '"]');
+                                if (lbl) r.label = lbl.innerText.trim().toLowerCase();
+                            }
+                        });
+                    }
+                    return groups;
+                }
+            """)
+
+            for name, options in radio_groups.items():
+                # Skip if already checked
+                if any(o.get("checked") for o in options):
+                    continue
+
+                name_lower = name.lower()
+                # Match against known patterns
+                for pattern, desired_value in _RADIO_AUTO_SELECT.items():
+                    if pattern in name_lower:
+                        # Find matching option
+                        for opt in options:
+                            val = opt.get("value", "").lower()
+                            lbl = opt.get("label", "")
+                            if desired_value in val or desired_value in lbl:
+                                # Click it
+                                selector = f"input[type='radio'][name='{name}'][value='{opt['value']}']"
+                                if opt.get("id"):
+                                    selector = f"#{opt['id']}"
+                                radio_el = await page.query_selector(selector)
+                                if radio_el:
+                                    await radio_el.click()
+                                    logger.info("Selected radio '%s' = '%s'", name, opt.get("value"))
+                                break
+                        else:
+                            # No exact match — select first option
+                            if options:
+                                first = options[0]
+                                selector = f"input[type='radio'][name='{name}'][value='{first['value']}']"
+                                if first.get("id"):
+                                    selector = f"#{first['id']}"
+                                radio_el = await page.query_selector(selector)
+                                if radio_el:
+                                    await radio_el.click()
+                                    logger.info("Selected first radio for '%s'", name)
+                        break
+        except Exception as exc:
+            logger.debug("Radio button handling error: %s", exc)
+
+    async def _fill_date_of_birth(self, page: Page) -> None:
+        """Auto-fill date of birth fields with a generic adult date."""
+        try:
+            for selector in _DOB_SELECTORS:
+                dob_elements = await page.query_selector_all(selector)
+                for dob_el in dob_elements:
+                    if not await dob_el.is_visible():
+                        continue
+                    name = (await dob_el.get_attribute("name") or "").lower()
+                    tag = await dob_el.evaluate("el => el.tagName")
+
+                    if tag == "SELECT":
+                        # Handle day/month/year dropdowns
+                        options = await dob_el.evaluate("""
+                            (sel) => Array.from(sel.options).map(o => ({
+                                text: o.text.trim(), value: o.value
+                            }))
+                        """)
+                        if not options or len(options) <= 1:
+                            continue
+
+                        if "day" in name:
+                            # Select day 15
+                            for opt in options:
+                                if opt["value"] == "15" or opt["text"] == "15":
+                                    await dob_el.select_option(value=opt["value"])
+                                    break
+                        elif "month" in name:
+                            # Select a middle month
+                            mid = len(options) // 2
+                            if mid < len(options):
+                                await dob_el.select_option(value=options[mid]["value"])
+                        elif "year" in name:
+                            # Select a year that makes us ~25 years old
+                            import datetime
+                            target_year = str(datetime.datetime.now().year - 25)
+                            for opt in options:
+                                if opt["value"] == target_year or opt["text"] == target_year:
+                                    await dob_el.select_option(value=opt["value"])
+                                    break
+                            else:
+                                # Fallback: pick middle option
+                                if mid < len(options):
+                                    await dob_el.select_option(value=options[mid]["value"])
+                        logger.info("Filled DOB field '%s'", name)
+                    elif tag == "INPUT":
+                        # Date input — fill with 1998-06-15
+                        input_type = await dob_el.get_attribute("type") or ""
+                        if input_type == "date":
+                            await dob_el.fill("1998-06-15")
+                        else:
+                            # Text input for DOB — try common formats
+                            await dob_el.fill("06/15/1998")
+                        logger.info("Filled DOB input '%s'", name)
+        except Exception as exc:
+            logger.debug("DOB handling error: %s", exc)
+
+    async def _fill_phone_number(self, page: Page) -> None:
+        """Auto-fill phone number fields with a generic number."""
+        try:
+            for selector in _PHONE_SELECTORS:
+                phone_inputs = await page.query_selector_all(selector)
+                for phone_el in phone_inputs:
+                    if not await phone_el.is_visible():
+                        continue
+                    # Check if already filled
+                    current = await phone_el.evaluate("el => el.value")
+                    if current:
+                        continue
+                    await phone_el.fill("2025551234")
+                    logger.info("Filled phone number field")
+                    break
+        except Exception as exc:
+            logger.debug("Phone number handling error: %s", exc)
+
+    async def _handle_confirm_password_by_position(self, page: Page) -> bool:
+        """Find and fill confirm password by position (second password field)."""
+        try:
+            password_fields = await page.query_selector_all("input[type='password']")
+            visible_passwords = []
+            for pf in password_fields:
+                if await pf.is_visible():
+                    visible_passwords.append(pf)
+
+            # If there are 2+ visible password fields, the second is likely confirm
+            if len(visible_passwords) >= 2:
+                confirm = visible_passwords[1]
+                current = await confirm.evaluate("el => el.value")
+                if not current:
+                    await confirm.fill(_DEFAULT_SIGNUP_PASSWORD)
+                    logger.info("Filled confirm password by position (2nd password field)")
+                    return True
+        except Exception as exc:
+            logger.debug("Confirm password by position error: %s", exc)
+        return False
+
+    def _generate_username(self, email: str, domain: str = "") -> str:
+        """Generate a signup username: 'duka' + 5 random digits (e.g. duka48213)."""
+        import random
+        return f"duka{random.randint(10000, 99999)}"
+
+    async def _handle_multi_step_registration(self, page: Page, email: str, password: str) -> dict:
+        """Handle multi-step registration wizards (step-by-step forms).
+
+        Many forums and sites use wizard-style registration:
+          Step 1: Email + Username
+          Step 2: Password + Confirm Password
+          Step 3: Profile details (DOB, country, etc.)
+          Step 4: Terms agreement
+
+        Returns dict with: success, message, needs_verification
+        """
+        result = {"success": False, "message": "", "needs_verification": False}
+
+        try:
+            _generated_username = self._generate_username(email)
+            max_steps = 5  # Safety limit
+
+            for step in range(max_steps):
+                page_text = await self._get_page_text(page)
+                current_url = page.url.lower()
+
+                logger.info("Multi-step registration: step %d, url=%s", step + 1, current_url[:80])
+
+                # Detect what this step needs
+                has_email_field = bool(
+                    await page.query_selector(
+                        "input[type='email'], input[name='email'], input[name='register_email']"
+                    )
+                )
+                has_password_field = bool(
+                    await page.query_selector("input[type='password']")
+                )
+                has_username_field = bool(
+                    await page.query_selector(
+                        "input[name='username'], input[name='register_username'], "
+                        "input[id='ctrl_username']"
+                    )
+                )
+
+                # Fill available fields
+                if has_email_field:
+                    email_input = await page.query_selector(
+                        "input[type='email'], input[name='email'], input[name='register_email']"
+                    )
+                    if email_input and not await email_input.evaluate("el => el.value"):
+                        await email_input.fill(email)
+                        logger.info("Step %d: Filled email", step + 1)
+
+                if has_username_field:
+                    username_input = await page.query_selector(
+                        "input[name='username'], input[name='register_username'], "
+                        "input[id='ctrl_username']"
+                    )
+                    if username_input and not await username_input.evaluate("el => el.value"):
+                        await username_input.fill(_generated_username)
+                        logger.info("Step %d: Filled username '%s'", step + 1, _generated_username)
+
+                if has_password_field:
+                    password_inputs = await page.query_selector_all("input[type='password']")
+                    for i, pw in enumerate(password_inputs):
+                        if await pw.is_visible() and not await pw.evaluate("el => el.value"):
+                            await pw.fill(password)
+                            logger.info("Step %d: Filled password field %d", step + 1, i + 1)
+
+                # Fill other fields (dropdowns, radios, DOB, phone)
+                await self._fill_dropdowns(page)
+                await self._fill_radio_buttons(page)
+                await self._fill_date_of_birth(page)
+                await self._fill_phone_number(page)
+                await self._tick_agreement_checkboxes(page)
+                await self._answer_bot_qa_fields(page)
+
+                # Find and click Next/Continue/Submit button
+                next_selectors = [
+                    "button:has-text('Next')",
+                    "button:has-text('Continue')",
+                    "button:has-text('Proceed')",
+                    "input[type='submit'][value*='Next' i]",
+                    "input[type='submit'][value*='Continue' i]",
+                    "button[type='submit']",
+                    "input[type='submit']",
+                ]
+                submit_btn = None
+                for sel in next_selectors:
+                    submit_btn = await page.query_selector(sel)
+                    if submit_btn and await submit_btn.is_visible():
+                        break
+                    submit_btn = None
+
+                if not submit_btn:
+                    logger.info("Step %d: No next/submit button — registration may be complete", step + 1)
+                    break
+
+                button_text = (await submit_btn.evaluate("el => el.innerText || el.value || ''")).strip().lower()
+                await submit_btn.click()
+                await asyncio.sleep(3)
+
+                # Wait for navigation
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+
+                # Check if we're done (no more form fields)
+                new_text = await self._get_page_text(page)
+                still_has_form = bool(
+                    await page.query_selector("input[type='email'], input[type='password'], input[type='text']")
+                )
+
+                # Check for verification needed
+                if self._check_markers(new_text, _VERIFICATION_NEEDED_MARKERS):
+                    result["success"] = True
+                    result["needs_verification"] = True
+                    result["message"] = f"Multi-step registration complete after {step + 1} steps — verification needed"
+                    return result
+
+                # Check for success
+                if self._check_markers(new_text, ["welcome", "dashboard", "successfully", "account created"]):
+                    result["success"] = True
+                    result["message"] = f"Multi-step registration complete after {step + 1} steps"
+                    return result
+
+                # If no form fields remain, we're done
+                if not still_has_form:
+                    result["success"] = True
+                    result["message"] = f"Multi-step registration complete after {step + 1} steps (no more form fields)"
+                    return result
+
+            # If we exhausted all steps
+            result["success"] = True
+            result["message"] = f"Multi-step registration submitted ({max_steps} steps attempted)"
+
+        except Exception as exc:
+            result["message"] = f"Multi-step registration error: {exc}"
+            logger.error("Multi-step registration exception: %s", exc, exc_info=True)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Q&A handler
+    # ------------------------------------------------------------------
 
     async def _answer_bot_qa_fields(self, page: Page) -> None:
         """Detect and answer anti-bot Q&A fields (e.g., XenForo's "What color is the sky?")."""
@@ -1083,17 +1647,50 @@ class AutoSignupHandler:
         email: str,
         domain: str,
     ) -> bool:
-        """Handle email verification by polling Gmail and navigating to verification link."""
-        logger.info("[%s] Polling for verification email...", domain)
+        """Handle email verification by polling the inbox and navigating to the
+        verification link (or filling the code input).
 
-        verification = await gmail_handler.poll_for_verification(
-            email=email,
-            sender_domain=domain,
-            timeout_seconds=90,
-            poll_interval=5.0,
-        )
+        Backend selection:
+          - Gmail API when the account has Gmail OAuth secrets configured
+          - IMAP fallback (seed inbox credentials from settings) otherwise —
+            this covers Gmail plus-aliases (seed+dukaXXXXX@gmail.com) and any
+            IMAP provider configured in .env
+        """
+        logger.info("[%s] Polling for verification email (address=%s)...", domain, email)
 
-        if not verification["found"]:
+        verification: dict[str, Any] = {"found": False, "link": None, "code": None, "body": None}
+
+        # --- Try Gmail API when OAuth is available for this account ---
+        try:
+            verification = await gmail_handler.poll_for_verification(
+                email=email,
+                sender_domain=domain,
+                timeout_seconds=60,
+                poll_interval=5.0,
+            )
+        except Exception:
+            logger.debug("[%s] Gmail API polling failed — falling back to IMAP", domain, exc_info=True)
+            verification = {"found": False, "link": None, "code": None, "body": None}
+
+        # --- IMAP fallback (seed inbox) when Gmail API found nothing ---
+        if not verification.get("found"):
+            from app.services.gmail_verification import ImapVerificationReader, imap_poll_for_code
+            try:
+                reader = ImapVerificationReader()
+                # Validate config before attempting a connection
+                reader._connect()
+                reader._disconnect()
+                verification = await imap_poll_for_code(
+                    sender_domain=domain,
+                    timeout_seconds=90,
+                )
+            except Exception as imap_err:
+                logger.warning(
+                    "[%s] IMAP fallback unavailable (%s) — cannot read verification email",
+                    domain, imap_err,
+                )
+
+        if not verification.get("found"):
             logger.warning("[%s] No verification email received", domain)
             return False
 

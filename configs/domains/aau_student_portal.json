@@ -1,0 +1,40 @@
+{
+    "domain": "aau.edu.et",
+    "name": "AAU Student Portal",
+    "description": "Addis Ababa University student portal — student ID + password. Matches aau.edu.et, portal.aau.edu.et, aastu.edu.et, etc.",
+    "handle_http_interstitial": true,
+    "login_url": "https://portal.aau.edu.et",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[name='username'], input[name='student_id'], input[type='text'], #username",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill student ID / username"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='password'], #password",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In')",
+            "wait_after_ms": 5000,
+            "description": "Click Login button"
+        }
+    ],
+    "post_login_targets": [
+        "/student/dashboard"
+    ],
+    "extraction_targets": [
+        {
+            "name": "student_profile",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 10000) : '' }; })()",
+            "description": "Extract student profile and academic data"
+        }
+    ]
+}

@@ -1,10 +1,11 @@
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
 from app.common.logger.logger import logger
 from app.pipeline.main import submit_crawl_job
+from app.security.auth import require_admin
 from app.storage.postgres.client import pg_client
 
 router = APIRouter()
@@ -54,6 +55,20 @@ class ScrapeRequest(BaseModel):
     )
 
 
+class BatchScrapeRequest(BaseModel):
+    urls: list[HttpUrl] = Field(..., min_length=1, max_length=500)
+    user_id: str
+    language: str = "am"
+    worker_override: str | None = None
+    max_depth: int = 5
+    recursive_config: dict[str, Any] = Field(default_factory=dict)
+    allow_login: bool = False
+    allow_signup: bool = False
+    allow_email_verification: bool = False
+    credential_email: str | None = None
+    job_params: dict[str, Any] = Field(default_factory=dict)
+
+
 # ========================================================================
 # STATIC / NON-WILDCARD ROUTES FIRST
 # ========================================================================
@@ -91,10 +106,43 @@ async def trigger_scrape_job(request: ScrapeRequest):
         raise HTTPException(status_code=500, detail="Internal Pipeline Error")
 
 
+@router.post("/batch", status_code=202, response_model=dict)
+async def trigger_batch(request: BatchScrapeRequest):
+    """Submit a URL batch with explicit authentication permissions."""
+    jobs = []
+    for url in request.urls:
+        params = dict(request.job_params)
+        params["allow_login"] = request.allow_login
+        params["allow_signup"] = request.allow_signup
+        params["allow_email_verification"] = request.allow_email_verification
+        if request.credential_email:
+            params["credential_email"] = request.credential_email
+        try:
+            jobs.append(await submit_crawl_job(
+                user_id=request.user_id,
+                url=str(url),
+                language=request.language,
+                worker_override=request.worker_override,
+                max_depth=request.max_depth,
+                recursive_config=request.recursive_config,
+                job_params=params,
+            ))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Batch item failed for %s: %s", url, exc, exc_info=True)
+            jobs.append({"url": str(url), "error": "submission_failed"})
+    return {"total": len(jobs), "jobs": jobs}
+
+
 @router.get("/user/{user_id}", response_model=dict)
 async def get_user_jobs(user_id: str):
     """List all jobs submitted by a given user."""
-    jobs = await pg_client.get_jobs_by_user(user_id)
+    from app.storage.postgres.client import _normalize_user_id
+    normalized = _normalize_user_id(user_id)
+    existing = await pg_client.ensure_user(normalized)
+    actual_id = existing["user_id"]
+    jobs = await pg_client.get_jobs_by_user(actual_id)
     return {
         "user_id": user_id,
         "total": len(jobs),
@@ -106,6 +154,27 @@ async def get_user_jobs(user_id: str):
                 "created_at": job["created_at"].isoformat() if job["created_at"] else None,
             }
             for job in jobs
+        ],
+    }
+
+
+@router.get("/all", response_model=dict)
+async def get_all_jobs(_: object = Depends(require_admin)):
+    """List all jobs for the admin console."""
+    async with pg_client.system_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM jobs ORDER BY created_at DESC")
+    return {
+        "user_id": "all",
+        "total": len(rows),
+        "jobs": [
+            {
+                "job_id": row["job_id"],
+                "url": row["url"],
+                "status": row["status"],
+                "user_id": row["user_id"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in rows
         ],
     }
 
@@ -379,12 +448,17 @@ async def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    failure_reason = job.get("failure_reason")
+    if not failure_reason and job["status"] in ("failed", "needs_review"):
+        failure_reason = await pg_client.get_job_failure_reason(job_id)
+
     return {
         "job_id": job["job_id"],
         "user_id": job["user_id"],
         "url": job["url"],
         "language": job["language"],
         "status": job["status"],
+        "failure_reason": failure_reason or None,
         "created_at": job["created_at"].isoformat() if job["created_at"] else None,
         "completed_at": job["completed_at"].isoformat() if job["completed_at"] else None,
     }

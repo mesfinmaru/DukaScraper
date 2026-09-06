@@ -19,6 +19,10 @@
 | `MINIO_ACCESS_KEY` | `minioadmin` | Worker settings | MinIO access key |
 | `MINIO_SECRET_KEY` | `minioadmin` | Worker settings | MinIO secret key |
 | `MINIO_SECURE` | `False` | Workers/API | Whether to use HTTPS for MinIO |
+| `HOSTED_LLM_URL` | `https://api.groq.com/openai/v1/chat/completions` | LLM worker | Hosted provider endpoint for intelligence analysis |
+| `HOSTED_LLM_API_KEY` | empty | LLM worker | API key for hosted model provider; never commit to repo |
+| `HOSTED_LLM_MODEL` | `openai/gpt-oss-120b` | LLM worker | Hosted model to invoke |
+| `FALLBACK_ONLY` | `False` | LLM worker | Allow fallback behavior without hosted credentials |
 | `POSTGRES_USER` | `postgres` | API/workers | PostgreSQL user |
 | `POSTGRES_PASSWORD` | `postgres` | API/workers | PostgreSQL password |
 | `POSTGRES_DB` | `duka` | API/workers | PostgreSQL database |

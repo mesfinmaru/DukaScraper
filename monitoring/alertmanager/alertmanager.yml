@@ -1,0 +1,37 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default'
+
+receivers:
+  - name: 'default'
+    # No-op receiver — alerts are silently dropped until PagerDuty / Slack
+    # credentials are configured.  To enable, uncomment the relevant
+    # receiver blocks below and supply real webhook URLs.
+
+# --- Uncomment when PAGERDUTY_SERVICE_KEY is set ---
+#  - name: 'pagerduty-critical'
+#    pagerduty_configs:
+#      - service_key: '${PAGERDUTY_SERVICE_KEY}'
+#
+#  - name: 'pagerduty-warning'
+#    pagerduty_configs:
+#      - service_key: '${PAGERDUTY_SERVICE_KEY}'
+
+# --- Uncomment when SLACK_WEBHOOK_URL is set ---
+#  - name: 'slack-info'
+#    slack_configs:
+#      - api_url: '${SLACK_WEBHOOK_URL}'
+#        channel: '#duka-alerts'
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']

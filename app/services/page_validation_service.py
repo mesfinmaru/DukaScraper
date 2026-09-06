@@ -11,9 +11,8 @@ from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import ETHIOPIC_LANGUAGES, detect_language_from_text
 
 # All languages the pipeline can detect and store
-SUPPORTED_LANGUAGES = ETHIOPIC_LANGUAGES | {
-    "en", "fr", "es", "de", "it", "pt", "sw", "tr", "hi", "ar", "ru",
-}
+# Quality over quantity: only Ethiopian local languages + English
+SUPPORTED_LANGUAGES = ETHIOPIC_LANGUAGES | {"en"}
 
 # Languages the LLM analysis step can fully process
 PIPELINE_LANGUAGES = {"am", "en"}
@@ -75,8 +74,11 @@ class PageValidationService:
         # well-formed pages. Honour the document language when it is one of
         # the pipeline's supported languages.
         document_language = (soup.html.get("lang", "") if soup.html else "").lower().split("-", 1)[0]
-        if language not in SUPPORTED_LANGUAGES and document_language in SUPPORTED_LANGUAGES:
-            language = document_language
+        # Use <html lang> as a strong override when text detection disagrees
+        # with the document's declared language AND the expected language.
+        if document_language in SUPPORTED_LANGUAGES:
+            if language not in SUPPORTED_LANGUAGES or document_language == expected_language:
+                language = document_language
         if language not in SUPPORTED_LANGUAGES:
             return PageValidation("needs_review", "unsupported_language", language)
         if expected_language in SUPPORTED_LANGUAGES and language != expected_language:
@@ -87,5 +89,9 @@ class PageValidationService:
             if title_lang == expected_language:
                 language = expected_language
             else:
-                return PageValidation("needs_review", "language_mismatch", language)
+                # Return completed (not needs_review) so that:
+                # 1. Children are still queued (recursive crawl continues)
+                # 2. The CrawlResult reaches the parser for proper language
+                #    filtering at the paragraph level (parser handles mismatch)
+                return PageValidation("completed", "language_mismatch", language)
         return PageValidation("completed", "valid_content", language)

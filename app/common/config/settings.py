@@ -33,10 +33,29 @@ class Settings(BaseSettings):
     # ==================================================================
     # Security
     # ==================================================================
-    SECRET_KEY: str = ""
+    JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
-    JWT_REFRESH_EXPIRE_DAYS: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 30
+    PASSWORD_RESET_URL: str = "http://localhost:5173/reset-password"
+    EMAIL_VERIFICATION_URL: str = "http://localhost:5173/verify-email"
+    LOGIN_RATE_LIMIT_PER_MINUTE: int = 10
+    RESET_RATE_LIMIT_PER_HOUR: int = 5
+
+    # Bootstrap admin (created on first run)
+    INITIAL_ADMIN_USERNAME: str = "dukaadmin"
+    INITIAL_ADMIN_EMAIL: str = ""
+    INITIAL_ADMIN_PASSWORD: str = ""
+    INITIAL_ADMIN_NAME: str = "System Administrator"
+
+    # SMTP (Gmail or other provider)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_USE_TLS: bool = True
 
     # ==================================================================
     # CORS
@@ -63,6 +82,7 @@ class Settings(BaseSettings):
     dark_enabled: bool = True
     tor_proxy_url: str = "socks5://tor:9050"
     proxy_pool: str = ""
+    RESIDENTIAL_PROXY: str = ""  # e.g. socks5://user:pass@host:port
     export_batch_size: int = 100
     export_flush_interval_seconds: int = 60
     http_timeout_seconds: float = 30.0
@@ -103,6 +123,26 @@ class Settings(BaseSettings):
     AUTH_SESSION_ALLOWED_HOSTS: str = ""
 
     # ==================================================================
+    # Gmail OAuth2 (default credentials for auto signup/login verification)
+    # ==================================================================
+    # Per-credential Gmail OAuth overrides these when set on the credential row.
+    GMAIL_CLIENT_ID: str = ""
+    GMAIL_CLIENT_SECRET: str = ""
+    GMAIL_REFRESH_TOKEN: str = ""
+
+    # ==================================================================
+    # IMAP (backup for email verification — used when OAuth2 is unavailable)
+    # ==================================================================
+    IMAP_HOST: str = "imap.gmail.com"
+    IMAP_PORT: int = 993
+    IMAP_USERNAME: str = ""
+    IMAP_PASSWORD: str = ""
+    IMAP_USE_SSL: bool = True
+    # The email address to read verification codes FROM
+    SEED_GMAIL_EMAIL: str = ""
+    SEED_GMAIL_PASSWORD: str = ""
+
+    # ==================================================================
     # Kafka Topics
     # ==================================================================
     crawl_request_topic: str = "crawl.requests"
@@ -140,7 +180,6 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     DUKA_SYSTEM_DB: str = "duka_system"
-    DUKA_DB: str = "duka_db"
 
     # ==================================================================
     # Infrastructure Connections
@@ -148,6 +187,17 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
     ELASTICSEARCH_URL: str = "http://localhost:9200"
+
+    # ==================================================================
+    # Monitoring tools (browser URLs surfaced by GET /api/v1/monitoring/urls)
+    # These point at the docker-compose host port mappings; override per env.
+    # ==================================================================
+    GRAFANA_URL: str = "http://localhost:3000"
+    PROMETHEUS_URL: str = "http://localhost:9090"
+    KAFKA_UI_URL: str = "http://localhost:8088"
+    KIBANA_URL: str = "http://localhost:5601"
+    PGADMIN_URL: str = "http://localhost:5050"
+    MINIO_CONSOLE_URL: str = "http://localhost:9001"
 
     # ==================================================================
     # Integration Test Defaults
@@ -449,24 +499,100 @@ class Settings(BaseSettings):
     # Lifecycle
     # ==================================================================
 
+    @staticmethod
+    def _detect_wsl() -> bool:
+        """Auto-detect WSL2 environment via multiple signals."""
+        if os.getenv("APP_ENV") == "wsl":
+            return True
+        # Check 1: /proc/version (reliable on most WSL2 distros)
+        try:
+            with open("/proc/version") as f:
+                version = f.read().lower()
+                if "microsoft" in version or "wsl" in version:
+                    return True
+        except (FileNotFoundError, PermissionError):
+            pass
+        # Check 2: os.uname().release often contains 'microsoft' on WSL
+        try:
+            release = os.uname().release.lower()
+            if "microsoft" in release or "wsl" in release:
+                return True
+        except Exception:
+            pass
+        # Check 3: WSLInterop environment variable (set by most WSL distros)
+        if os.getenv("WSL_DISTRO_NAME") or os.getenv("WSL_INTEROP"):
+            return True
+        # Check 4: /proc/sys/fs/binfmt_misc/WSLInterop exists
+        if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
+            return True
+        return False
+
+    @staticmethod
+    def _detect_docker() -> bool:
+        """Auto-detect Docker environment."""
+        if os.getenv("APP_ENV") == "docker":
+            return True
+        if os.path.exists("/.dockerenv"):
+            return True
+        try:
+            with open("/proc/1/cgroup") as f:
+                return "docker" in f.read().lower()
+        except (FileNotFoundError, PermissionError):
+            pass
+        return False
+
     def __init__(self, **data):
         super().__init__(**data)
 
-        # Generate SECRET_KEY if not provided
-        if not self.SECRET_KEY:
-            self.SECRET_KEY = secrets.token_urlsafe(32)
+        # Generate JWT_SECRET_KEY if not provided
+        if not self.JWT_SECRET_KEY:
+            self.JWT_SECRET_KEY = secrets.token_urlsafe(32)
 
         # Inject user_agent into browser context kwargs
         if "user_agent" not in self.DEEP_BROWSER_CONTEXT_KWARGS:
             self.DEEP_BROWSER_CONTEXT_KWARGS["user_agent"] = self.DEEP_DEFAULT_USER_AGENT
 
-        if os.getenv("APP_ENV") == "docker":
+        # --- Auto-detect environment ---
+        if self._detect_docker():
             self.MINIO_ENDPOINT = "minio:9000"
             self.CLICKHOUSE_HOST = "clickhouse"
             self.POSTGRES_HOST = "postgres"
             self.REDIS_URL = "redis://redis:6379/0"
             self.KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
             self.ELASTICSEARCH_URL = "http://elasticsearch:9200"
+        elif self._detect_wsl():
+            # WSL2: services exposed via Docker Desktop port mappings on localhost
+            import logging as _log
+            _log.getLogger("duka.config").info(
+                "WSL2 environment detected — rewriting service endpoints to localhost ports"
+            )
+            # IMPORTANT: Do NOT use os.getenv() for Kafka — the .env file often
+            # sets KAFKA_BOOTSTRAP_SERVERS=kafka:9092 (Docker internal), which
+            # doesn't resolve from WSL.  Always force the EXTERNAL listener.
+            self.KAFKA_BOOTSTRAP_SERVERS = "localhost:29092"
+            self.MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+            self.REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            self.POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+            self.POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+            self.CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
+            self.CLICKHOUSE_HTTP_PORT = int(os.getenv("CLICKHOUSE_HTTP_PORT", "8123"))
+            self.CLICKHOUSE_NATIVE_PORT = int(os.getenv("CLICKHOUSE_NATIVE_PORT", "9002"))
+            self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
+            self.tor_proxy_url = os.getenv("tor_proxy_url", "socks5://localhost:9050")
+
+        # --- Failsafe: always use EXTERNAL Kafka listener (29092) outside Docker ---
+        # If KAFKA_BOOTSTRAP_SERVERS points to port 9092 (internal Docker listener),
+        # the broker will advertise 'kafka:9092' which doesn't resolve from WSL.
+        # Force port 29092 (EXTERNAL listener) which advertises 'localhost:29092'.
+        _kafka_bs = self.KAFKA_BOOTSTRAP_SERVERS
+        if not self._detect_docker() and (":9092" in _kafka_bs and ":29092" not in _kafka_bs):
+            import logging as _log2
+            _log2.getLogger("duka.config").warning(
+                "Kafka bootstrap '%s' uses port 9092 (Docker internal). "
+                "Forcing port 29092 (EXTERNAL listener) for non-Docker environment.",
+                _kafka_bs,
+            )
+            self.KAFKA_BOOTSTRAP_SERVERS = _kafka_bs.replace(":9092", ":29092")
 
     def validate_config(self) -> list[str]:
         """Validate configuration and return any warnings."""
@@ -486,6 +612,11 @@ class Settings(BaseSettings):
             warnings.append("CORS is configured to allow all origins — restrict in production")
 
         return warnings
+
+    @property
+    def SECRET_KEY(self) -> str:
+        """Backward-compatible alias — prefer JWT_SECRET_KEY in new code."""
+        return self.JWT_SECRET_KEY
 
     @property
     def DATABASE_URL(self) -> str:

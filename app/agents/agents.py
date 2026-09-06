@@ -76,7 +76,7 @@ async def _httpx_fetch(
     timeout: int = 30,
 ) -> tuple[int, str, str]:
     async with httpx.AsyncClient(
-        proxies=proxy,
+        proxy=proxy,
         headers=headers,
         follow_redirects=True,
         timeout=timeout,

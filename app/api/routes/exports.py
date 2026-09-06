@@ -117,7 +117,7 @@ async def list_exports(job_id: str | None = None, limit: int = 50):
     Returns the most recent exports first.
     """
     try:
-        async with pg_client.db_pool.acquire() as conn:
+        async with pg_client.system_pool.acquire() as conn:
             if job_id:
                 rows = await conn.fetch(
                     "SELECT * FROM exports WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2",
@@ -136,7 +136,7 @@ async def list_exports(job_id: str | None = None, limit: int = 50):
 async def get_export(export_id: str):
     """Get details for a specific export, including a download URL if ready."""
     try:
-        async with pg_client.db_pool.acquire() as conn:
+        async with pg_client.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM exports WHERE export_id = $1", export_id
             )
@@ -177,7 +177,7 @@ async def get_export(export_id: str):
 async def delete_export(export_id: str):
     """Delete an export record and its associated file from MinIO."""
     try:
-        async with pg_client.db_pool.acquire() as conn:
+        async with pg_client.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM exports WHERE export_id = $1", export_id
             )

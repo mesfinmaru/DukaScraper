@@ -21,9 +21,12 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
 from workers.common import check_escalation, extract_and_queue_children
+from workers.health import HealthServer
+from workers.metrics import WorkerMetrics
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 from app.services.link_extraction_service import LinkExtractionService
 from app.language.cleaning.cleaner import clean_and_extract_text
@@ -37,10 +40,13 @@ from app.services.content_fingerprint_service import (
 from app.agents import fetch_with_agent_rotation
 
 # --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+if APP_ENV == "docker":
+    _setup_worker_logging(level=logging.INFO, json_output=True)
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
@@ -161,7 +167,23 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         request = CrawlRequest(**data)
 
         if request.worker_type != WORKER_TYPE:
+            logger.debug("Skipping job %s — worker_type='%s' != '%s'",
+                         request.job_id, request.worker_type, WORKER_TYPE)
             return
+
+        # --- Dedup: skip jobs already completed (prevents re-processing on worker restart)
+        # When auto_offset_reset="earliest" is set, a restarted worker replays
+        # all messages from the start of the topic.
+        try:
+            existing_job = await pg_client.get_job(request.job_id)
+            if existing_job and existing_job["status"] in ("completed", "failed", "skipped"):
+                logger.info(
+                    "Skipping already-%s job %s for %s (depth=%d) — no re-fetch",
+                    existing_job["status"], request.job_id, request.url, request.depth,
+                )
+                return
+        except Exception as dedup_err:
+            logger.debug("Job status check failed (non-fatal): %s", dedup_err)
 
         logger.info(
             f"Processing job {request.job_id} [{request.language}] depth={request.depth}/{request.max_depth} "
@@ -305,6 +327,16 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
                 request.url, queued_count,
             )
 
+        # Truncate very large HTML to avoid Kafka MessageSizeTooLargeError
+        MAX_HTML_BYTES = 500_000  # ~500 KB
+        html_bytes = html.encode("utf-8") if html else b""
+        if len(html_bytes) > MAX_HTML_BYTES:
+            logger.warning(
+                "HTML for %s is %d bytes — truncating to %d for Kafka",
+                request.url, len(html_bytes), MAX_HTML_BYTES,
+            )
+            html = html_bytes[:MAX_HTML_BYTES].decode("utf-8", errors="ignore")
+
         result = CrawlResult(
             job_id=request.job_id,
             item_id=item_id,
@@ -401,23 +433,33 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes):
     """Enforces concurrency limits using asyncio.Semaphore."""
-    async with semaphore:
-        await process_request(producer, message_value)
+    try:
+        async with semaphore:
+            await process_request(producer, message_value)
+    except Exception as exc:
+        logger.error("Unhandled exception in surface worker task: %s", exc, exc_info=True)
 
 
 async def main():
     """Main worker lifecycle loop."""
+    # --- Health + Metrics servers ---
+    health = HealthServer(worker_name="surface")
+    await health.start()
+    metrics = WorkerMetrics(worker_name="surface", topic=CONSUME_TOPIC)
+    await metrics.start()
+
     await pg_client.connect()
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{WORKER_TYPE}-group",
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
     await producer.start()
     await consumer.start()
+    health.mark_ready()
     logger.info(
         f"'{WORKER_TYPE}' worker online listening on topic '{CONSUME_TOPIC}' "
         f"with rule-based proxy routing + recursive crawling + auto-escalation."
@@ -440,11 +482,16 @@ async def main():
 
     try:
         async for msg in consumer:
+            metrics.record_consumed()
+            logger.debug("Received message from topic '%s' (partition=%s, offset=%s)",
+                         CONSUME_TOPIC, msg.partition, msg.offset)
             asyncio.create_task(process_message_safely(producer, msg.value))
     except asyncio.CancelledError:
         logger.info("Surface worker cancellation requested.")
     finally:
         logger.info("Shutting down worker gracefully...")
+        await health.stop()
+        await metrics.stop()
         await consumer.stop()
         await producer.stop()
 

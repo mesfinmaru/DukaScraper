@@ -1,12 +1,16 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
 
 # System deps required by headless Chromium (Playwright)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     ca-certificates \
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev \
     fonts-liberation \
     fonts-unifont \
     libasound2 \
@@ -36,20 +40,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY workers/requirements.txt .
 RUN pip install --no-cache-dir --requirement requirements.txt
 
-# Install Patchright's patched Chromium binary at BUILD time.
-# Patchright strips CDP signatures, C++ automation markers, and TLS/JA3
-# fingerprints that Cloudflare/Akamai use to detect headless browsers.
-# NOTE: --with-deps is a Playwright flag, NOT supported by Patchright.
-RUN python -m patchright install chromium
+# Camoufox is a Python package plus a separately managed browser binary.
+# Fetch it at image build time so challenge fallback never fails at runtime.
+RUN camoufox fetch official/stable
 
-# Verify patchright is importable after install
-RUN python -c "from patchright.sync_api import sync_playwright; print('✅ patchright importable')"
+# Patchright uses its own browser cache and executable revision. Installing
+# Playwright's Chromium binary does not satisfy patchright.async_api.
+RUN patchright install chromium
 
 COPY . .
 COPY workers/wait_for_kafka.sh /wait_for_kafka.sh
 RUN chmod +x /wait_for_kafka.sh
+COPY workers/deep-worker/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-CMD ["/wait_for_kafka.sh", "python", "workers/deep-worker/main.py"]
+CMD ["/docker-entrypoint.sh"]

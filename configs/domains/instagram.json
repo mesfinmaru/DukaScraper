@@ -1,0 +1,41 @@
+{
+    "domain": "instagram.com",
+    "name": "Instagram",
+    "description": "Instagram login — email/username + password. Web login form.",
+    "handle_http_interstitial": false,
+    "login_url": "https://www.instagram.com/accounts/login/",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[name='username'], input[autocomplete='username'], input[aria-label='Phone number, username, or email']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill username/email/phone field"
+        },
+        {
+            "action": "fill",
+            "selector": "input[name='password'], input[type='password'], input[aria-label='Password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password field"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], button:has-text('Log in'), div[role='button']:has-text('Log in')",
+            "wait_after_ms": 5000,
+            "description": "Click Log in button"
+        }
+    ],
+    "post_login_targets": [
+        "/",
+        "/accounts/activity/"
+    ],
+    "extraction_targets": [
+        {
+            "name": "feed_data",
+            "type": "custom",
+            "js_extract": "(() => { const posts = document.querySelectorAll('article div[role=\"presentation\"]'); const items = []; posts.forEach((p, i) => { if (i < 20) items.push(p.innerText.substring(0, 500)); }); return { url: window.location.href, post_count: items.length, posts: items, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract Instagram feed posts after login"
+        }
+    ]
+}

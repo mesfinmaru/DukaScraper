@@ -634,6 +634,41 @@ class PortalHandler:
         # Step 5: Extract structured data
         result["extracted_data"] = await self.extract_structured_data()
 
+        # Step 5.5: Detect login error messages from the page
+        try:
+            page_text = await self.page.evaluate(
+                "() => document.body ? document.body.innerText.substring(0, 3000) : ''"
+            )
+            _LOGIN_ERROR_MARKERS = [
+                "incorrect username or password",
+                "incorrect email or password",
+                "invalid credentials",
+                "wrong password",
+                "authentication failed",
+                "login failed",
+                "account locked",
+                "too many attempts",
+                "captcha required",
+                "verify you are human",
+                "suspicious activity",
+                "unusual sign-in activity",
+                "please verify your identity",
+                "two-factor authentication required",
+                "2fa required",
+            ]
+            page_lower = (page_text or "").lower()
+            for marker in _LOGIN_ERROR_MARKERS:
+                if marker in page_lower:
+                    logger.warning(
+                        "[%s] Login error detected on page: '%s'",
+                        self.config.domain if self.config else "unknown",
+                        marker,
+                    )
+                    result["login_error"] = marker
+                    break
+        except Exception:
+            pass
+
         # Step 6: Collect raw HTML and rendered text for downstream
         try:
             result["html"] = await self.page.content()

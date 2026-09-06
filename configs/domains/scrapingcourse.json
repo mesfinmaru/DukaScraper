@@ -1,0 +1,38 @@
+{
+    "domain": "scrapingcourse.com",
+    "name": "ScrapingCourse Login Challenge",
+    "description": "ScrapingCourse.com login practice page — email + password. Products appear on the same page after login.",
+    "handle_http_interstitial": false,
+    "login_url": "https://www.scrapingcourse.com/login",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "input[type='email'], input[name='email'], input[placeholder*='email'], input[placeholder*='Email']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill email address"
+        },
+        {
+            "action": "fill",
+            "selector": "input[type='password'], input[name='password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], input[type='submit'], button:has-text('Login'), a:has-text('Login')",
+            "wait_after_ms": 5000,
+            "description": "Click Login button"
+        }
+    ],
+    "post_login_targets": [],
+    "extraction_targets": [
+        {
+            "name": "products",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 10000) : '' }; })()",
+            "description": "Extract products shown on page after login"
+        }
+    ]
+}

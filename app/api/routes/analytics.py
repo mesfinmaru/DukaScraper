@@ -93,3 +93,150 @@ async def evaluation_metrics():
         "category": _metrics(rows, 4, 5),
         "note": "Metrics are based only on human-labeled evaluations; no per-response confidence is inferred.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Threat intelligence analytics (ClickHouse intelligence_analytics)
+# ---------------------------------------------------------------------------
+
+_FLAGGED_FILTER = "category != 'other'"
+
+
+def _dt(value) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+@router.get("/threats")
+async def threat_analytics(limit: int = 50):
+    """Aggregate LLM-classified threat items from ClickHouse.
+
+    Counts and the recent list cover "flagged" items only (category != 'other'),
+    i.e. data_leak / gov_issue / cyber_threat / physical_threat / misinformation.
+    """
+    if not ch_client.client:
+        raise HTTPException(status_code=503, detail="Analytics database unavailable")
+
+    total = ch_client.client.query(
+        f"SELECT count() FROM intelligence_analytics WHERE {_FLAGGED_FILTER}"
+    ).result_rows[0][0]
+
+    by_severity_rows = ch_client.client.query(
+        f"SELECT threat_severity, count() FROM intelligence_analytics "
+        f"WHERE {_FLAGGED_FILTER} GROUP BY threat_severity"
+    ).result_rows
+    by_severity = {int(sev): int(cnt) for sev, cnt in by_severity_rows}
+    by_severity_list = [
+        {"severity": level, "count": int(by_severity.get(level, 0))}
+        for level in (1, 2, 3, 4, 5)
+    ]
+
+    by_category_rows = ch_client.client.query(
+        f"SELECT category, count() FROM intelligence_analytics "
+        f"WHERE {_FLAGGED_FILTER} GROUP BY category ORDER BY count() DESC"
+    ).result_rows
+    by_category_list = [{"category": cat, "count": int(cnt)} for cat, cnt in by_category_rows]
+
+    recent_rows = ch_client.client.query(
+        "SELECT item_id, job_id, url, source_type, category, threat_severity, summary, created_at "
+        f"FROM intelligence_analytics WHERE {_FLAGGED_FILTER} "
+        "ORDER BY created_at DESC LIMIT {limit:UInt32}",
+        parameters={"limit": int(limit)},
+    ).result_rows
+    recent = [
+        {
+            "item_id": row[0],
+            "job_id": row[1],
+            "url": row[2],
+            "source_type": row[3],
+            "category": row[4],
+            "severity": int(row[5]),
+            "summary": row[6],
+            "created_at": _dt(row[7]),
+        }
+        for row in recent_rows
+    ]
+
+    return {
+        "total": int(total),
+        "by_severity": by_severity_list,
+        "by_category": by_category_list,
+        "recent": recent,
+    }
+
+
+@router.get("/performance")
+async def crawler_performance(limit: int = 25):
+    """Worker latency/reliability aggregates + recent attempts from ClickHouse."""
+    if not ch_client.client:
+        raise HTTPException(status_code=503, detail="Analytics database unavailable")
+
+    def _row_result(rows, index: int, default=None):
+        """Return column `index` of the first result row (aggregate queries)."""
+        if not rows:
+            return default
+        row = rows[0]
+        try:
+            return row[index]
+        except (IndexError, TypeError):
+            return default
+
+    # Per-worker aggregates
+    worker_rows = ch_client.client.query(
+        "SELECT worker, count(), avg(latency_ms), quantile(0.95)(latency_ms), "
+        "max(latency_ms), sum(retry_count), "
+        "countIf(status_code >= 400 OR status_code = 0), avg(payload_size_bytes) "
+        "FROM crawler_performance GROUP BY worker ORDER BY count() DESC"
+    ).result_rows
+    workers = []
+    for row in worker_rows:
+        worker, requests, avg_lat, p95_lat, max_lat, retries, errors, avg_payload = row
+        requests = int(requests)
+        error_rate = (errors / requests) if requests else None
+        workers.append({
+            "worker": worker,
+            "requests": requests,
+            "avg_latency_ms": round(float(avg_lat), 1) if avg_lat is not None else None,
+            "p95_latency_ms": round(float(p95_lat), 1) if p95_lat is not None else None,
+            "max_latency_ms": round(float(max_lat), 1) if max_lat is not None else None,
+            "retries": int(retries),
+            "error_rate": round(float(error_rate), 4) if error_rate is not None else None,
+            "avg_payload_bytes": round(float(avg_payload), 1) if avg_payload is not None else None,
+        })
+
+    # Overall aggregates
+    overall_rows = ch_client.client.query(
+        "SELECT count(), avg(latency_ms), quantile(0.95)(latency_ms), "
+        "countIf(status_code >= 400 OR status_code = 0) "
+        "FROM crawler_performance"
+    ).result_rows
+    total_requests = int(_row_result(overall_rows, 0, 0))
+    errors_total = int(_row_result(overall_rows, 3, 0))
+    overall = {
+        "requests": total_requests,
+        "avg_latency_ms": round(float(_row_result(overall_rows, 1)), 1)
+        if overall_rows and overall_rows[0][1] is not None else None,
+        "p95_latency_ms": round(float(_row_result(overall_rows, 2)), 1)
+        if overall_rows and overall_rows[0][2] is not None else None,
+        "error_rate": round(errors_total / total_requests, 4) if total_requests else None,
+    }
+
+    # Recent attempts
+    attempt_rows = ch_client.client.query(
+        "SELECT job_id, worker, status_code, latency_ms, retry_count, payload_size_bytes, created_at "
+        "FROM crawler_performance ORDER BY created_at DESC LIMIT {limit:UInt32}",
+        parameters={"limit": int(limit)},
+    ).result_rows
+    recent_attempts = [
+        {
+            "job_id": row[0],
+            "worker": row[1],
+            "status_code": int(row[2]),
+            "latency_ms": round(float(row[3]), 1) if row[3] is not None else 0,
+            "retry_count": int(row[4]),
+            "payload_size_bytes": int(row[5]),
+            "created_at": _dt(row[6]),
+        }
+        for row in attempt_rows
+    ]
+
+    return {"workers": workers, "overall": overall, "recent_attempts": recent_attempts}

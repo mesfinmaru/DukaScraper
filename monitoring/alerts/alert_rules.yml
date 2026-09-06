@@ -1,0 +1,70 @@
+groups:
+  - name: duka_alerts
+    rules:
+      # --- API down ---
+      - alert: ApiDown
+        expr: up{job="duka-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API is down"
+          description: "Duka API has been unreachable for more than 1 minute."
+
+      # --- Worker down ---
+      - alert: WorkerDown
+        expr: up{job="duka-workers"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker {{ $labels.instance }} is down"
+          description: "Worker {{ $labels.instance }} has been unreachable for more than 2 minutes."
+
+      # --- High error rate (API) ---
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (endpoint)
+          / sum(rate(http_requests_total[5m])) by (endpoint)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx error rate on {{ $labels.endpoint }}"
+          description: "More than 5% of requests to {{ $labels.endpoint }} are returning 5xx errors."
+
+      # --- High request latency (API) ---
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 latency"
+          description: "P95 request latency is above 2 seconds."
+
+      # --- Worker processing errors ---
+      - alert: WorkerProcessingErrors
+        expr: |
+          sum(rate(worker_errors_total[5m])) by (worker) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker {{ $labels.worker }} has high error rate"
+          description: "Worker {{ $labels.worker }} is experiencing more than 0.1 errors/second."
+
+      # --- No messages being consumed (possible Kafka issue) ---
+      - alert: WorkerNoMessages
+        expr: |
+          rate(worker_messages_consumed_total[5m]) == 0
+          and
+          up{job="duka-workers"} == 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Worker {{ $labels.worker }} not consuming messages"
+          description: "Worker {{ $labels.worker }} is up but has consumed no messages for 10 minutes."

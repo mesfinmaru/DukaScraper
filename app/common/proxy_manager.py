@@ -26,6 +26,11 @@ def parse_proxy_url(proxy_url: str) -> dict[str, str] | None:
     if ":" in url and not url.startswith(("http://", "https://", "socks5://", "socks5h://")):
         url = f"http://{url}"
 
+    # Playwright/Patchright only supports socks5://, not socks5h://
+    # socks5h means "DNS through proxy" — replace with socks5://
+    if url.startswith("socks5h://"):
+        url = url.replace("socks5h://", "socks5://", 1)
+
     try:
         parsed = urlparse(url)
         server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"

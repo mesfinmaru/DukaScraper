@@ -1,0 +1,40 @@
+{
+    "domain": "gitlab.com",
+    "name": "GitLab",
+    "description": "GitLab login — email + password. Standard form.",
+    "handle_http_interstitial": false,
+    "login_url": "https://gitlab.com/users/sign_in",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "#user_login, input[name='user[login]'], input[type='email']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill username/email field"
+        },
+        {
+            "action": "fill",
+            "selector": "#user_password, input[name='user[password]'], input[type='password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password field"
+        },
+        {
+            "action": "click",
+            "selector": "input[type='submit'], button:has-text('Sign in'), button[type='submit']",
+            "wait_after_ms": 5000,
+            "description": "Click Sign in button"
+        }
+    ],
+    "post_login_targets": [
+        "/"
+    ],
+    "extraction_targets": [
+        {
+            "name": "dashboard_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract GitLab dashboard data after login"
+        }
+    ]
+}

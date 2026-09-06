@@ -1,0 +1,45 @@
+{
+    "domain": "github.com",
+    "name": "GitHub",
+    "description": "GitHub login — standard email/password form. No SSO click needed; form is already visible on default login page.",
+    "handle_http_interstitial": false,
+    "login_url": "https://github.com/login",
+    "login_steps": [
+        {
+            "action": "wait",
+            "wait_after_ms": 3000,
+            "description": "Wait for GitHub login page to fully render"
+        },
+        {
+            "action": "fill",
+            "selector": "#login_field, input[name='login'], input[autocomplete='username']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill username/email field"
+        },
+        {
+            "action": "fill",
+            "selector": "#password, input[name='password'], input[type='password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password field"
+        },
+        {
+            "action": "click",
+            "selector": "input[type='submit'][name='commit'], button:has-text('Sign in')",
+            "wait_after_ms": 8000,
+            "description": "Click Sign in button and wait for redirect"
+        }
+    ],
+    "post_login_targets": [
+        "/dashboard"
+    ],
+    "extraction_targets": [
+        {
+            "name": "dashboard_profile",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract dashboard data after login"
+        }
+    ]
+}

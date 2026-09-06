@@ -154,28 +154,27 @@ class LinkExtractionService:
     # Non-content page path patterns that should never be crawled as articles.
     # Matches against the lowercased path of the resolved absolute URL.
     NON_CONTENT_PATH_PATTERNS = (
-        r"/search",
-        r"/login",
-        r"/signin",
-        r"/signup",
-        r"/register",
-        r"/account",
-        r"/auth",
-        r"/logout",
-        r"/password",
-        r"/forgot",
-        r"/reset",
-        r"/subscribe",
-        r"/unsubscribe",
-        r"/cart",
-        r"/checkout",
-        r"/compare",
+        r"/search$",
+        r"/signin$",
+        r"/signup$",
+        r"/register$",
+        r"/account$",
+        r"/auth$",
+        r"/logout$",
+        r"/password$",
+        r"/forgot$",
+        r"/reset$",
+        r"/subscribe$",
+        r"/unsubscribe$",
+        r"/cart$",
+        r"/checkout$",
+        r"/compare$",
         r"/tag/",
         r"/tags/",
         r"/category/",
         r"/categories/",
-        r"/watch",
-        r"/redirect",
+        r"/watch$",
+        r"/redirect$",
         r"/go/",
         r"/out/",
         r"/page/\d+$",
@@ -781,6 +780,7 @@ class LinkExtractionService:
         *,
         same_domain_as: str | None = None,
         include_subdomains: bool = True,
+        path_prefix: str | None = None,
     ) -> list[str]:
         """
         Filter extracted links based on whitelist patterns and domain blocklist.
@@ -792,6 +792,9 @@ class LinkExtractionService:
             same_domain_as: If provided, only keep links whose registrable domain
                 matches this URL's (crawl-scoping helper)
             include_subdomains: Whether subdomains count as "same domain" for same_domain_as
+            path_prefix: If provided, only keep links whose path starts with this
+                prefix (e.g. "/amharic" keeps bbc.com/amharic/... but rejects
+                bbc.com/sport/...).  Combined with same_domain_as for full scope.
 
         Returns:
             Filtered list of URLs
@@ -858,6 +861,19 @@ class LinkExtractionService:
                 ):
                     logger.debug(f"Filtered out {link} (outside crawl scope of {same_domain_as})")
                     continue
+
+                # Path-prefix scoping: keep the crawler within the seed URL's
+                # directory tree.  E.g. seed bbc.com/amharic keeps only links
+                # whose path starts with /amharic/ (or equals /amharic).
+                if path_prefix:
+                    link_path = (parsed.path or "/").rstrip("/")
+                    # Ensure boundary match: /amharic must NOT match /amharic-news
+                    pp = path_prefix.rstrip("/")
+                    if link_path != pp and not link_path.startswith(pp + "/"):
+                        logger.debug(
+                            f"Filtered out {link} (path '{link_path}' not under prefix '{pp}')"
+                        )
+                        continue
 
                 if allowed_patterns:
                     matched = any(re.search(pat, link, re.IGNORECASE) for pat in allowed_patterns)

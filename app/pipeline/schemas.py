@@ -5,10 +5,10 @@ TEXT-ONLY crawling pipeline with source_type POST-ANALYSIS
 
 NOTE on ID types:
 PostgreSQL IDs are auto-generated STRINGS (not integers):
-  - duka_system.users.user_id    -> VARCHAR(8)  e.g. "USR12345"
-  - duka_system.jobs.job_id      -> VARCHAR(11) e.g. "JOB00000001"
-  - duka_db.parsed_items.item_id -> VARCHAR(12) e.g. "ITEM00000001"
-  - duka_db.exports.export_id    -> VARCHAR(11) e.g. "EXP00000001"
+  - duka_system.users.user_id      -> VARCHAR(8)  e.g. "USR12345"
+  - duka_system.jobs.job_id        -> VARCHAR(11) e.g. "JOB00000001"
+  - duka_system.parsed_items.item_id -> VARCHAR(12) e.g. "ITEM00000001"
+  - duka_system.exports.export_id  -> VARCHAR(11) e.g. "EXP00000001"
 All schemas below use `str` for these IDs to match the real database schema.
 
 NOTE on source_type:
@@ -60,7 +60,7 @@ class CrawlRequest(BaseModel):
     )
     recursive_config: dict = Field(
         default_factory=dict,
-        description="Recursion rules: {enable_extraction: bool, link_filter_patterns: [...], skip_domains: [...]}",
+        description="Recursion rules: {enable_extraction: bool, link_filter_patterns: [...], skip_domains: [...], same_domain_only: bool, scope_prefix: str|None}",
     )
 
     # ========================================================================
@@ -227,7 +227,7 @@ class IntelligenceAnalytics(BaseModel):
 
 
 # ============================================================================
-# DATABASE SCHEMAS (duka_system + duka_db - PostgreSQL)
+# DATABASE SCHEMAS (duka_system - PostgreSQL)
 # ============================================================================
 
 
@@ -262,7 +262,7 @@ class UserRecord(BaseModel):
 
 class ParsedItemRecord(BaseModel):
     """
-    Schema for PostgreSQL duka_db.parsed_items table.
+    Schema for PostgreSQL duka_system.parsed_items table.
     METADATA ONLY - actual text lives in MinIO (duka-parsed-data).
     The worker is recorded here because each item is processed by one worker,
     even though a job can flow through multiple worker stages across items.
@@ -291,7 +291,7 @@ class ParsedItemRecord(BaseModel):
 
 class ExportRecord(BaseModel):
     """
-    Schema for PostgreSQL duka_db.exports table
+    Schema for PostgreSQL duka_system.exports table
     """
 
     export_id: str | None = None  # Auto-generated: EXP00000001

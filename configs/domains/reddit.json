@@ -1,0 +1,41 @@
+{
+    "domain": "reddit.com",
+    "name": "Reddit",
+    "description": "Reddit login — username/email + password. Standard form.",
+    "handle_http_interstitial": false,
+    "login_url": "https://www.reddit.com/login/",
+    "login_steps": [
+        {
+            "action": "fill",
+            "selector": "#login-username, input[name='username'], input[autocomplete='username']",
+            "value": "$username",
+            "wait_after_ms": 500,
+            "description": "Fill username/email field"
+        },
+        {
+            "action": "fill",
+            "selector": "#login-password, input[name='password'], input[type='password']",
+            "value": "$password",
+            "wait_after_ms": 500,
+            "description": "Fill password field"
+        },
+        {
+            "action": "click",
+            "selector": "button[type='submit'], button:has-text('Log In'), button[class*='login']",
+            "wait_after_ms": 5000,
+            "description": "Click Log In button"
+        }
+    ],
+    "post_login_targets": [
+        "/",
+        "/user/me"
+    ],
+    "extraction_targets": [
+        {
+            "name": "feed_data",
+            "type": "custom",
+            "js_extract": "(() => { return { url: window.location.href, title: document.title, body_text: document.body ? document.body.innerText.substring(0, 5000) : '' }; })()",
+            "description": "Extract Reddit feed data after login"
+        }
+    ]
+}

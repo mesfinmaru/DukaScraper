@@ -217,19 +217,17 @@ AUTH_PATTERNS = [
     r'checking\s+your\s+browser.*(?:cloudflare|captcha|challenge)',
     r'(?:verify\s+you\s+are\s+human|attention\s+required).*?(?:cloudflare|captcha|challenge)',
     # Challenge provider scripts/iframe markers (require HTML element context)
-    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*(?:cf-chl|challenge-platform|hcaptcha|recaptcha)',
-    r'<iframe[^>]*src\s*=\s*["\']?https?://[^"\'>]*(?:turnstile|challenge|hcaptcha|recaptcha)',
+    r'<script[^>]*src\s*=\s*["\']?(?:https?://)?[^"\'>]*(?:cf-chl|challenge-platform|hcaptcha|recaptcha)',
+    r'<iframe[^>]*src\s*=\s*["\']?(?:https?://)?[^"\'>]*(?:turnstile|challenge|hcaptcha|recaptcha)',
     r'recaptcha/api\.js',
-    # PerimeterX / DataDome / Akamai bot manager script markers
-    r'<script[^>]*>.*?(?:perimeterx|px-captcha|_px3)',
+    # PerimeterX / DataDome / Akamai bot manager — match in ANY HTML context
+    r'(?:perimeterx|px-captcha|_px3|_px2)',
     r'datadome[^<]*(?:\.js|\.min\.js)',
-    r'akamai[^<]*bot|bm-verify',
-    r'incapsula|imperva',
+    r'(?:akamai[^<]*bot|bm-verify|bm-notice)',
+    r'(?:incapsula|imperva)',
     # Cloudflare challenge scripts — match cf-chl/challenge-platform in script src,
-    # but NOT the Turnstile v0 API library (challenges.cloudflare.com/turnstile/v0/api.js)
-    # which is included on normal pages that merely USE Turnstile on sub-pages.
-    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*cloudflare[^"\'>]*cf-chl',
-    r'<script[^>]*src\s*=\s*["\']?https?://[^"\'>]*challenge-platform',
+    # including relative paths (/cdn-cgi/challenge-platform/...)
+    r'<script[^>]*src\s*=\s*["\']?(?:https?://)?[^"\'>]*(?:cf-chl|challenge-platform)',
 ]
 AUTH_REGEX_PATTERNS = [re.compile(pat, re.IGNORECASE) for pat in AUTH_PATTERNS]
 
