@@ -99,6 +99,22 @@ class Settings(BaseSettings):
     # Deep Worker (Browser / Patchright)
     # ==================================================================
     DEEP_MAX_CONCURRENT_JOBS: int = 5
+    # Hard wall-clock budget per crawl message: one slow/hanging page ( spins,
+    # dead browser sockets, endless Cloudflare retries) must not stall the
+    # whole job — the message task is cancelled at this deadline and the site
+    # is closed out as failed.
+    DEEP_MESSAGE_BUDGET_SECONDS: float = 150.0
+
+    # ==================================================================
+    # Job watchdog — fails jobs stuck in running/pending forever
+    # ==================================================================
+    JOB_WATCHDOG_ENABLED: bool = True
+    JOB_WATCHDOG_INTERVAL_SECONDS: int = 60
+    # A job is stale when neither it nor its crawl_log has been active for
+    # this long (covers worker crashes where the exception never reaches the
+    # per-message handler). Recursive jobs keep resetting this via their
+    # per-site crawl_log entries.
+    JOB_STALE_JOB_SECONDS: int = 1800
 
     # ==================================================================
     # Dark Worker (Tor)
@@ -148,6 +164,15 @@ class Settings(BaseSettings):
     crawl_request_topic: str = "crawl.requests"
     crawl_raw_topic: str = "crawl.raw"
     crawl_parsed_topic: str = "crawl.parsed"
+
+    # ==================================================================
+    # Elasticsearch
+    # ==================================================================
+    # Default targets a local install; docker-compose overrides this with the
+    # in-network hostname (http://elasticsearch:9200). The container default
+    # "localhost" silently pointed at the API container itself, so /ready
+    # always reported elasticsearch down and search returned 503.
+    ELASTICSEARCH_URL: str = "http://localhost:9200"
 
     # ==================================================================
     # MinIO Storage

@@ -593,22 +593,26 @@ class PostgreSQLClient:
         user_id: str,
         url: str,
         language: str = "am",
+        assignment_reason: str | None = None,
     ):
         """Create a new job row without storing worker_type at the job level.
 
         Worker assignment happens in the in-flight CrawlRequest and is persisted
-        at the parsed-item level once each item is created.
+        at the parsed-item level once each item is created. The rules-engine
+        decision is preserved on the job row as ``assignment_reason`` so the UI
+        can explain why a job went to surface/deep/dark.
         """
         if not self.system_pool:
             raise RuntimeError("Database not connected")
         async with self.system_pool.acquire() as conn:
             row = await conn.fetchrow(
-                """INSERT INTO jobs (user_id, url, language, status)
-                   VALUES ($1, $2, $3, 'pending')
-                   RETURNING job_id, user_id, url, language, status, created_at""",
+                """INSERT INTO jobs (user_id, url, language, status, assignment_reason)
+                   VALUES ($1, $2, $3, 'pending', $4)
+                   RETURNING job_id, user_id, url, language, status, created_at, assignment_reason""",
                 user_id,
                 url,
                 language,
+                assignment_reason,
             )
         await self._publish_job_event(
             event="job_created",
@@ -634,27 +638,219 @@ class PostgreSQLClient:
         async with self.system_pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC", user_id)
 
+    async def get_active_job_for_url(self, user_id: str, url: str):
+        """Return an existing non-terminal job for the same user + URL, if any.
+
+        Used to prevent duplicate jobs when the UI "Start crawl" button is
+        clicked repeatedly for a URL that is already queued/running.
+        Failed and completed jobs are excluded so re-submission creates a new job.
+        """
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        normalized = url.strip().rstrip("/")
+        async with self.system_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT job_id, user_id, url, status, created_at
+                   FROM jobs
+                   WHERE user_id = $1
+                     AND rtrim(url, '/') = $2
+                     AND status IN ('pending', 'queued', 'running')
+                   ORDER BY created_at DESC""",
+                user_id,
+                normalized,
+            )
+            # Return only the most recent active job, or None if no active jobs
+            return rows[0] if rows else None
+
+    async def get_job_owners(self, job_ids: list[str]) -> dict[str, str | None]:
+        """Map job_id -> user_id for the given jobs (missing jobs are omitted)."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        if not job_ids:
+            return {}
+        async with self.system_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT job_id, user_id FROM jobs WHERE job_id = ANY($1)",
+                list(job_ids),
+            )
+        return {row["job_id"]: row["user_id"] for row in rows}
+
     async def update_job_status(self, job_id: str, status: str):
-        """Update job status. Sets completed_at automatically when status is terminal."""
+        """Update job status. Sets completed_at automatically when status is terminal.
+
+        Terminal-safe: an active status (``running``/``pending``) is never
+        applied to a job that already finished (completed/failed/skipped), and
+        ``completed`` is never downgraded to ``failed``/``skipped``. Recursive
+        jobs process many messages concurrently — a stale worker message must
+        not resurrect a finished job or stomp a failure written by another page.
+        """
         if not self.system_pool:
             await self.connect()
         async with self.system_pool.acquire() as conn:
             if status in ("completed", "failed", "skipped", "needs_review"):
                 if status == "completed":
                     await conn.execute(
-                        "UPDATE jobs SET status = $1, completed_at = NOW() WHERE job_id = $2",
+                        "UPDATE jobs SET status = $1, completed_at = COALESCE(completed_at, NOW()) WHERE job_id = $2",
                         status,
                         job_id,
                     )
                 else:
                     await conn.execute(
-                        "UPDATE jobs SET status = $1, completed_at = NOW() WHERE job_id = $2 AND status <> 'completed'",
+                        "UPDATE jobs SET status = $1, completed_at = COALESCE(completed_at, NOW()) WHERE job_id = $2 AND status <> 'completed'",
                         status,
                         job_id,
                     )
             else:
-                await conn.execute("UPDATE jobs SET status = $1 WHERE job_id = $2", status, job_id)
+                # Active states only apply to jobs that have not finished yet.
+                await conn.execute(
+                    "UPDATE jobs SET status = $1 WHERE job_id = $2 "
+                    "AND status IN ('pending', 'running', 'needs_review')",
+                    status,
+                    job_id,
+                )
         await self._publish_job_event(event="job_status", job_id=job_id, status=status)
+
+    async def register_job_tasks(self, job_id: str, task_count: int) -> None:
+        """Add child crawl tasks before they are published to Kafka."""
+        if task_count <= 0:
+            return
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET active_tasks = active_tasks + $1 WHERE job_id = $2",
+                task_count,
+                job_id,
+            )
+
+    async def complete_job_task(
+        self,
+        job_id: str,
+        *,
+        failed: bool = False,
+        fail_reason: str | None = None,
+    ) -> str:
+        """Settle one crawl message and transition the job when the last one ends.
+
+        Outcome rules:
+          - ``failed=True`` marks the job failed immediately: any page that
+            crashed fails the whole job, and the remaining outstanding
+            messages settle as no-ops (they cannot resurrect it).
+          - otherwise the job completes ONLY when this is the last
+            outstanding task AND the job is still in an active/needs_review
+            state — a recursive job with many sites must never flip to
+            ``completed`` while children are still queued, and must never
+            overwrite a ``failed`` status written by a crashed page.
+
+        Returns the resulting job status ("" when the job row is gone).
+        """
+        if not self.system_pool:
+            await self.connect()
+        final_status = ""
+        async with self.system_pool.acquire() as conn:
+            async with conn.transaction():
+                if failed:
+                    row = await conn.fetchrow(
+                        """UPDATE jobs
+                           SET status = 'failed',
+                               completed_at = COALESCE(completed_at, NOW()),
+                               active_tasks = GREATEST(active_tasks - 1, 0)
+                         WHERE job_id = $1 AND status <> 'completed'
+                         RETURNING status""",
+                        job_id,
+                    )
+                    final_status = row["status"] if row else ""
+                else:
+                    row = await conn.fetchrow(
+                        """UPDATE jobs
+                           SET active_tasks = GREATEST(active_tasks - 1, 0),
+                               status = CASE
+                                   WHEN active_tasks <= 1
+                                        AND status IN ('pending', 'running', 'needs_review')
+                                   THEN 'completed' ELSE status END,
+                               completed_at = CASE
+                                   WHEN active_tasks <= 1
+                                        AND status IN ('pending', 'running', 'needs_review')
+                                   THEN NOW() ELSE completed_at END
+                         WHERE job_id = $1
+                         RETURNING status""",
+                        job_id,
+                    )
+                    final_status = row["status"] if row else ""
+                if failed and fail_reason:
+                    try:
+                        await conn.execute(
+                            """INSERT INTO crawl_log
+                               (job_id, item_id, url, worker_type, event_type, status, retry_count, details)
+                               VALUES ($1, NULL, '', 'worker', 'task_failed', 'failed', 0, $2)""",
+                            job_id, (fail_reason or "unknown error")[:2000],
+                        )
+                    except Exception as exc:
+                        logger.debug("Could not record task failure for %s: %s", job_id, exc)
+        if final_status in ("completed", "failed"):
+            await self._publish_job_event(event="job_status", job_id=job_id, status=final_status)
+        return final_status
+
+    async def fail_job(
+        self,
+        job_id: str,
+        *,
+        worker_type: str,
+        url: str = "",
+        reason: str,
+        item_id: str | None = None,
+        event_type: str = "worker_error",
+    ) -> None:
+        """Mark a job failed and persist the failure reason (never raises).
+
+        The reason is written to ``crawl_log`` so ``get_job_failure_reason``
+        (and the job detail UI) can show WHY the job failed. Used by workers
+        when an exception escapes job processing and by the stuck-job watchdog.
+        """
+        try:
+            await self.record_crawl_log(
+                job_id,
+                item_id,
+                url,
+                worker_type,
+                event_type,
+                "failed",
+                details=(reason or "unknown error")[:2000],
+            )
+        except Exception as exc:
+            logger.warning("Could not record failure reason for job %s: %s", job_id, exc)
+        try:
+            await self.update_job_status(job_id, "failed")
+        except Exception as exc:
+            logger.error("Could not mark job %s failed: %s", job_id, exc)
+
+    async def get_stale_running_jobs(self, max_inactive_seconds: float) -> list[dict]:
+        """Return non-terminal jobs with no activity for *max_inactive_seconds*.
+
+        A job counts as stale when its last ``crawl_log`` entry (or its
+        ``created_at`` if it never logged anything) is older than the cutoff —
+        i.e. the worker died or stopped mid-processing. Used by the API-side
+        job watchdog to fail jobs that would otherwise sit in ``running``.
+        """
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT j.job_id, j.user_id, j.url, j.status, j.created_at,
+                          COALESCE(
+                              (SELECT MAX(cl.created_at) FROM crawl_log cl WHERE cl.job_id = j.job_id),
+                              j.created_at
+                          ) AS last_activity
+                   FROM jobs j
+                   WHERE j.status IN ('pending', 'running')
+                     AND COALESCE(
+                             (SELECT MAX(cl.created_at) FROM crawl_log cl WHERE cl.job_id = j.job_id),
+                             j.created_at
+                         ) < NOW() - ($1 * INTERVAL '1 second')
+                   ORDER BY last_activity""",
+                float(max_inactive_seconds),
+            )
+        return [dict(r) for r in rows]
 
     async def get_job_failure_reason(self, job_id: str) -> str | None:
         """Return the most recent crawl_log error detail for a failed job."""
@@ -1355,8 +1551,15 @@ class PostgreSQLClient:
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','skipped','needs_review')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP,
+    active_tasks INTEGER NOT NULL DEFAULT 0,
     CONSTRAINT fk_jobs_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 )"""
+            )
+            await conn.execute(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS active_tasks INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assignment_reason VARCHAR(64)"
             )
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (

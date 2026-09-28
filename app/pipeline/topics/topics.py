@@ -11,7 +11,9 @@ CRAWL_RAW = "crawl.raw"  # surface/deep/dark workers -> parser-worker
 CRAWL_PARSED = "crawl.parsed"  # parser-worker -> exporter-worker
 
 # --- Resilience & Error Handling Topics ---
-CRAWL_REQUESTS_RETRY = "crawl.requests.retry"
+# NOTE: crawl.requests.retry was removed - nothing ever produced to or consumed
+# from it. Escalation re-publishes to crawl.requests (with retry_count bumped
+# and a circuit breaker at MAX_RETRY_COUNT=3), which is the actual retry path.
 CRAWL_REQUESTS_DLQ = "crawl.requests.dlq"
 
 
@@ -20,6 +22,5 @@ ALL_TOPICS = [
     CRAWL_REQUESTS,
     CRAWL_RAW,
     CRAWL_PARSED,
-    CRAWL_REQUESTS_RETRY,
     CRAWL_REQUESTS_DLQ,
 ]

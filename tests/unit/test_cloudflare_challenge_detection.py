@@ -47,8 +47,19 @@ _MOCK_MODULES = [
     "browserforge", "browserforge.fingerprints",
 ]
 
+# Snapshot of sys.modules (name -> module object) BEFORE any mocks are
+# installed. The cleanup below restores exactly what the mocked era added or
+# shadowed, compared by object identity.
+_MODULES_BEFORE_MOCKS = dict(sys.modules)
+
+# Settings modules are shadowed unconditionally: this file assigns attributes
+# on them (e.g. _settings_mock.settings = MagicMock()), and if the real module
+# was already imported (e.g. by conftest or an earlier test file), that would
+# mutate the real module for every later test. Shadowing keeps the real object
+# untouched; cleanup restores it by identity.
+_ALWAYS_SHADOW = ("app.common.config.settings", "app.common.config.wsl_settings")
 for mod_name in _MOCK_MODULES:
-    if mod_name not in sys.modules:
+    if mod_name in _ALWAYS_SHADOW or mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
 # browserforge.fingerprints needs a real Screen class
@@ -110,15 +121,17 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["workers.deep_worker_main"] = _mod
 _spec.loader.exec_module(_mod)
 
-# Restore any sys.modules entries we shadowed with MagicMocks. The mocks are
-# only needed while the worker module imports; leaving them installed poisons
-# subsequently collected test files (test_logger, test_metrics import the
-# mocked modules and fail with MagicMock values).
-for mod_name in _MOCK_MODULES:
-    mod = sys.modules.get(mod_name)
-    if isinstance(mod, MagicMock):
+# Restore sys.modules so subsequently collected test files are not poisoned
+# (a lingering mocked 'pydantic' breaks every later FastAPI import, and real
+# modules imported while the mocks were active may have cached mock-derived
+# singletons). Remove everything this file added or shadowed during the mocked
+# era; restore shadowed pre-existing modules by identity.
+for mod_name in list(sys.modules):
+    if mod_name in _MODULES_BEFORE_MOCKS:
+        if sys.modules[mod_name] is not _MODULES_BEFORE_MOCKS[mod_name]:
+            sys.modules[mod_name] = _MODULES_BEFORE_MOCKS[mod_name]
+    else:
         sys.modules.pop(mod_name, None)
-sys.modules.pop("workers.deep_worker_main", None)
 
 _is_cloudflare_challenge = _mod._is_cloudflare_challenge
 _html_has_cloudflare_challenge = _mod._html_has_cloudflare_challenge

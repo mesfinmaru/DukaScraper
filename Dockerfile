@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
 RUN pip install --no-cache --no-index --find-links=/wheels -r requirements.txt
+RUN pip install --no-cache --force-reinstall "elasticsearch==8.19.2"
 
 # Copy application code and set ownership
 COPY --chown=duka:duka app/ ./app/

@@ -1,0 +1,15 @@
+[
+  {
+    "name": "Duka PostgreSQL",
+    "group": "duka",
+    "host": "postgres",
+    "port": 5432,
+    "maintenance_db": "duka_system",
+    "username": "postgres",
+    "password": "postgres",
+    "save_password": true,
+    "connect_now": true,
+    "color": "#336791",
+    "comments": "Main DukaScraper database"
+  }
+]

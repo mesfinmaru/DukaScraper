@@ -84,10 +84,36 @@ async def submit_crawl_job(
     existing_user = await pg_client.ensure_user(normalized_user_id)
     actual_user_id = existing_user["user_id"]
 
+    # --- Duplicate-job guard ---
+    # A URL that is already queued/running for this user is NOT re-submitted;
+    # the existing job is returned instead so repeated "Start crawl" clicks
+    # never spawn duplicate crawls of the same URL.
+    try:
+        active = await pg_client.get_active_job_for_url(actual_user_id, url)
+        if active:
+            logger.info(
+                "Duplicate submission suppressed for %s — active job %s already exists",
+                url, active["job_id"],
+            )
+            return {
+                "message": "This URL is already being crawled — returning the active job",
+                "job_id": active["job_id"],
+                "assigned_worker": worker_type,
+                "assignment_reason": "duplicate_active_job",
+                "max_depth": max_depth,
+                "duplicate": True,
+                "kafka_topic": topics.CRAWL_REQUESTS,
+            }
+    except HTTPException:
+        raise
+    except Exception as guard_err:
+        logger.warning("Duplicate-job guard failed (non-fatal): %s", guard_err)
+
     job_row = await pg_client.create_job(
         user_id=actual_user_id,
         url=url,
         language=language,
+        assignment_reason=assignment_reason,
     )
 
     # Inject seed_url into recursive_config so recursive_crawl_service
@@ -108,8 +134,38 @@ async def submit_crawl_job(
         job_params=job_params or {},
     )
 
+    # One outstanding task represents the root message. Workers transfer
+    # this count to child messages as recursive pages are queued.
+    await pg_client.register_job_tasks(job_row["job_id"], 1)
+
+    # Publish FIRST, then mark running. If Kafka is down (broker restarting,
+    # network blip) the job row must not stay in ``running`` forever with no
+    # message in the topic — that orphans the job, blocks re-submission via
+    # the duplicate-job guard, and the UI spins on it until the watchdog
+    # (30 min) finally fails it.
+    try:
+        await kafka_producer.publish_crawl_request(request=job_event)
+    except Exception as publish_err:
+        logger.error(
+            "Kafka publish failed for job %s (%s): %s — marking job failed",
+            job_row["job_id"], url, publish_err,
+        )
+        await pg_client.fail_job(
+            job_row["job_id"],
+            worker_type=worker_type,
+            url=url,
+            reason=(
+                "Job could not be queued: the message broker was unreachable. "
+                "Click Retry to resubmit."
+            ),
+            event_type="publish_failed",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Message broker unavailable — the crawl was not queued. Please retry in a moment.",
+        ) from publish_err
+
     await pg_client.update_job_status(job_row["job_id"], "running")
-    await kafka_producer.publish_crawl_request(request=job_event)
 
     logger.info(
         "Submitted crawl job %s for %s -> %s worker (reason=%s, max_depth=%s)",

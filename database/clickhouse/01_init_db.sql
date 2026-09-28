@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS duka_scraper.crawler_performance (
 ) ENGINE = MergeTree()
 ORDER BY (worker, job_id, item_id);
 
+-- Idempotency: ReplacingMergeTree keyed on item_id — at-least-once Kafka
+-- re-delivery (crash between insert and the parsed_items.intelligence_processed
+-- flag) can no longer produce duplicate intelligence rows. Queries should use
+-- FINAL or argMax(created_at) per item_id to collapse duplicates from concurrent
+-- inserts (Replacing only merges asynchronously).
 CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_analytics (
     job_id String,
     item_id String,
@@ -49,5 +54,21 @@ CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_analytics (
     llm_model String,
     llm_score Float32,
     created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-ORDER BY (created_at, category);
+) ENGINE = ReplacingMergeTree(created_at)
+ORDER BY (item_id);
+
+-- Flattened entity index for OSINT queries ("every page mentioning X").
+-- One row per (item, entity). Written by the llm-worker alongside the
+-- intelligence_analytics insert; ReplacingMergeTree(item_id, entity) keeps it
+-- idempotent against re-delivery too.
+CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_entities (
+    item_id String,
+    entity String,
+    job_id String,
+    url String,
+    category LowCardinality(String),
+    language LowCardinality(String),
+    threat_severity UInt8,
+    created_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(created_at)
+ORDER BY (entity, item_id);

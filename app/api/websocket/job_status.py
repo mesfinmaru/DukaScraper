@@ -150,6 +150,19 @@ async def job_status_websocket(websocket: WebSocket, job_id: str):
         except Exception as e:
             logger.debug("Could not fetch initial job status for %s: %s", job_id, e)
 
+        # Replay stored history (logs + stage transitions) so a client that
+        # opens the job after completion — or from another browser — still
+        # gets the full picture, not just what happens from now on.
+        try:
+            from app.common.job_events import get_job_log_history, get_job_stage_history
+
+            for stage_event in await get_job_stage_history(job_id):
+                await _send_json(websocket, stage_event)
+            for log_line in await get_job_log_history(job_id):
+                await _send_json(websocket, log_line)
+        except Exception as e:
+            logger.debug("Could not replay job history for %s: %s", job_id, e)
+
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30)

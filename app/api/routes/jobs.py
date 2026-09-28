@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from app.common.logger.logger import logger
 from app.pipeline.main import submit_crawl_job
-from app.security.auth import require_admin
+from app.security.auth import ensure_owner_or_admin, get_current_user, require_admin
 from app.storage.postgres.client import pg_client
 
 router = APIRouter()
@@ -26,7 +26,13 @@ class ScrapeRequest(BaseModel):
     """
 
     url: HttpUrl
-    user_id: str = Field(..., description="ID of the user submitting the job, e.g. 'USR12345'.")
+    user_id: str | None = Field(
+        None,
+        description=(
+            "Submit on behalf of this user (ADMIN ONLY - ignored for regular "
+            "users, whose authenticated identity from the JWT is used)."
+        ),
+    )
     language: str = Field(
         "am",
         description="Language of the content to be scraped ('am', 'en').",
@@ -75,8 +81,15 @@ class BatchScrapeRequest(BaseModel):
 
 
 @router.post("/trigger", status_code=202, response_model=dict)
-async def trigger_scrape_job(request: ScrapeRequest):
+async def trigger_scrape_job(
+    request: ScrapeRequest,
+    user: dict = Depends(get_current_user),
+):
     """Persist a new job row and publish the matching CrawlRequest.
+
+    Requires authentication. The job is always attributed to the
+    authenticated user from the JWT; only admins may submit on behalf of
+    another user via the optional body ``user_id``.
 
     worker_type is assigned automatically by the multi-signal rules engine
     (domain whitelist + WAF/CDN detection + Ethiopian domain intelligence +
@@ -84,9 +97,12 @@ async def trigger_scrape_job(request: ScrapeRequest):
     later hits a 403/login-form/empty-shell, it self-escalates to DEEP
     automatically - no manual intervention required.
     """
+    effective_user_id = user["user_id"]
+    if request.user_id and user["role"] == "admin":
+        effective_user_id = request.user_id
     try:
         result = await submit_crawl_job(
-            user_id=request.user_id,
+            user_id=effective_user_id,
             url=str(request.url),
             language=request.language,
             worker_override=request.worker_override,
@@ -107,8 +123,19 @@ async def trigger_scrape_job(request: ScrapeRequest):
 
 
 @router.post("/batch", status_code=202, response_model=dict)
-async def trigger_batch(request: BatchScrapeRequest):
-    """Submit a URL batch with explicit authentication permissions."""
+async def trigger_batch(
+    request: BatchScrapeRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Submit a URL batch with explicit authentication permissions.
+
+    Requires authentication. Jobs are attributed to the authenticated user
+    from the JWT; only admins may submit on behalf of another user via the
+    optional body ``user_id``.
+    """
+    effective_user_id = user["user_id"]
+    if request.user_id and user["role"] == "admin":
+        effective_user_id = request.user_id
     jobs = []
     for url in request.urls:
         params = dict(request.job_params)
@@ -119,7 +146,7 @@ async def trigger_batch(request: BatchScrapeRequest):
             params["credential_email"] = request.credential_email
         try:
             jobs.append(await submit_crawl_job(
-                user_id=request.user_id,
+                user_id=effective_user_id,
                 url=str(url),
                 language=request.language,
                 worker_override=request.worker_override,
@@ -136,8 +163,12 @@ async def trigger_batch(request: BatchScrapeRequest):
 
 
 @router.get("/user/{user_id}", response_model=dict)
-async def get_user_jobs(user_id: str):
-    """List all jobs submitted by a given user."""
+async def get_user_jobs(user_id: str, user: dict = Depends(get_current_user)):
+    """List all jobs submitted by a given user.
+
+    Regular users may only list their own jobs; admins may list any user's.
+    """
+    ensure_owner_or_admin(owner_id=user_id, user=user)
     from app.storage.postgres.client import _normalize_user_id
     normalized = _normalize_user_id(user_id)
     existing = await pg_client.ensure_user(normalized)
@@ -152,6 +183,7 @@ async def get_user_jobs(user_id: str):
                 "url": job["url"],
                 "status": job["status"],
                 "created_at": job["created_at"].isoformat() if job["created_at"] else None,
+                "assignment_reason": job["assignment_reason"] if "assignment_reason" in job.keys() else None,
             }
             for job in jobs
         ],
@@ -173,6 +205,7 @@ async def get_all_jobs(_: object = Depends(require_admin)):
                 "status": row["status"],
                 "user_id": row["user_id"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "assignment_reason": row["assignment_reason"] if "assignment_reason" in row.keys() else None,
             }
             for row in rows
         ],
@@ -187,7 +220,7 @@ async def get_all_jobs(_: object = Depends(require_admin)):
 
 
 @router.get("/{job_id}/external-links/domains", response_model=dict)
-async def get_discovered_domains(job_id: str):
+async def get_discovered_domains(job_id: str, user: dict = Depends(get_current_user)):
     """Get aggregated external domains discovered during a crawl.
 
     Returns domains grouped by registrable domain with link counts and
@@ -197,6 +230,7 @@ async def get_discovered_domains(job_id: str):
     job = await pg_client.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
     domains = await pg_client.get_discovered_external_domains(job_id)
 
@@ -223,6 +257,7 @@ async def get_discovered_domains(job_id: str):
 async def get_discovered_links(
     job_id: str,
     status: str | None = None,
+    user: dict = Depends(get_current_user),
 ):
     """Get discovered external links, optionally filtered by status.
 
@@ -233,6 +268,7 @@ async def get_discovered_links(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
     links = await pg_client.get_discovered_external_links(job_id, status)
     return {
         "job_id": job_id,
@@ -275,6 +311,7 @@ class ReviewLinksRequest(BaseModel):
 async def review_discovered_links(
     job_id: str,
     request: ReviewLinksRequest,
+    user: dict = Depends(get_current_user),
 ):
     """Approve or reject discovered external links.
 
@@ -284,6 +321,7 @@ async def review_discovered_links(
     job = await pg_client.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
     if request.action not in ("approve", "reject"):
         raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
@@ -349,7 +387,7 @@ async def review_discovered_links(
 
 
 @router.get("/{job_id}/dedup/stats", response_model=dict)
-async def get_dedup_stats(job_id: str):
+async def get_dedup_stats(job_id: str, user: dict = Depends(get_current_user)):
     """Get deduplication statistics for a job.
 
     Shows how many items were unique vs duplicates across all 3 tiers:
@@ -360,6 +398,7 @@ async def get_dedup_stats(job_id: str):
     job = await pg_client.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
     stats = await pg_client.get_dedup_stats(job_id)
     return {
@@ -370,11 +409,12 @@ async def get_dedup_stats(job_id: str):
 
 
 @router.get("/{job_id}/dedup/{item_id}/duplicates", response_model=dict)
-async def get_item_duplicates(job_id: str, item_id: str):
+async def get_item_duplicates(job_id: str, item_id: str, user: dict = Depends(get_current_user)):
     """Get all items that are duplicates of a given item."""
     job = await pg_client.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
     fp = await pg_client.get_fingerprint_by_item(item_id)
     if not fp:
@@ -410,11 +450,17 @@ async def get_item_duplicates(job_id: str, item_id: str):
 async def check_dedup(
     job_id: str,
     url: str,
+    user: dict = Depends(get_current_user),
 ):
     """Check if a URL would be a duplicate before submitting a crawl job.
 
     Useful for the UI to show "this page was already crawled" warnings.
     """
+    job = await pg_client.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
+
     from app.services.content_fingerprint_service import url_fingerprint
 
     u_fp = url_fingerprint(url)
@@ -442,11 +488,15 @@ async def check_dedup(
 
 
 @router.get("/{job_id}", response_model=dict)
-async def get_job_status(job_id: str):
-    """Get the status of a job by its ID (e.g. 'JOB00000001')."""
+async def get_job_status(job_id: str, user: dict = Depends(get_current_user)):
+    """Get the status of a job by its ID (e.g. 'JOB00000001').
+
+    Regular users may only read their own jobs; admins may read any.
+    """
     job = await pg_client.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
     failure_reason = job.get("failure_reason")
     if not failure_reason and job["status"] in ("failed", "needs_review"):
@@ -458,7 +508,64 @@ async def get_job_status(job_id: str):
         "url": job["url"],
         "language": job["language"],
         "status": job["status"],
+        "assignment_reason": job.get("assignment_reason"),
         "failure_reason": failure_reason or None,
         "created_at": job["created_at"].isoformat() if job["created_at"] else None,
         "completed_at": job["completed_at"].isoformat() if job["completed_at"] else None,
     }
+
+
+class RetryJobRequest(BaseModel):
+    """Request to retry a failed or stuck job.
+
+    Fails the old job (if still running/stuck) and creates a brand new job
+    for the same URL. Useful when a worker crashed mid-crawl.
+    """
+    max_depth: int = Field(5, description="Max recursion depth for the new job")
+    recursive_config: dict[str, Any] = Field(default_factory=dict)
+    job_params: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{job_id}/retry", response_model=dict)
+async def retry_job(job_id: str, request: RetryJobRequest, user: dict = Depends(get_current_user)):
+    """Retry a job by failing the old one and creating a new crawl.
+
+    This is the recommended way to re-crawl a URL after a worker crash,
+    instead of re-submitting the URL (which may return the stuck job).
+    Regular users may only retry their own jobs; admins may retry any.
+    """
+    job = await pg_client.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
+
+    # Only allow retrying non-terminal jobs (running/pending) or failed jobs
+    if job["status"] not in ("running", "pending", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry job in '{job['status']}' status. Only running, pending, or failed jobs can be retried.",
+        )
+
+    # Mark old job as failed (if it was stuck running) so it doesn't block re-submission
+    if job["status"] in ("running", "pending"):
+        await pg_client.fail_job(
+            job_id,
+            worker_type="retry",
+            url=job["url"],
+            reason=f"Retry requested — old job marked failed to allow new submission",
+            event_type="retry_requested",
+        )
+
+    # Create a new job for the same URL
+    result = await submit_crawl_job(
+        user_id=job["user_id"],
+        url=job["url"],
+        language=job.get("language", "am"),
+        max_depth=request.max_depth,
+        recursive_config=request.recursive_config,
+        job_params=request.job_params,
+    )
+
+    result["retry_of"] = job_id
+    result["message"] = f"Job retried — new job created for {job['url']}"
+    return result

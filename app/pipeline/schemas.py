@@ -59,7 +59,7 @@ class CrawlRequest(BaseModel):
         default=None, description="Lineage tracking: URL that led to this child task"
     )
     recursive_config: dict = Field(
-        default_factory=dict,
+        default_factory=lambda: {"enable_extraction": True},
         description="Recursion rules: {enable_extraction: bool, link_filter_patterns: [...], skip_domains: [...], same_domain_only: bool, scope_prefix: str|None}",
     )
 
@@ -360,7 +360,7 @@ class CreateJobRequest(BaseModel):
         default=5, description="Max recursion depth (0 = single URL, no recursion; default 5)"
     )
     recursive_config: dict = Field(
-        default_factory=dict,
+        default_factory=lambda: {"enable_extraction": True},
         description="Recursion control: {enable_extraction: bool, link_filter_patterns: list, skip_domains: list}",
     )
 

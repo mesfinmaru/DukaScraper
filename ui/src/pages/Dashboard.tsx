@@ -2,28 +2,22 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import type { ReactNode } from "react"
 import { Link } from "react-router-dom"
 import {
-  Activity,
-  Archive,
   CheckCircle2,
   ChevronRight,
   CircleX,
   Clock3,
-  Cpu,
-  Database,
-  Download,
-  FileText,
   Loader2,
   RefreshCw,
   Rocket,
   Search,
+  ShieldAlert,
   Waypoints,
-  Zap,
 } from "lucide-react"
 import { PieChart, Pie, Cell, Tooltip } from "recharts"
 import { api } from "../api"
 import { useAuth } from "../config"
 import { JOB_STATUSES } from "../types"
-import type { UserJobsResponse } from "../types"
+import type { ThreatAnalyticsResponse, UserJobsResponse } from "../types"
 import { cn, formatNumber, relativeTime } from "../utils"
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader, StatusBadge } from "../components/ui"
 
@@ -35,16 +29,6 @@ const STATUS_COLORS: Record<string, string> = {
   skipped: "#94a3b8",
   needs_review: "#a78bfa",
 }
-
-const PIPELINE_STEPS = [
-  { icon: Zap, title: "Gateway", sub: "POST /jobs/trigger" },
-  { icon: Activity, title: "Kafka", sub: "crawl.requests" },
-  { icon: Cpu, title: "Workers", sub: "Surface / Deep / Dark" },
-  { icon: Archive, title: "MinIO", sub: "duka_raw" },
-  { icon: FileText, title: "Parser", sub: "clean text + metadata" },
-  { icon: Database, title: "Stores", sub: "Elasticsearch · ClickHouse" },
-  { icon: Download, title: "Exports", sub: "TXT / JSON / Parquet" },
-]
 
 function StatCard({
   label,
@@ -72,23 +56,63 @@ function StatCard({
   )
 }
 
-function PipelineFlow() {
+function ThreatSeverityCard({ threats }: { threats: ThreatAnalyticsResponse | null }) {
+  const count = (level: number) =>
+    threats?.by_severity.find((s) => s.severity === level)?.count ?? 0
+  const flagged = (count(4) ?? 0) + (count(5) ?? 0)
+  const total = threats?.total ?? 0
+  const share = total > 0 ? ((flagged / total) * 100).toFixed(1) : "0.0"
+  const critical = flagged > 0 && count(4) === 0
+
   return (
-    <div className="card p-5">
-      <h2 className="mb-4 text-sm font-semibold text-slate-200">Pipeline</h2>
-      <div className="flex items-stretch gap-1 overflow-x-auto pb-1">
-        {PIPELINE_STEPS.map((step, i) => (
-          <div key={step.title} className="flex items-center gap-1">
-            <div className="flex min-w-[120px] flex-col gap-1 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5">
-              <step.icon className="h-4 w-4 text-indigo-500" />
-              <p className="text-xs font-semibold text-slate-200">{step.title}</p>
-              <p className="text-[11px] whitespace-nowrap text-slate-500">{step.sub}</p>
-            </div>
-            {i < PIPELINE_STEPS.length - 1 && (
-              <ChevronRight className="h-4 w-4 shrink-0 text-slate-600" />
-            )}
+    <div className="card flex flex-col p-5">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-amber-500/15">
+            <ShieldAlert className="h-5 w-5 text-amber-500" />
           </div>
-        ))}
+          <div>
+            <p className="text-sm font-semibold text-slate-200">Threat severity</p>
+            <p className="text-[11px] tracking-wider text-slate-500 uppercase">
+              High &amp; critical threats
+            </p>
+          </div>
+        </div>
+        <span
+          className={cn(
+            "rounded-full border px-2.5 py-0.5 text-[11px] font-semibold tracking-wider",
+            critical
+              ? "border-rose-500/40 bg-rose-500/10 text-rose-500"
+              : "border-amber-500/40 bg-amber-500/10 text-amber-500",
+          )}
+        >
+          {critical ? "CRITICAL" : "HIGH"}
+        </span>
+      </div>
+
+      <div className="mt-5 flex items-baseline gap-3">
+        <span className="text-4xl font-bold tracking-tight text-amber-500">
+          {formatNumber(flagged)}
+        </span>
+        <span className="text-xs tracking-wider text-slate-500 uppercase">threats flagged</span>
+      </div>
+
+      <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-amber-500 to-rose-500 transition-all duration-500"
+          style={{ width: `${Math.min(100, Math.max(0, Number(share)))}%` }}
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between">
+        <p className="text-[11px] text-slate-500">{share}% of flagged threats</p>
+        <Link
+          to="/analytics"
+          className="inline-flex items-center gap-0.5 text-xs font-medium text-amber-500 transition hover:text-amber-400"
+        >
+          Details
+          <ChevronRight className="h-3.5 w-3.5" />
+        </Link>
       </div>
     </div>
   )
@@ -157,6 +181,7 @@ export default function Dashboard() {
   const { session } = useAuth()
   const isAdmin = session?.user.role === "admin"
   const [data, setData] = useState<UserJobsResponse | null>(null)
+  const [threats, setThreats] = useState<ThreatAnalyticsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
@@ -178,10 +203,19 @@ export default function Dashboard() {
     }
   }, [session, isAdmin])
 
+  const loadThreats = useCallback(async () => {
+    try {
+      setThreats(await api.getThreatAnalytics())
+    } catch {
+      setThreats(null)
+    }
+  }, [])
+
   useEffect(() => {
     setLoading(true)
     void load()
-  }, [load, refreshTick])
+    void loadThreats()
+  }, [load, loadThreats, refreshTick])
 
   const jobs = useMemo(() => data?.jobs ?? [], [data])
   const sorted = useMemo(
@@ -275,7 +309,7 @@ export default function Dashboard() {
               <StatusDonut data={donutData} />
             </div>
 
-            <PipelineFlow />
+            <ThreatSeverityCard threats={threats} />
           </div>
 
           <div className="card overflow-hidden">

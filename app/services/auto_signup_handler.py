@@ -38,6 +38,57 @@ _ALREADY_REGISTERED_MARKERS = [
     "sign in instead",
 ]
 
+# Phrases that indicate the site demands PHONE/SMS verification — signup is
+# treated as failed because we cannot receive SMS codes.
+# Explicit page-error feedback after a registration submit (e.g. "Wrong
+# solved puzzle", "invalid username"). Any of these means the signup FAILED,
+# regardless of what else is on the page.
+_SUBMIT_ERROR_MARKERS = [
+    "wrong solved",
+    "wrong captcha",
+    "incorrect captcha",
+    "invalid captcha",
+    "solve the puzzle",
+    "wrong",
+    "incorrect",
+    "invalid",
+    "captcha",
+    "puzzle",
+    "try again",
+]
+
+# Multi-step success requires stronger evidence than the single word
+# "welcome" — registration pages often say "Welcome back" in the login
+# prompt right next to the (failed) form.
+_MULTI_STEP_SUCCESS_MARKERS = [
+    "account created",
+    "registration complete",
+    "successfully registered",
+    "your account has been created",
+    "dashboard",
+    "congratulations",
+]
+
+_PHONE_VERIFICATION_MARKERS = [
+    "verify your phone",
+    "verify your number",
+    "phone verification",
+    "phone number verification",
+    "verify via sms",
+    "verify by sms",
+    "sms verification",
+    "text message verification",
+    "code sent to your phone",
+    "code sent to your mobile",
+    "sent a code to your phone",
+    "enter your phone number",
+    "confirm your phone",
+    "otp sent to your phone",
+    "otp sent to your mobile",
+    "enter the otp sent",
+    "enter verification code sent to your",
+]
+
 # Phrases that indicate verification is needed
 _VERIFICATION_NEEDED_MARKERS = [
     "verify your email",
@@ -100,6 +151,11 @@ _SIGNUP_LINK_SELECTORS = [
 
 # Default signup credentials (overridable per-domain via portal_config)
 _DEFAULT_SIGNUP_PASSWORD = "Duka@12345"
+
+# Identity used when a signup form asks for a name
+_SIGNUP_FIRST_NAME = "Duka"
+_SIGNUP_LAST_NAME = "S."
+_SIGNUP_FULL_NAME = "Duka S."
 
 # Dropdown fields to auto-fill
 _DROPDOWN_AUTO_FILL = {
@@ -220,6 +276,7 @@ class AutoSignupHandler:
                     username=signup_result.get("username") or email,
                     password=password,
                     action="signup",
+                    display_name=_SIGNUP_FULL_NAME,
                 )
             except Exception:
                 logger.warning("[%s] Failed to persist site credential after signup", domain, exc_info=True)
@@ -237,15 +294,10 @@ class AutoSignupHandler:
                     "[%s] Site requested email verification but the crawl did not "
                     "enable it — skipping verification polling", domain,
                 )
-                if verified:
-                    await credential_service.record_usage(
-                        email, domain, "verified", "success"
-                    )
-                else:
-                    await credential_service.record_usage(
-                        email, domain, "verification_sent", "pending",
-                        error_message="Verification email not received within timeout",
-                    )
+                await credential_service.record_usage(
+                    email, domain, "verification_sent", "pending",
+                    error_message="Verification email not received within timeout",
+                )
         else:
             # Check if "already registered" appeared during signup
             page_text = await self._get_page_text(page)
@@ -436,12 +488,33 @@ class AutoSignupHandler:
                     pass
             logger.info("[%s] All input fields on signup page (%d): %s", email, len(_debug_fields), _debug_fields)
 
+            # Custom puzzle/math captchas (radio answer lists, decaptcha_hash)
+            # cannot be solved automatically — fail fast with a clear reason
+            # instead of submitting and pretending it worked.
+            _puzzle_present = bool(
+                await page.query_selector(
+                    "input[name='decaptcha_hash'], input[name^='captcha_answer'], "
+                    "input[id='decaptcha_hash'], input[name^='puzzle']"
+                )
+            )
+            if _puzzle_present:
+                logger.warning(
+                    "[%s] Custom puzzle/captcha registration detected — cannot auto-register",
+                    email,
+                )
+                result["message"] = (
+                    "Signup failed: site requires solving a custom puzzle/captcha, "
+                    "which is not supported"
+                )
+                return result
+
             # Find all input fields — include both visible and hidden (some forms use JS to reveal)
             all_inputs = all_raw_inputs
             username_filled = False
             email_filled = False
             password_filled = False
             confirm_password_filled = False
+            name_filled = False
 
             # Generate a username from the email for forum registrations
             _domain = locals().get("domain", "") or getattr(self, "_current_domain", "")
@@ -492,6 +565,28 @@ class AutoSignupHandler:
                     password_filled = True
                     logger.info("Filled password field '%s'", input_name)
                     continue
+
+                # Name fields (first/last/full/display name)
+                if not name_filled and input_type not in ("email", "password"):
+                    _name_value: str | None = None
+                    if "full_name" in input_name or "fullname" in input_name \
+                            or "full name" in input_placeholder:
+                        _name_value = _SIGNUP_FULL_NAME
+                    elif "first_name" in input_name or "firstname" in input_name \
+                            or "fname" in input_name or "first name" in input_placeholder:
+                        _name_value = _SIGNUP_FIRST_NAME
+                    elif "last_name" in input_name or "lastname" in input_name \
+                            or "lname" in input_name or "surname" in input_name \
+                            or "last name" in input_placeholder:
+                        _name_value = _SIGNUP_LAST_NAME
+                    elif input_name in ("name", "realname", "real_name") \
+                            or input_placeholder in ("name", "your name", "full name"):
+                        _name_value = _SIGNUP_FULL_NAME
+                    if _name_value:
+                        await inp.fill(_name_value)
+                        name_filled = True
+                        logger.info("Filled name field '%s' with '%s'", input_name, _name_value)
+                        continue
 
             if not email_filled or not password_filled:
                 # Try XenForo-specific fallback selectors
@@ -687,6 +782,20 @@ class AutoSignupHandler:
 
             page_text = await self._get_page_text(page)
 
+            # Phone/SMS verification demanded → treat signup as failed (we
+            # cannot receive SMS codes). Do not persist the credential.
+            if self._check_markers(page_text, _PHONE_VERIFICATION_MARKERS):
+                logger.warning(
+                    "[%s] Site requires phone/SMS verification — marking signup as FAILED for %s",
+                    email, domain,
+                )
+                result["success"] = False
+                result["needs_verification"] = False
+                result["message"] = (
+                    "Signup failed: site requires phone/SMS verification, which is not supported"
+                )
+                return result
+
             # Check for verification needed
             if self._check_markers(page_text, _VERIFICATION_NEEDED_MARKERS):
                 result["success"] = True
@@ -765,9 +874,28 @@ class AutoSignupHandler:
                 result["success"] = True
                 result["message"] = "Signup appears successful"
             else:
-                # Assume success if no clear error
-                result["success"] = True
-                result["message"] = "Signup submitted (no clear error detected)"
+                # No success text — only believe it worked if the registration
+                # form is actually GONE. A still-visible form means we never
+                # left the page (e.g. a captcha silently rejected us).
+                _form_still_present = bool(
+                    await page.query_selector(
+                        "input[type='email']:visible, input[type='password']:visible, "
+                        "input[name='username']:visible"
+                    )
+                )
+                if _form_still_present:
+                    result["success"] = False
+                    result["message"] = (
+                        "Signup failed: registration form still present after submit "
+                        "(no success or error text detected)"
+                    )
+                    logger.warning(
+                        "[%s] Form still present after submit — treating signup as FAILED",
+                        email,
+                    )
+                else:
+                    result["success"] = True
+                    result["message"] = "Signup submitted (form no longer present, no error detected)"
 
         except Exception as exc:
             result["message"] = f"Signup error: {exc}"
@@ -1065,13 +1193,22 @@ class AutoSignupHandler:
             logger.debug("DOB handling error: %s", exc)
 
     async def _fill_phone_number(self, page: Page) -> None:
-        """Auto-fill phone number fields with a generic number."""
+        """Fill phone fields on a real registration form with a generic number."""
         try:
             for selector in _PHONE_SELECTORS:
                 phone_inputs = await page.query_selector_all(selector)
                 for phone_el in phone_inputs:
                     if not await phone_el.is_visible():
                         continue
+                    # Only fill when a real signup form is present (email or
+                    # password field exists) — otherwise skip entirely; the
+                    # site has no signup and we must not fabricate data.
+                    has_signup_form = bool(
+                        await page.query_selector("input[type='email'], input[type='password']")
+                    )
+                    if not has_signup_form:
+                        logger.info("Phone field present but no signup form — not filling")
+                        return
                     # Check if already filled
                     current = await phone_el.evaluate("el => el.value")
                     if current:
@@ -1126,7 +1263,6 @@ class AutoSignupHandler:
             max_steps = 5  # Safety limit
 
             for step in range(max_steps):
-                page_text = await self._get_page_text(page)
                 current_url = page.url.lower()
 
                 logger.info("Multi-step registration: step %d, url=%s", step + 1, current_url[:80])
@@ -1146,6 +1282,18 @@ class AutoSignupHandler:
                         "input[id='ctrl_username']"
                     )
                 )
+
+                # No registration fields anywhere on this page — this is not a
+                # signup flow at all (e.g. a plain news homepage). Bail out
+                # instead of pretending the wizard completed.
+                if not (has_email_field or has_password_field or has_username_field):
+                    logger.info(
+                        "Step %d: page has no email/username/password fields — "
+                        "no registration form exists on this site",
+                        step + 1,
+                    )
+                    result["message"] = "No signup form found on page"
+                    return result
 
                 # Fill available fields
                 if has_email_field:
@@ -1171,6 +1319,22 @@ class AutoSignupHandler:
                         if await pw.is_visible() and not await pw.evaluate("el => el.value"):
                             await pw.fill(password)
                             logger.info("Step %d: Filled password field %d", step + 1, i + 1)
+
+                # Fill name fields if present (Duka S.)
+                _name_field_map = (
+                    ("input[name*='first_name' i], input[name*='firstname' i], input[placeholder*='first name' i]", _SIGNUP_FIRST_NAME),
+                    ("input[name*='last_name' i], input[name*='lastname' i], input[name*='surname' i], input[placeholder*='last name' i]", _SIGNUP_LAST_NAME),
+                    ("input[name*='full_name' i], input[name*='fullname' i], input[placeholder*='full name' i], input[name='name' i]", _SIGNUP_FULL_NAME),
+                )
+                for _name_sel, _name_val in _name_field_map:
+                    try:
+                        _name_input = await page.query_selector(_name_sel)
+                        if _name_input and await _name_input.is_visible() \
+                                and not await _name_input.evaluate("el => el.value"):
+                            await _name_input.fill(_name_val)
+                            logger.info("Step %d: Filled name field '%s'", step + 1, _name_val)
+                    except Exception:
+                        continue
 
                 # Fill other fields (dropdowns, radios, DOB, phone)
                 await self._fill_dropdowns(page)
@@ -1198,10 +1362,20 @@ class AutoSignupHandler:
                     submit_btn = None
 
                 if not submit_btn:
-                    logger.info("Step %d: No next/submit button — registration may be complete", step + 1)
-                    break
+                    # A wizard only "completes without a submit button" if this
+                    # step actually had registration fields to fill. Otherwise
+                    # there was never a form here (e.g. a news homepage).
+                    if has_email_field or has_password_field or has_username_field:
+                        logger.info("Step %d: No next/submit button — registration may be complete", step + 1)
+                        break
+                    logger.info(
+                        "Step %d: No submit button and no registration fields — "
+                        "no signup form exists on this site",
+                        step + 1,
+                    )
+                    result["message"] = "No signup form found on page"
+                    return result
 
-                button_text = (await submit_btn.evaluate("el => el.innerText || el.value || ''")).strip().lower()
                 await submit_btn.click()
                 await asyncio.sleep(3)
 
@@ -1217,6 +1391,19 @@ class AutoSignupHandler:
                     await page.query_selector("input[type='email'], input[type='password'], input[type='text']")
                 )
 
+                # Phone/SMS verification demanded → treat signup as failed
+                if self._check_markers(new_text, _PHONE_VERIFICATION_MARKERS):
+                    logger.warning(
+                        "[%s] Site requires phone/SMS verification (multi-step) — marking signup as FAILED",
+                        email,
+                    )
+                    result["success"] = False
+                    result["needs_verification"] = False
+                    result["message"] = (
+                        "Signup failed: site requires phone/SMS verification, which is not supported"
+                    )
+                    return result
+
                 # Check for verification needed
                 if self._check_markers(new_text, _VERIFICATION_NEEDED_MARKERS):
                     result["success"] = True
@@ -1224,8 +1411,25 @@ class AutoSignupHandler:
                     result["message"] = f"Multi-step registration complete after {step + 1} steps — verification needed"
                     return result
 
-                # Check for success
-                if self._check_markers(new_text, ["welcome", "dashboard", "successfully", "account created"]):
+                # Explicit error feedback (e.g. "Wrong solved puzzle") — the
+                # site rejected the submission. Never report success on a page
+                # that shows an error, no matter what else it says.
+                if self._check_markers(new_text, _SUBMIT_ERROR_MARKERS):
+                    result["success"] = False
+                    result["message"] = (
+                        "Signup failed: site rejected the registration "
+                        "(error feedback detected on page)"
+                    )
+                    logger.warning(
+                        "[%s] Multi-step submit rejected — error markers on page: %s",
+                        email, new_text[:300],
+                    )
+                    return result
+
+                # Check for success — with stronger evidence than the single
+                # word "welcome" (login prompts say "Welcome back" right on
+                # the failed registration page).
+                if self._check_markers(new_text, _MULTI_STEP_SUCCESS_MARKERS):
                     result["success"] = True
                     result["message"] = f"Multi-step registration complete after {step + 1} steps"
                     return result
@@ -1236,9 +1440,13 @@ class AutoSignupHandler:
                     result["message"] = f"Multi-step registration complete after {step + 1} steps (no more form fields)"
                     return result
 
-            # If we exhausted all steps
-            result["success"] = True
-            result["message"] = f"Multi-step registration submitted ({max_steps} steps attempted)"
+            # If we exhausted all steps and the form is STILL there, the
+            # registration was never confirmed — do not report success.
+            result["success"] = False
+            result["message"] = (
+                f"Signup failed: registration form still present after "
+                f"{max_steps} steps — submission was never confirmed"
+            )
 
         except Exception as exc:
             result["message"] = f"Multi-step registration error: {exc}"

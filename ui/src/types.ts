@@ -66,6 +66,7 @@ export interface JobSummary {
   status: JobStatus
   created_at: string | null
   user_id?: string
+  assignment_reason?: string | null
 }
 
 export interface UserInfo {
@@ -247,6 +248,50 @@ export interface ThreatAnalyticsResponse {
   by_severity: { severity: number; count: number }[]
   by_category: { category: string; count: number }[]
   recent: ThreatRecentRow[]
+}
+
+export interface EntitySummaryRow {
+  entity: string
+  entity_type: string
+  occurrences: number
+  sample_urls: string[]
+}
+
+export interface EntitySummaryResponse {
+  total: number
+  entities: EntitySummaryRow[]
+}
+
+export interface EntityMentionRow {
+  item_id: string
+  job_id: string
+  url: string
+  entity: string
+  category: string
+  language: string
+  severity: number
+  created_at: string
+}
+
+export interface EntityMentionsResponse {
+  entity: string
+  total: number
+  mentions: EntityMentionRow[]
+}
+
+export interface SemanticSearchResult {
+  item_id: string
+  url: string
+  language: string
+  category: string
+  summary: string
+  score: number
+}
+
+export interface SemanticSearchResponse {
+  query: string
+  total: number
+  results: SemanticSearchResult[]
 }
 
 export interface WorkerPerformanceRow {

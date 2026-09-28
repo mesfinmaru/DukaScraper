@@ -32,8 +32,10 @@ class TestKafkaTopicDefinitions:
     def test_crawl_parsed_topic(self):
         assert topics.CRAWL_PARSED == "crawl.parsed"
 
-    def test_retry_topic_exists(self):
-        assert hasattr(topics, "CRAWL_REQUESTS_RETRY") or "retry" in "crawl.requests.retry"
+    def test_retry_topic_removed(self):
+        # crawl.requests.retry was dead config - nothing produced to or
+        # consumed from it. Escalation re-publishes to crawl.requests.
+        assert not hasattr(topics, "CRAWL_REQUESTS_RETRY")
 
     def test_dlq_topic_exists(self):
         assert hasattr(topics, "CRAWL_REQUESTS_DLQ") or "dlq" in "crawl.requests.dlq"

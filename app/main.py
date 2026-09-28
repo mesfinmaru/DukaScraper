@@ -16,6 +16,7 @@ from app.common.logger.logger import logger
 from app.common.metrics.middleware import PrometheusMiddleware, metrics_endpoint
 from app.pipeline.producer.kafka_producer import kafka_producer
 from app.security.auth import hash_password
+from app.services.job_watchdog import start_job_watchdog, stop_job_watchdog
 from app.storage.clickhouse.client import ch_client
 from app.storage.elasticsearch.client import es_client
 from app.storage.minio.client import minio_client
@@ -77,7 +78,7 @@ async def lifespan(app: FastAPI):
         app.state.dependencies["clickhouse"] = False
         logger.error("Startup dependency clickhouse failed: %s", exc, exc_info=True)
 
-    await start_dependency("elasticsearch", es_client.connect)
+    await start_dependency("elasticsearch", lambda: es_client.connect(retries=30, delay_seconds=2.0))
     if app.state.dependencies.get("elasticsearch"):
         try:
             await es_client.ensure_articles_index()
@@ -88,10 +89,14 @@ async def lifespan(app: FastAPI):
     # is unavailable; the UI falls back to periodic REST refresh.
     start_job_updates_listener()
 
+    # Fail jobs stuck in running/pending (crashed workers, lost messages).
+    start_job_watchdog()
+
     yield
 
     # Disconnect from all services
     logger.info("API shutting down...")
+    stop_job_watchdog()
     stop_job_updates_listener()
     await pg_client.close()
     if kafka_producer:

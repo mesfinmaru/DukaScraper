@@ -7,7 +7,6 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
-  Radar,
   Rocket,
   Search,
   ShieldCheck,
@@ -20,6 +19,7 @@ import { useAuth } from "../config"
 import { cn } from "../utils"
 import { ThemeToggle } from "../theme"
 import { HealthPill } from "./HealthPill"
+import { Logo } from "./Logo"
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -41,16 +41,8 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 px-5 py-5">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-600 shadow-[0_0_18px_rgba(34,197,94,0.5)] ring-1 ring-emerald-300/40">
-          <Radar className="h-5 w-5 text-white" />
-        </div>
-        <div>
-          <p className="text-sm font-bold tracking-tight text-white">DukaScraper</p>
-          <p className="text-[11px] font-medium tracking-widest text-emerald-400/80 uppercase">
-            Console
-          </p>
-        </div>
+      <div className="flex items-center px-5 py-5">
+        <Logo className="h-8 w-auto" />
       </div>
 
       <nav className="flex-1 space-y-1 px-3 py-2">

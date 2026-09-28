@@ -5,6 +5,8 @@ pydantic==2.13.5
 pydantic-settings==2.15.0
 httpx==0.28.1
 httpx-socks>=0.8.0
+# python-socks 3.x removed the `proxy_ssl` kwarg that httpx-socks still passes
+python-socks>=2.4.0,<3.0.0
 
 # --- Databases, Storage & Messaging ---
 sqlalchemy==2.0.29

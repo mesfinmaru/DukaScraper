@@ -1,9 +1,10 @@
 import { useState } from "react"
-import { Loader2, LogIn, Radar } from "lucide-react"
+import { Loader2, LogIn } from "lucide-react"
 import { Link } from "react-router-dom"
 import { ApiError } from "../api"
 import { useAuth } from "../config"
 import { ThemeToggle } from "../theme"
+import { Logo } from "../components/Logo"
 
 export default function LoginPage() {
   const { login } = useAuth()
@@ -32,13 +33,8 @@ export default function LoginPage() {
       </div>
       <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600">
-            <Radar className="h-6 w-6 text-white" />
-          </div>
-          <div>
-            <h1 className="text-lg font-bold tracking-tight text-slate-100">Duka Scraper</h1>
-            <p className="mt-1 text-xs text-slate-400">Intelligent web intelligence, at your command.</p>
-          </div>
+          <Logo className="h-12 w-auto" />
+          <p className="mt-1 text-xs text-slate-400">Intelligent web intelligence, at your command.</p>
         </div>
 
         <form

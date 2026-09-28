@@ -68,20 +68,27 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # Topics are created explicitly by kafka-topics-init; auto-creation hides
+      # typos in topic names and lets producers silently create mis-partitioned
+      # topics, so it is disabled.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
     volumes:
     - kafka_data:/var/lib/kafka/data
     networks:
     - duka-net
     restart: always
     healthcheck:
+      # Real broker probe: confirms the broker accepts API requests (the old
+      # 'test -f /proc/1/status' check always passed and proved nothing).
       test:
       - CMD-SHELL
-      - test -f /proc/1/status || exit 1
+      # Probe the PLAINTEXT listener address (kafka:9092) — the broker binds
+      # that hostname, not loopback, so localhost would never answer.
+      - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1
       interval: 15s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
   kafka-topics-init:
     image: apache/kafka:3.9.1
     container_name: kafka-topics-init
@@ -92,17 +99,13 @@ services:
     - /bin/bash
     - -c
     command:
-    - '/opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server
-      kafka:9092 --topic crawl.requests --partitions 10 --replication-factor 1
+    - '/opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic crawl.requests --partitions 10 --replication-factor 1
 
       /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
       --topic crawl.raw --partitions 10 --replication-factor 1
 
       /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
       --topic crawl.parsed --partitions 10 --replication-factor 1
-
-      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
-      --topic crawl.requests.retry --partitions 5 --replication-factor 1
 
       /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
       --topic crawl.requests.dlq --partitions 5 --replication-factor 1
@@ -273,6 +276,7 @@ services:
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - ELASTICSEARCH_URL=http://elasticsearch:9200
     ports:
     - 8000:8000
     volumes:
@@ -408,7 +412,7 @@ services:
       dockerfile: workers/dark-worker/Dockerfile
     container_name: dark-worker
     restart: unless-stopped
-    entrypoint: ["/bin/bash", "-c", "pip install httpx-socks socksio -q && exec /wait_for_kafka.sh python workers/dark-worker/main.py"]
+    entrypoint: ["/bin/bash", "-c", "pip install httpx-socks socksio 'python-socks<3' -q && exec /wait_for_kafka.sh python workers/dark-worker/main.py"]
     environment:
     - APP_ENV=docker
     - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -452,9 +456,13 @@ services:
     - RAG_ENABLED=true
     - EMBEDDING_PROVIDER=ollama
     - EMBEDDING_BASE_URL=http://ollama-embedding:11434
-    - EMBEDDING_MODEL=nomic-embed-text
+    # bge-m3: multilingual (Amharic + English) embeddings, 1024-dim.
+    - EMBEDDING_MODEL=bge-m3
+    - EMBEDDING_VECTOR_SIZE=1024
     - VECTOR_DB_URL=http://qdrant:6333
     - VECTOR_DB_COLLECTION=duka_articles
+    - RAG_SCORE_THRESHOLD=0.35
+    - REDIS_URL=redis://redis:6379/0
     - HEALTH_PORT=8080
     volumes:
     - .:/app

@@ -62,8 +62,19 @@ _MOCK_MODULES = [
     "browserforge", "browserforge.fingerprints",
 ]
 
+# Snapshot of sys.modules (name -> module object) BEFORE any mocks are
+# installed. The cleanup below restores exactly what the mocked era added or
+# shadowed, compared by object identity.
+_MODULES_BEFORE_MOCKS = dict(sys.modules)
+
+# Settings modules are shadowed unconditionally: this file assigns attributes
+# on them (e.g. _settings_mock.settings = MagicMock()), and if the real module
+# was already imported (e.g. by conftest), that would mutate the real module
+# for every later test. Shadowing keeps the real object untouched; cleanup
+# restores it by identity.
+_ALWAYS_SHADOW = ("app.common.config.settings", "app.common.config.wsl_settings")
 for mod_name in _MOCK_MODULES:
-    if mod_name not in sys.modules:
+    if mod_name in _ALWAYS_SHADOW or mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
 # camoufox.async_api needs a real AsyncCamoufox attribute for patch() to find
@@ -134,6 +145,32 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["workers.deep_worker_main"] = _mod
 _spec.loader.exec_module(_mod)
+
+# Restore sys.modules so subsequently collected test files are not poisoned
+# (a lingering mocked 'pydantic' breaks every later FastAPI import, and real
+# modules imported while the mocks were active may have cached mock-derived
+# singletons). Remove everything this file added or shadowed during the mocked
+# era: the MagicMocks installed above plus any module created transitively.
+#
+# Kept on purpose:
+#   * workers.deep_worker_main — tests below import it by name; the already-
+#     executed module holds direct references to the mocks, which is exactly
+#     what those tests assert against.
+#   * camoufox / camoufox.async_api — the real package is not installed in
+#     this environment, and tests below patch
+#     "camoufox.async_api.AsyncCamoufox" by string, which re-imports the
+#     target at test time and would raise ModuleNotFoundError without these
+#     mock entries.
+_KEEP = ("workers.deep_worker_main", "camoufox", "camoufox.async_api")
+for mod_name in list(sys.modules):
+    if mod_name in _KEEP:
+        continue
+    if mod_name in _MODULES_BEFORE_MOCKS:
+        if sys.modules[mod_name] is not _MODULES_BEFORE_MOCKS[mod_name]:
+            # Shadowed a pre-existing module: restore the original object.
+            sys.modules[mod_name] = _MODULES_BEFORE_MOCKS[mod_name]
+    else:
+        sys.modules.pop(mod_name, None)
 
 DeepWorker = _mod.DeepWorker
 _is_cloudflare_challenge = _mod._is_cloudflare_challenge

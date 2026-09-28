@@ -8,7 +8,9 @@ Read-only endpoints for viewing what the pipeline has produced:
 
 import asyncio
 import json
+import os
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from app.common.logger.logger import logger
@@ -19,6 +21,14 @@ from app.storage.postgres.client import pg_client
 router = APIRouter()
 
 ES_INDEX = "duka_articles"
+
+# Semantic search config (defaults mirror docker-compose llm-worker values so
+# the API can query the same Qdrant collection + embedding model with no extra
+# environment setup).
+SEMANTIC_EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "http://ollama-embedding:11434")
+SEMANTIC_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
+SEMANTIC_VECTOR_DB_URL = os.getenv("VECTOR_DB_URL", "http://qdrant:6333")
+SEMANTIC_VECTOR_COLLECTION = os.getenv("VECTOR_DB_COLLECTION", "duka_articles")
 
 
 def _split_s3_path(path: str | None) -> tuple[str | None, str | None]:
@@ -128,6 +138,80 @@ async def search_articles(
     except Exception as e:
         logger.error(f"Elasticsearch search failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Search failed") from e
+
+
+@router.get("/search/semantic")
+async def semantic_search_articles(
+    q: str = Query(..., description="Free-text query embedded and matched against stored article vectors"),
+    size: int = 20,
+):
+    """Nearest-neighbor search over stored article embeddings (Qdrant).
+
+    The query is embedded with the same multilingual model the llm-worker uses
+    (bge-m3), so Amharic queries match Amharic *and* English content and vice
+    versa. Complements the keyword search above: semantic matches on meaning,
+    keyword matches on exact tokens. Returns 503 when the embedding service or
+    vector DB is unavailable.
+    """
+    query_text = (q or "").strip()
+    if not query_text:
+        raise HTTPException(status_code=422, detail="Query must not be empty")
+
+    limit = max(1, min(size, 100))
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            emb_resp = await client.post(
+                f"{SEMANTIC_EMBEDDING_BASE_URL}/api/embed",
+                json={"model": SEMANTIC_EMBEDDING_MODEL, "input": query_text},
+            )
+            if emb_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Embedding service unavailable - semantic search disabled",
+                )
+            vectors = emb_resp.json().get("embeddings", [])
+            if not vectors:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Embedding service returned no vector - semantic search disabled",
+                )
+
+            search_resp = await client.post(
+                f"{SEMANTIC_VECTOR_DB_URL}/collections/{SEMANTIC_VECTOR_COLLECTION}/points/search",
+                json={"vector": vectors[0], "limit": limit, "with_payload": True},
+            )
+            if search_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Vector database unavailable - semantic search disabled",
+                )
+            hits = search_resp.json().get("result", [])
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Semantic search failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Semantic search unavailable (embedding service or vector DB unreachable)",
+            ) from e
+
+    results = []
+    for hit in hits:
+        payload = hit.get("payload", {}) or {}
+        results.append({
+            "item_id": payload.get("item_id", ""),
+            "url": payload.get("url", ""),
+            "language": payload.get("language", ""),
+            "category": payload.get("category", ""),
+            "summary": payload.get("text_summary", ""),
+            "score": round(float(hit.get("score", 0.0)), 4),
+        })
+
+    return {
+        "query": query_text,
+        "total": len(results),
+        "results": results,
+    }
 
 
 @router.get("/job/{job_id}")

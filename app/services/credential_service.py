@@ -366,6 +366,7 @@ class CredentialService:
         username: str,
         password: str,
         action: str = "signup",
+        display_name: str | None = None,
     ) -> dict[str, Any]:
         """Store a credential for a specific site after successful signup/login.
 
@@ -380,21 +381,24 @@ class CredentialService:
             username: The login username (may differ from email)
             password: The plaintext password (stored encrypted)
             action: 'signup' or 'login'
+            display_name: Optional human name stored for the account
         """
         async with pg_client.system_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO credential_usage
-                   (email, domain, username, password_hash, password_enc, action, usage_status)
-                   VALUES ($1, $2, $3, $4, $5, $6, 'success')
+                   (email, domain, username, password_hash, password_enc, action, usage_status, display_name)
+                   VALUES ($1, $2, $3, $4, $5, $6, 'success', $7)
                    ON CONFLICT (email, domain) DO UPDATE SET
                        username = EXCLUDED.username,
                        password_hash = EXCLUDED.password_hash,
                        password_enc = EXCLUDED.password_enc,
                        action = EXCLUDED.action,
                        usage_status = 'success',
+                       display_name = COALESCE(EXCLUDED.display_name, credential_usage.display_name),
                        last_used_at = CURRENT_TIMESTAMP
                    RETURNING email, domain, username, action, usage_status, created_at""",
                 email, domain, username, hash_password(password), encrypt_value(password), action,
+                display_name,
             )
             logger.info(
                 "Stored site credential: %s@%s (user=%s, action=%s)",

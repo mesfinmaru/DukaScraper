@@ -46,6 +46,10 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.job_events import (
+    install_job_log_relay,
+    publish_job_stage,
+)
 from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.common.utils.url_utils import is_onion_url, is_valid_http_url
 from app.pipeline.schemas import CrawlRequest, CrawlResult
@@ -53,7 +57,12 @@ from app.services.dead_letter_service import publish_crawl_dead_letter
 from app.services.page_validation_service import PageValidationService
 from app.services.politeness_service import PolitenessService
 from app.services.recursive_crawl_service import extract_and_queue_children
+from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
+from workers.common import (
+    complete_job_task_from_message,
+    fail_job_from_message,
+)
 from workers.health import HealthServer
 from workers.metrics import WorkerMetrics
 
@@ -301,18 +310,21 @@ async def escalate_to_deep(
     producer: AIOKafkaProducer,
     request: CrawlRequest,
     reason: str,
-) -> None:
+) -> bool:
     """Requeue a job to the DEEP worker when httpx can't handle the page.
 
     The deep worker automatically detects .onion/.i2p URLs and creates
     a Tor-proxied browser context — so the Tor routing is preserved.
+
+    Returns True when the message was requeued; False when the escalation
+    budget was exhausted (the caller must close the site out itself).
     """
     if request.retry_count >= MAX_RETRY_COUNT:
         logger.warning(
             "[%s] Exceeded max escalation retries (%d); giving up on %s",
             request.job_id, MAX_RETRY_COUNT, request.url,
         )
-        return
+        return False
 
     escalated = request.model_copy(
         update={
@@ -321,6 +333,9 @@ async def escalate_to_deep(
             "escalation_reason": reason,
         },
     )
+    # Transfer this message's outstanding-task slot to the deep message so the
+    # job cannot complete while the escalated page is still in flight.
+    await pg_client.register_job_tasks(request.job_id, 1)
     await producer.send_and_wait(
         CONSUME_TOPIC,
         value=escalated.model_dump_json().encode("utf-8"),
@@ -330,6 +345,7 @@ async def escalate_to_deep(
         "[%s] Escalated %s to DEEP worker (reason=%s, retry=%d)",
         request.job_id, request.url, reason, escalated.retry_count,
     )
+    return True
 
 
 def _detect_challenge(html: str, status_code: int) -> str | None:
@@ -409,6 +425,9 @@ async def process_request(
         logger.debug("Job status check failed (non-fatal): %s", dedup_err)
 
     item_id = await pg_client.allocate_item_id()
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="site_started", state="active",
+    )
     logger.info(
         "Processing dark job %s [%s] depth=%d/%d url=%s item=%s",
         request.job_id,
@@ -423,25 +442,57 @@ async def process_request(
     politeness = PolitenessService(settings.REDIS_URL, DEFAULT_HEADERS["User-Agent"])
     try:
         if not await politeness.allowed(request.url):
+            # One robots-disallowed page must not flip the whole job to
+            # 'skipped' — the outstanding-task counter owns the final status.
             await pg_client.record_crawl_log(
                 request.job_id, item_id, request.url, WORKER_TYPE,
                 "robots_disallowed", "skipped", request.retry_count,
             )
-            await pg_client.update_job_status(request.job_id, "skipped")
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, stage="site_finished",
+                state="failed", detail="Blocked by robots.txt",
+            )
             return
         await politeness.wait_for_turn(request.url)
     finally:
         await politeness.close()
 
     # --- Fetch through Tor ---
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="fetching", state="active",
+    )
     start_time = time.perf_counter()
     try:
         html, status_code, final_url = await fetch_url(http_client, request.url)
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="fetching", state="passed",
+            detail=f"HTTP {status_code}",
+        )
     except Exception as exc:
         logger.warning("Request error for %s via Tor: %s", request.url, exc)
         html, status_code, final_url = "", 599, request.url
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="fetching", state="failed",
+            detail="Fetch error",
+        )
 
     latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+    # Per-attempt performance metric (mirrors surface worker; non-fatal —
+    # ClickHouse outages must never break the crawl pipeline).
+    try:
+        ch_client.write_crawler_performance(
+            job_id=request.job_id,
+            item_id=item_id,
+            worker=WORKER_TYPE,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            proxy_ip=TOR_PROXY_URL,
+            retry_count=request.retry_count,
+            payload_size_bytes=len(html.encode("utf-8")),
+        )
+    except Exception as perf_err:
+        logger.warning("Unable to write crawler performance metric for %s: %s", request.job_id, perf_err)
 
     # --- Anti-bot detection + escalation to deep worker ---
     # Before page validation, check if the response indicates a challenge
@@ -457,7 +508,17 @@ async def process_request(
             request.job_id, item_id, final_url, WORKER_TYPE,
             challenge_reason, "escalated", request.retry_count,
         )
-        await escalate_to_deep(producer, request, challenge_reason)
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="challenge_detected",
+            state="active", detail=challenge_reason,
+        )
+        if await escalate_to_deep(producer, request, challenge_reason):
+            return
+        # Budget exhausted — close the site out instead of leaving it spinning.
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="failed", detail=f"Escalation exhausted: {challenge_reason}",
+        )
         return
 
     # --- Page validation ---
@@ -472,7 +533,12 @@ async def process_request(
             request.job_id, item_id, final_url, WORKER_TYPE,
             validation.reason, "escalated", request.retry_count,
         )
-        await escalate_to_deep(producer, request, validation.reason)
+        if await escalate_to_deep(producer, request, validation.reason):
+            return
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="failed", detail=f"Escalation exhausted: {validation.reason}",
+        )
         return
     if validation.status == "needs_review":
         # Only escalate actual anti-bot challenges — not insufficient content
@@ -493,7 +559,12 @@ async def process_request(
                 request.job_id, item_id, final_url, WORKER_TYPE,
                 validation.reason, "escalated", request.retry_count,
             )
-            await escalate_to_deep(producer, request, validation.reason)
+            if await escalate_to_deep(producer, request, validation.reason):
+                return
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, stage="site_finished",
+                state="failed", detail=f"Escalation exhausted: {validation.reason}",
+            )
             return
 
     # --- Recursive link extraction ---
@@ -540,7 +611,13 @@ async def process_request(
         request.job_id, item_id, final_url, WORKER_TYPE,
         validation.reason, validation.status, request.retry_count,
     )
-    await pg_client.update_job_status(request.job_id, "completed")
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="parsing", state="passed",
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="site_finished",
+        state="passed", detail=f"Queued {queued_count} child links",
+    )
 
     logger.info(
         "Dark job completed — job=%s status=%d latency=%dms "
@@ -563,12 +640,33 @@ async def process_message_safely(
     http_client: httpx.AsyncClient,
     message_value: bytes,
 ) -> None:
-    """Enforce concurrency limits via semaphore."""
+    """Enforce concurrency limits via semaphore.
+
+    An exception escaping ``process_request`` fails the job with the error as
+    its failure reason so it never stays in ``running`` forever.
+    """
+    failed_reason: str | None = None
     try:
         async with semaphore:
             await process_request(producer, http_client, message_value)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.error("Unhandled exception in dark worker task: %s", exc, exc_info=True)
+
+        failed_reason = f"Dark worker crashed while processing: {exc}"
+        await fail_job_from_message(
+            WORKER_TYPE,
+            message_value,
+            failed_reason,
+        )
+    finally:
+        await complete_job_task_from_message(
+            message_value,
+            worker_type=WORKER_TYPE,
+            failed=failed_reason is not None,
+            fail_reason=failed_reason,
+        )
 
 
 # =========================================================================
@@ -594,13 +692,18 @@ async def main() -> None:
 
     # --- Database ---
     await pg_client.connect()
+    install_job_log_relay()
 
     # --- Kafka consumer ---
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{WORKER_TYPE}-group",
-        auto_offset_reset="latest",
+        # "latest" silently skipped every message queued while this worker was
+        # down (fresh group / no committed offset) — jobs submitted during a
+        # stack restart sat in "running" forever. "earliest" + the completed-
+        # jobs dedup guard above makes restarts replay safely instead.
+        auto_offset_reset="earliest",
         enable_auto_commit=True,
         auto_commit_interval_ms=5000,
         max_poll_records=MAX_CONCURRENT_TASKS,

@@ -1,4 +1,5 @@
 import clickhouse_connect
+import time
 
 from app.common.config.settings import settings
 from app.common.logger.logger import logger
@@ -27,10 +28,24 @@ class ClickHouseManager:
 
     def connect(self) -> None:
         """Pings the ClickHouse server to ensure it is healthy."""
-        if not self.client:
-            raise ConnectionError("ClickHouse client not initialized. Cannot connect.")
+        for attempt in range(1, 31):
+            try:
+                if not self.client:
+                    self.client = clickhouse_connect.get_client(
+                        host=getattr(settings, "CLICKHOUSE_HOST", "localhost"),
+                        port=int(getattr(settings, "CLICKHOUSE_HTTP_PORT", 8123)),
+                        user=getattr(settings, "CLICKHOUSE_USER", "default"),
+                        password=getattr(settings, "CLICKHOUSE_PASSWORD", ""),
+                        database=settings.CLICKHOUSE_DB,
+                    )
+                self.client.ping()
+                break
+            except Exception:
+                self.client = None
+                if attempt == 30:
+                    raise
+                time.sleep(2)
         try:
-            self.client.ping()
             logger.info("ClickHouse server connected successfully.")
             # Ensure required database and tables exist for the application.
             try:
@@ -84,7 +99,23 @@ class ClickHouseManager:
                         llm_model String,
                         llm_score Nullable(Float32),
                         created_at DateTime DEFAULT now()
-                    ) ENGINE = MergeTree() ORDER BY (created_at, category);
+                    ) ENGINE = ReplacingMergeTree(created_at) ORDER BY (item_id);
+                    """
+                )
+                # Flattened entity index written by the llm-worker; powers the
+                # /analytics/intelligence/entities OSINT endpoints.
+                self.client.command(
+                    """
+                    CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_entities (
+                        item_id String,
+                        entity String,
+                        job_id String,
+                        url String,
+                        category LowCardinality(String),
+                        language LowCardinality(String),
+                        threat_severity UInt8,
+                        created_at DateTime DEFAULT now()
+                    ) ENGINE = ReplacingMergeTree(created_at) ORDER BY (entity, item_id);
                     """
                 )
                 # Forward-compatible migrations for installations created before

@@ -1,8 +1,9 @@
 import { useState } from "react"
-import { ArrowLeft, KeyRound, Loader2, Mail, Radar, ShieldCheck } from "lucide-react"
+import { ArrowLeft, KeyRound, Loader2, Mail, ShieldCheck } from "lucide-react"
 import { Link, useNavigate } from "react-router-dom"
 import { api, ApiError } from "../api"
 import { ThemeToggle } from "../theme"
+import { Logo } from "../components/Logo"
 
 export default function ForgotPasswordPage() {
   const navigate = useNavigate()
@@ -75,9 +76,7 @@ export default function ForgotPasswordPage() {
       </div>
       <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600">
-            <Radar className="h-6 w-6 text-white" />
-          </div>
+          <Logo className="h-12 w-auto" />
           <div>
             <h1 className="text-lg font-bold tracking-tight text-slate-100">Reset your password</h1>
             <p className="mt-1 text-xs text-slate-400">

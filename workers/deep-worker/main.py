@@ -22,6 +22,7 @@ Navigation strategy:
 """
 
 import asyncio
+import contextvars
 import io
 import json
 import logging
@@ -60,6 +61,7 @@ SUPPORTED_LANGUAGES = ETHIOPIC_LANGUAGES | {
     "en", "fr", "es", "de", "it", "pt", "sw", "tr", "hi", "ar", "ru",
 }
 from app.pipeline.schemas import CrawlRequest, ParsedItem, ParsedItemData
+from app.services.content_fingerprint_service import generate_fingerprint
 from app.services.link_extraction_service import LinkExtractionService
 from app.common.utils.minio_naming import parsed_name, raw_name
 from app.services.portal_handler import (
@@ -70,9 +72,23 @@ from app.services.portal_handler import (
     generic_portal_login,
 )
 from app.services.auto_signup_handler import auto_signup_handler
+from app.common.job_events import (
+    install_job_log_relay,
+    publish_job_stage,
+    reset_current_job_id,
+    set_current_job_id,
+)
 from app.services.credential_service import credential_service
+from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
-from workers.common import shared_proxy_manager
+from workers.common import (
+    complete_job_task_from_message,
+    extract_and_queue_children,
+    extract_job_context,
+    fail_job_from_message,
+    owns_message,
+    shared_proxy_manager,
+)
 from workers.health import HealthServer
 
 # Optional: audio solver for reCAPTCHA v2
@@ -747,8 +763,13 @@ class DeepWorker:
                 logger.error(
                     "[%s] fallback navigation also failed: %s", job_id, fallback_err
                 )
-                # Return empty — caller will handle the failure
-                return response, ""
+                # Return empty — caller handles the failure. The nav error is
+                # surfaced via the payload so process_job can fail this site
+                # with a real reason instead of reporting a fake HTTP 200.
+                payload["_navigation_error"] = (
+                    f"Navigation failed: {fallback_err}"
+                )
+                return None, ""
 
         # --- Stage 2: Ensure the DOM is at least parsed ---
         # commit-only returns before DOM is ready; force wait for DOM-ready.
@@ -767,6 +788,7 @@ class DeepWorker:
         is_challenge = await _is_cloudflare_challenge(page)
         if is_challenge:
             logger.info("[%s] Cloudflare challenge detected — running solver …", job_id)
+            await publish_job_stage(job_id=job_id, url=url, stage="challenge_detected", state="active", detail="Cloudflare challenge detected — solving")
             await self._humanize(page)
             await self.captcha_solver.solve_cloudflare_turnstile(page)
             await asyncio.sleep(3.0)
@@ -775,6 +797,7 @@ class DeepWorker:
             still_challenge = await _is_cloudflare_challenge(page)
             if not still_challenge:
                 logger.info("[%s] Cloudflare challenge cleared after solver", job_id)
+                await publish_job_stage(job_id=job_id, url=url, stage="challenge", state="passed", detail="Cloudflare challenge cleared")
             else:
                 logger.info("[%s] Challenge still present after solver — waiting for auto-resolve", job_id)
                 await asyncio.sleep(5.0)
@@ -881,8 +904,12 @@ class DeepWorker:
             webgl_config = _get_camoufox_webgl_config(os_name, screen_size)
 
             logger.info(
-                "[%s] 🦊 Camoufox attempt %d/%d — os=%s screen=%s locale=%s",
+                "[%s] 🦊 Camoufox fallback attempt %d/%d — os=%s screen=%s locale=%s",
                 job_id, attempt + 1, max_retries, os_name, screen_size, locale,
+            )
+            await publish_job_stage(
+                job_id=job_id, url=url, stage="camoufox_fallback", state="active",
+                detail=f"Camoufox stealth browser attempt {attempt + 1}/{max_retries}",
             )
 
             try:                    # Access AsyncCamoufox via sys.modules at call time so
@@ -947,6 +974,7 @@ class DeepWorker:
                             "[%s] Camoufox cleared Cloudflare on attempt %d",
                             job_id, attempt + 1,
                         )
+                        await publish_job_stage(job_id=job_id, url=url, stage="challenge", state="passed", detail="Cloudflare cleared via Camoufox")
 
                         if credentials and portal_config and portal_config.login_steps:
                             logger.info(
@@ -1073,11 +1101,19 @@ class DeepWorker:
         depth: int = int(payload.get("depth", 0))  # type: ignore[arg-type]
         language: str = str(payload.get("language", "unknown"))
         start_time: float = time.monotonic()
+        # Outcome of the auto-signup pre-step, if one ran for this job. When a
+        # signup was requested but failed, the caller fails the job instead of
+        # storing the (useless) form page as a parsed item.
+        _last_signup_result: dict[str, object] | None = None
 
         page: Page = await context.new_page()
 
         try:
             logger.info("[%s] Navigating to: %s", job_id, url)
+            await publish_job_stage(
+                job_id=job_id, url=url, stage="fetching", state="active",
+                detail=f"Loading {url}",
+            )
 
             portal_config_dict = payload.get("portal_config")
             portal_config = (
@@ -1094,7 +1130,27 @@ class DeepWorker:
             # A None response with substantial content is the explicit signal
             # that the content came from the successful Camoufox fallback.
             used_camoufox_content = response is None and len(content) > 500
-            status_code: int = 200 if used_camoufox_content else (response.status if response else 200)
+            # Track whether navigation actually succeeded. When every goto
+            # attempt failed (ERR_TIMED_OUT / ERR_CONNECTION_REFUSED …),
+            # _navigate_and_solve returns (response=None, content="") — that is
+            # a FAILED fetch, not a success. Treating it as HTTP 200 made the
+            # UI show the site as green "Passed" even though nothing was ever
+            # loaded (the onion-link bug).
+            raw_nav_error = payload.get("_navigation_error")
+            navigation_error: str | None = str(raw_nav_error) if raw_nav_error else None
+            if response is not None:
+                status_code = int(response.status)
+            elif used_camoufox_content:
+                # Camoufox captured the page after Patchright was blocked — a
+                # real successful render (response is None only because the
+                # capture came from the fallback browser).
+                status_code = 200
+            elif content:
+                # No response object but non-empty content (e.g. the
+                # challenge-only capture path) — legacy permissive default.
+                status_code = 200
+            else:
+                status_code = 599
 
             # --- Content retry: if first attempt yielded thin HTML, retry once ---
             # This handles cases where commit-only returns before the page renders
@@ -1116,6 +1172,7 @@ class DeepWorker:
                     )
                 except Exception as retry_err:
                     logger.error("[%s] Retry navigation failed: %s", job_id, retry_err)
+                    payload["_navigation_error"] = f"Retry navigation failed: {retry_err}"
                     break
                 await self._humanize(page)
                 await asyncio.sleep(4.0)
@@ -1239,14 +1296,21 @@ class DeepWorker:
                             payload.get("auto_email_verification")
                             or payload.get("allow_email_verification")
                         )
-                        signup_result = await auto_signup_handler.handle(
-                            page=page,
-                            email=_signup_email,
-                            password=credentials["password"],
-                            domain=_signup_domain,
-                            portal_config=portal_config_dict if isinstance(portal_config_dict, dict) else None,
-                            perform_verification=_want_verification,
-                        )
+                        # Relay signup-handler logs (tagged with email/domain,
+                        # not [JOBxxx]) to this job's UI console.
+                        _job_tag_token = set_current_job_id(job_id)
+                        try:
+                            signup_result = await auto_signup_handler.handle(
+                                page=page,
+                                email=_signup_email,
+                                password=credentials["password"],
+                                domain=_signup_domain,
+                                portal_config=portal_config_dict if isinstance(portal_config_dict, dict) else None,
+                                perform_verification=_want_verification,
+                            )
+                        finally:
+                            reset_current_job_id(_job_tag_token)
+                        _last_signup_result = dict(signup_result)
                         logger.info(
                             "[%s] Auto-signup result: action=%s success=%s "
                             "needs_verification=%s verified=%s",
@@ -1256,6 +1320,22 @@ class DeepWorker:
                             signup_result.get("needs_verification"),
                             signup_result.get("verified"),
                         )
+                        await publish_job_stage(
+                            job_id=job_id, url=url,
+                            stage="signup",
+                            state="passed" if signup_result.get("success") else "failed",
+                            detail=str(signup_result.get("message") or signup_result.get("action") or ""),
+                        )
+                        if signup_result.get("needs_verification"):
+                            await publish_job_stage(
+                                job_id=job_id, url=url, stage="verification", state="active",
+                                detail="Email verification in progress",
+                            )
+                        if signup_result.get("verified"):
+                            await publish_job_stage(
+                                job_id=job_id, url=url, stage="verification", state="passed",
+                                detail="Email verified",
+                            )
                         # Refresh content after signup/login
                         if signup_result.get("success"):
                             content = await page.content()
@@ -1265,7 +1345,16 @@ class DeepWorker:
                             job_id, signup_err,
                         )
 
-            if not self.camoufox_authenticated and not is_still_challenge and credentials:
+            # Skip the generic login block when the signup handler already ran:
+            # its result covers both signup and login, and re-running login on a
+            # page with no form produced misleading "Login form submitted" stages.
+            _signup_ran = _last_signup_result is not None
+            if (
+                not self.camoufox_authenticated
+                and not is_still_challenge
+                and credentials
+                and not _signup_ran
+            ):
                 await self._log_page_state(page, job_id, "pre_login")
 
                 if portal_config:
@@ -1290,9 +1379,16 @@ class DeepWorker:
                         len(portal_structured_data),
                         portal_result.get("pages_visited"),
                     )
+                    await publish_job_stage(
+                        job_id=job_id, url=url,
+                        stage="login",
+                        state="passed" if portal_result.get("login_successful") else "failed",
+                        detail="Portal login " + ("succeeded" if portal_result.get("login_successful") else "failed"),
+                    )
                 else:
                     # Fallback: generic login (existing behavior)
                     await self.handle_login(page, credentials)
+                    await publish_job_stage(job_id=job_id, url=url, stage="login", state="passed", detail="Login form submitted")
                     # Wait for post-login JS rendering (SPA product pages)
                     try:
                         await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -1316,6 +1412,10 @@ class DeepWorker:
                     "[%s] Page is STILL a Cloudflare challenge after all retries — "
                     "skipping login.",
                     job_id,
+                )
+                await publish_job_stage(
+                    job_id=job_id, url=url, stage="challenge", state="failed",
+                    detail="Cloudflare challenge could not be cleared",
                 )
 
             # --- Extract JS-rendered visible text (for SPAs / dynamic content) ---
@@ -1387,8 +1487,13 @@ class DeepWorker:
                 "depth": depth,
                 "language": language,
                 "fetch_duration": round(fetch_duration, 3),
-                "error": f"HTTP {status_code}" if status_code >= 400 else None,
+                "error": (
+                    navigation_error
+                    or (f"HTTP {status_code}" if status_code >= 400 else None)
+                ),
+                "navigation_error": navigation_error,
                 "portal_structured_data": portal_structured_data,
+                "signup_result": _last_signup_result,
             }
 
         except Exception as exc:
@@ -1404,6 +1509,7 @@ class DeepWorker:
                 "language": language,
                 "fetch_duration": round(time.monotonic() - start_time, 3),
                 "error": str(exc),
+                "navigation_error": str(exc),
                 "portal_structured_data": {},
             }
         finally:
@@ -1460,9 +1566,21 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 
     if _browser_context is None:
         logger.error(
-            "[%s] Browser context is None — skipping job. "
+            "[%s] Browser context is None — failing job. "
             "The browser may have failed to launch at startup.",
             request.job_id,
+        )
+        # Close the site timeline BEFORE failing the job so no spinner remains.
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="failed", detail="Deep worker browser unavailable",
+        )
+        await pg_client.fail_job(
+            request.job_id,
+            worker_type=WORKER_TYPE,
+            url=request.url,
+            reason="Deep worker browser is unavailable — job could not be processed",
+            event_type="browser_unavailable",
         )
         return
 
@@ -1485,6 +1603,15 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
     # ERR_NO_SUPPORTED_PROXIES and unnecessary latency.
     from urllib.parse import urlparse as _urlparse
     _hostname = (_urlparse(request.url).hostname or "").lower()
+
+    # Item-level progress: announce this site so the UI can list it with its
+    # own live stage timeline (recursive jobs process many sites per job).
+    await publish_job_stage(
+        job_id=request.job_id, stage="site_started", state="active",
+        url=request.url, item_id=item_id,
+        detail=_hostname or request.url,
+    )
+
     _is_dark_web = any(_hostname.endswith(s) for s in (".onion", ".i2p", ".loki", ".zeronet"))
     _job_context = _browser_context
 
@@ -1529,7 +1656,12 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                     "username": stored.get("username") or stored.get("email"),
                     "password": stored["password"],
                 }
-                logger.info("[%s] Reusing stored credential for %s", request.job_id, _hostname)
+                logger.info(                "[%s] Reusing stored credential for %s", request.job_id, _hostname)
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, item_id=item_id,
+                stage="login", state="active",
+                detail=f"Stored credential found for {_hostname} — logging in",
+            )
         if not request.job_params.get("credentials") and request.job_params.get("allow_signup"):
             # Full-auto signup: synthesize a new identity (dukaXXXXX / Duka@12345).
             # auto_signup_handler persists it to credential_usage after a
@@ -1540,15 +1672,15 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 "username": _gen_user,
                 "password": credential_service._DEFAULT_PASSWORD,
             }
-            # Signup email: use a plus-alias of the seed Gmail inbox when one is
-            # configured, so verification emails land in a real, pollable inbox.
-            # (Gmail ignores everything after '+', and signup forms treat it as
-            # a distinct address.) Otherwise fall back to a placeholder that
-            # cannot receive verification mail.
+            # Signup email: use the plain seed Gmail inbox when configured, so
+            # verification emails land in a real, pollable inbox and every site
+            # account is tied to the same address. (Previously we generated
+            # Gmail plus-aliases like seed+dukaXXXXX@gmail.com — disabled so
+            # sites store the exact seed address.) Otherwise fall back to a
+            # placeholder that cannot receive verification mail.
             _seed_inbox = getattr(settings, "SEED_GMAIL_EMAIL", "")
-            if _seed_inbox and "@gmail.com" in _seed_inbox.lower():
-                _seed_local, _, _seed_domain = _seed_inbox.partition("@")
-                request.job_params["auto_signup_email"] = f"{_seed_local}+{_gen_user}@{_seed_domain}"
+            if _seed_inbox and "@" in _seed_inbox:
+                request.job_params["auto_signup_email"] = _seed_inbox.strip()
             else:
                 request.job_params["auto_signup_email"] = f"{_gen_user}@dukascraper.local"
             request.job_params["auto_password"] = credential_service._DEFAULT_PASSWORD
@@ -1561,6 +1693,11 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 "[%s] No stored credential for %s — signup identity generated (user=%s, inbox=%s)",
                 request.job_id, _hostname, _gen_user,
                 request.job_params["auto_signup_email"],
+            )
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, item_id=item_id,
+                stage="signup", state="active",
+                detail=f"No stored credential — signing up as {_gen_user}",
             )
 
     # Build the payload for the browser renderer
@@ -1593,8 +1730,25 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
     html: str = str(result_data.get("html", ""))
     rendered_text_raw: str = str(result_data.get("rendered_text", ""))
     error: str | None = result_data.get("error")  # type: ignore[assignment]
+    nav_error: str | None = result_data.get("navigation_error")  # type: ignore[assignment]
     fetch_duration: float = float(result_data.get("fetch_duration", 0.0))
     portal_structured_data: dict[str, object] = dict(result_data.get("portal_structured_data", {}))  # type: ignore[arg-type]
+
+    # Per-attempt performance metric (mirrors surface/dark workers; non-fatal —
+    # ClickHouse outages must never break the crawl pipeline).
+    try:
+        ch_client.write_crawler_performance(
+            job_id=request.job_id,
+            item_id=item_id,
+            worker=WORKER_TYPE,
+            status_code=status_code,
+            latency_ms=int(fetch_duration * 1000),
+            proxy_ip="tor" if _is_dark_web else "direct",
+            retry_count=request.retry_count,
+            payload_size_bytes=len(html.encode("utf-8")),
+        )
+    except Exception as perf_err:
+        logger.warning("[%s] Unable to write crawler performance metric: %s", request.job_id, perf_err)
 
     # Log portal structured data if present
     if portal_structured_data:
@@ -1621,6 +1775,9 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 
     # --- Record crawl_log (mirrors surface/dark worker behavior) ---
     if error:
+        # Per-page failure: close THIS site's timeline as failed. The job status
+        # is owned by the outstanding-task counter — one failed page must not
+        # abort sibling pages still being processed by the recursive crawl.
         await pg_client.record_crawl_log(
             job_id=request.job_id,
             item_id=item_id,
@@ -1630,6 +1787,81 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
             status="failed",
             retry_count=request.retry_count,
             details=error,
+        )
+        # Show the real navigation error in the UI when that's what happened
+        # (e.g. "Page.goto: net::ERR_TIMED_OUT at …") instead of a bare status.
+        _fail_detail = str(error)
+        if nav_error and nav_error not in _fail_detail:
+            _fail_detail = f"{nav_error} ({status_code})"
+        await publish_job_stage(
+            job_id=request.job_id, stage="site_finished", state="failed",
+            url=request.url, item_id=item_id, detail=_fail_detail[:300],
+        )
+        return
+
+    # A requested auto-signup that failed means the crawl cannot achieve its
+    # goal — the captured page is just a registration/login form. Fail the job
+    # instead of storing the form as a completed parsed item.
+    # Exception: "no signup form found" is benign (the site simply has no
+    # registration page, e.g. a news site) — log it, mark the signup stage as
+    # skipped, and continue storing the page as normal content.
+    _signup_outcome = result_data.get("signup_result")
+    _signup_benign_skip = (
+        isinstance(_signup_outcome, dict)
+        and _signup_outcome
+        and not _signup_outcome.get("success")
+        and "no signup form found" in str(_signup_outcome.get("message", "")).lower()
+    )
+    if _signup_benign_skip:
+        _skip_msg = str(_signup_outcome.get("message") or "no signup form")
+        logger.info(
+            "[%s] Auto-signup skipped: %s — site has no registration form; "
+            "storing page as normal content.",
+            request.job_id, _skip_msg,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, item_id=item_id,
+            stage="signup", state="info",
+            detail="Skipped — site has no signup form",
+        )
+        await pg_client.record_crawl_log(
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            worker_type=WORKER_TYPE,
+            event_type="auto_signup",
+            status="skipped",
+            retry_count=request.retry_count,
+            details=f"Auto-signup skipped: {_skip_msg}",
+        )
+    elif isinstance(_signup_outcome, dict) and _signup_outcome and not _signup_outcome.get("success"):
+        _signup_msg = str(
+            _signup_outcome.get("message") or _signup_outcome.get("action") or "signup failed"
+        )
+        logger.error(
+            "[%s] Auto-signup did not succeed (%s) — failing job instead of "
+            "storing the registration page as content.",
+            request.job_id, _signup_msg,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, item_id=item_id,
+            stage="signup", state="failed",
+            detail=_signup_msg,
+        )
+        await pg_client.record_crawl_log(
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            worker_type=WORKER_TYPE,
+            event_type="auto_signup",
+            status="failed",
+            retry_count=request.retry_count,
+            details=f"Auto-signup failed: {_signup_msg}",
+        )
+        await publish_job_stage(
+            job_id=request.job_id, stage="site_finished", state="failed",
+            url=request.url, item_id=item_id,
+            detail=f"Auto-signup failed: {_signup_msg}",
         )
         await pg_client.update_job_status(request.job_id, "failed")
         return
@@ -1668,6 +1900,20 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 detected_language = doc_lang
         except Exception:
             pass
+
+    # --- Language gate (parity with parser-worker) ---
+    # Unsupported or mismatched languages are flagged, not dropped: the item is
+    # stored and published but marked needs_review, matching the parser-worker
+    # contract so the exporter and llm-worker can skip it downstream.
+    language_mismatch = False
+    language_rejection_reason: str | None = None
+    if detected_language not in SUPPORTED_LANGUAGES:
+        language_mismatch = True
+        language_rejection_reason = "unsupported_language"
+        detected_language = "unknown"
+    elif requested_lang in SUPPORTED_LANGUAGES and detected_language != requested_lang:
+        language_mismatch = True
+        language_rejection_reason = "language_mismatch"
 
     # Extract title from meta tags / <title> / first heading
     # (needed by the interstitial guard below AND stored on the parsed item)
@@ -1752,7 +1998,11 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
             retry_count=request.retry_count,
             details="Cloudflare challenge not solved: page content is the challenge interstitial",
         )
-        await pg_client.update_job_status(request.job_id, "failed")
+        await publish_job_stage(
+            job_id=request.job_id, stage="site_finished", state="failed",
+            url=request.url, item_id=item_id,
+            detail="Cloudflare challenge not solved",
+        )
         return
 
     canonical_url = LinkExtractionService.normalize_url(request.url)
@@ -1762,6 +2012,8 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 
     status = "completed"
     if not extracted_text or quality_score < 0.35:
+        status = "needs_review"
+    if status == "completed" and language_mismatch:
         status = "needs_review"
 
     # --- Persist parsed_items metadata in PostgreSQL ---
@@ -1779,6 +2031,58 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
     )
     resolved_item_id = item_record["item_id"]
 
+    # --- Content fingerprint + 3-tier dedup (parity with surface worker) ---
+    # Deep items previously skipped fingerprinting entirely, so browser-tier
+    # content was invisible to the exact/near-duplicate tiers. Mirror the
+    # surface worker: record duplicate_of metadata but still publish (the
+    # dedup APIs and parsed_items metadata surface the duplicate).
+    if settings.DEDUP_ENABLED:
+        try:
+            fp = generate_fingerprint(request.url, extracted_text or "")
+            dup_type: str | None = None
+            dup_of: str | None = None
+
+            # Tier 2: exact content hash
+            content_match = await pg_client.check_content_duplicate(
+                fp.content_fp, stale_hours=settings.DEDUP_STALE_HOURS,
+            )
+            if content_match and content_match.get("item_id") != resolved_item_id:
+                dup_type = "content_exact"
+                dup_of = content_match["item_id"]
+
+            # Tier 3: near-duplicate (only if no exact match found)
+            if not dup_type:
+                near_match = await pg_client.check_near_duplicate(
+                    fp.simhash_val,
+                    threshold=settings.DEDUP_SIMHASH_THRESHOLD,
+                    stale_hours=settings.DEDUP_STALE_HOURS,
+                )
+                if near_match and near_match.get("item_id") != resolved_item_id:
+                    dup_type = "near_duplicate"
+                    dup_of = near_match["item_id"]
+
+            if dup_of:
+                logger.info(
+                    "[%s] Dedup hit (%s) for %s -> duplicate of %s",
+                    request.job_id, dup_type, request.url, dup_of,
+                )
+
+            await pg_client.store_fingerprint(
+                job_id=request.job_id,
+                item_id=resolved_item_id,
+                url=canonical_url,
+                url_fingerprint=fp.url_fp,
+                content_fingerprint=fp.content_fp,
+                simhash_val=fp.simhash_val,
+                word_count=fp.word_count,
+                char_count=fp.char_count,
+                text_preview=fp.text_preview,
+                duplicate_of=dup_of,
+                duplicate_type=dup_type,
+            )
+        except Exception as fp_err:
+            logger.debug("Fingerprint storage failed (non-fatal): %s", fp_err)
+
     # --- Upload raw HTML and parsed JSON to MinIO (consistent naming) ---
     raw_object = raw_name(WORKER_TYPE, request.job_id, resolved_item_id)
     parsed_object = parsed_name(WORKER_TYPE, request.job_id, resolved_item_id)
@@ -1794,6 +2098,9 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         fetch_duration=fetch_duration,
         payload_size_bytes=payload_size,
         portal_structured_data=portal_structured_data if portal_structured_data else None,
+        requested_language=requested_lang,
+        language_mismatch=language_mismatch,
+        language_rejection_reason=language_rejection_reason,
     )
 
     parsed_item = ParsedItem(
@@ -1825,6 +2132,35 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         value=parsed_bytes,
         key=request.job_id.encode("utf-8"),
     )
+    # Item-level progress: this site is done.
+    await publish_job_stage(
+        job_id=request.job_id, stage="site_finished", state="passed",
+        url=request.url, item_id=item_id,
+        detail=f"Stored {len(extracted_text or '')} chars ({status})",
+    )
+    # --- Recursive crawling: queue child links (same as surface/dark workers) ---
+    # Runs only while the job is still within its depth budget and the crawl
+    # asked for link extraction. Children inherit the job's recursive config so
+    # depth accounting and domain scoping stay consistent across workers.
+    try:
+        _links, _queued, _skipped = await extract_and_queue_children(
+            producer=producer,
+            request=request,
+            html=html,
+            consume_topic=CONSUME_TOPIC,
+            redis_url=settings.REDIS_URL,
+        )
+        if _queued:
+            logger.info(
+                "[%s] Recursive crawl queued %d child pages (%d duplicates skipped)",
+                request.job_id, _queued, _skipped,
+            )
+    except Exception:
+        logger.exception(
+            "[%s] Recursive link extraction failed — continuing without children",
+            request.job_id,
+        )
+
     await pg_client.record_crawl_log(
         request.job_id,
         resolved_item_id,
@@ -1834,7 +2170,6 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         "completed",
         request.retry_count,
     )
-    await pg_client.update_job_status(request.job_id, "completed")
     logger.info(
         "Published parsed result for %s (lang=%s, chars=%d, quality=%.2f)",
         request.url,
@@ -1845,14 +2180,59 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 
 
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes) -> None:
-    """Enforces concurrency limits using the global semaphore."""
+    """Enforces concurrency limits + a hard wall-clock budget per message.
+
+    Any exception that escapes ``process_request`` fails the job with the
+    error as its failure reason, so a crash never leaves the job stuck in
+    ``running`` forever (the API-side watchdog is the last resort). A page
+    that hangs (dead browser socket, endless challenge loop) is cancelled at
+    ``DEEP_MESSAGE_BUDGET_SECONDS`` and the site is closed out as failed —
+    one slow site must not stall the whole job behind the semaphore.
+    """
+    failed_reason: str | None = None
     async with _semaphore:
         try:
-            await process_request(producer, message_value)
+            await asyncio.wait_for(
+                process_request(producer, message_value),
+                timeout=settings.DEEP_MESSAGE_BUDGET_SECONDS,
+            )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except TimeoutError:
+            job_id, url = extract_job_context(message_value)
+            failed_reason = (
+                "Deep worker page budget exceeded "
+                f"({settings.DEEP_MESSAGE_BUDGET_SECONDS:.0f}s) — site abandoned"
+            )
+            logger.error("[%s] %s (url=%s)", job_id or "?", failed_reason, url)
+            if job_id:
+                try:
+                    from app.common.job_events import publish_job_stage
+
+                    await publish_job_stage(
+                        job_id=job_id, url=url or "", stage="site_finished",
+                        state="failed", detail="Page budget exceeded — site abandoned",
+                    )
+                except Exception:
+                    pass
+                if owns_message(message_value, WORKER_TYPE):
+                    await fail_job_from_message(WORKER_TYPE, message_value, failed_reason)
+        except Exception as exc:
             logger.exception("Deep-worker message task failed")
+            failed_reason = f"Deep worker crashed while processing: {exc}"
+            if owns_message(message_value, WORKER_TYPE):
+                await fail_job_from_message(
+                    WORKER_TYPE,
+                    message_value,
+                    failed_reason,
+                )
+        finally:
+            await complete_job_task_from_message(
+                message_value,
+                worker_type=WORKER_TYPE,
+                failed=failed_reason is not None,
+                fail_reason=failed_reason,
+            )
 
 
 # =========================================================================
@@ -1975,6 +2355,9 @@ async def main() -> None:
     )
     await health_server.start()
 
+    # Stream any [JOBxxx]-tagged log line to the UI console over Redis pub/sub.
+    install_job_log_relay()
+
     # --- Step 1: Connect to PostgreSQL ---
     logger.info("Connecting to PostgreSQL …")
     try:
@@ -2057,7 +2440,8 @@ async def main() -> None:
 
     try:
         async for msg in consumer:
-            task = asyncio.create_task(process_message_safely(producer, msg.value))
+            task_ctx = contextvars.copy_context()
+            task = asyncio.create_task(process_message_safely(producer, msg.value), context=task_ctx)
             tasks.add(task)
             task.add_done_callback(_task_done)
     except asyncio.CancelledError:

@@ -463,7 +463,10 @@ async def consume_and_parse():
     consumer = AIOKafkaConsumer(
         KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BROKERS,
-        auto_offset_reset="latest",
+        # 'earliest' so results published while the parser was down are still
+        # processed after a restart — 'latest' silently dropped them, which
+        # showed up as "links extracted but 0 parsed items".
+        auto_offset_reset="earliest",
         group_id="parser-group",
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKERS)
@@ -493,6 +496,7 @@ async def consume_and_parse():
             metrics.record_consumed()
             logger.debug(f"[Kafka Offset {message.offset}] Received new ingestion payload.")
 
+            crawl_result: CrawlResult | None = None
             try:
                 crawl_result = CrawlResult(**json.loads(message.value.decode("utf-8")))
                 logger.info(f"Processing content from source [{crawl_result.language}]: {crawl_result.url}")
@@ -508,13 +512,22 @@ async def consume_and_parse():
                 #    Elasticsearch, exporter, and LLM.  needs_review items
                 #    (language_mismatch, quality_score < 0.35) are still published
                 #    but carry their status so downstream consumers can filter.
+                #
+                #    NOTE: the job status is NOT touched here. A recursive job
+                #    has one parsed item per site; stamping "completed" (or
+                #    "failed"/"skipped") per item used to finish the job after
+                #    the FIRST page while the remaining crawl messages were
+                #    still in flight — which also made the crawler workers
+                #    skip those messages as "already completed". The final
+                #    status is owned by the outstanding-task counter
+                #    (pg_client.complete_job_task).
                 if parsed_payload["status"] == "failed":
-                    await pg_client.update_job_status(crawl_result.job_id, "failed")
+                    # Per-page failure only — the job's terminal status is owned
+                    # by the outstanding-task counter, not by any single item.
                     logger.info("Held item %s for failure (status=failed)", item_id)
                     continue
 
                 if parsed_payload["status"] == "skipped":
-                    await pg_client.update_job_status(crawl_result.job_id, "skipped")
                     logger.info("Skipped item %s (duplicate content)", item_id)
                     continue
 
@@ -526,20 +539,21 @@ async def consume_and_parse():
                     parsed_payload.get("data", {}).get("detected_language"),
                     parsed_payload.get("data", {}).get("language_mismatch"),
                 )
-                await pg_client.update_job_status(crawl_result.job_id, parsed_payload["status"])
 
             except json.JSONDecodeError:
                 logger.warning("Failed to decode message package. Skipping invalid JSON format.")
-                await pg_client.update_job_status(crawl_result.job_id, "failed")
             except ValidationError as e:
                 logger.warning(f"Skipping invalid crawl result payload: {e}")
-                await pg_client.update_job_status(crawl_result.job_id, "failed")
             except DuplicateContentError as e:
-                logger.info(f"Skipping duplicate content for {crawl_result.url}: {e}")
-                await pg_client.update_job_status(crawl_result.job_id, "skipped")
+                # Duplicate CONTENT is per-item bookkeeping, not a job failure:
+                # the original item already exists, this page just adds nothing.
+                logger.info(
+                    "Skipping duplicate content for %s: %s",
+                    crawl_result.url if crawl_result else "?", e,
+                )
             except Exception as loop_err:
+                # Never let one bad record kill the consumer loop.
                 logger.error(f"Error handling individual record: {loop_err}", exc_info=True)
-                await pg_client.update_job_status(crawl_result.job_id, "failed")
 
     except Exception as e:
         logger.critical(f"Fatal error in consumer pipeline loop: {e}", exc_info=True)

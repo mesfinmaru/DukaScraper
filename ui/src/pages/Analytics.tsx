@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Loader2,
+  Network,
   RefreshCw,
   ShieldAlert,
 } from "lucide-react"
@@ -18,6 +19,8 @@ import {
   SOURCE_TYPES,
 } from "../types"
 import type {
+  EntityMentionsResponse,
+  EntitySummaryResponse,
   EvaluationResponse,
   MetricsResponse,
   PerformanceResponse,
@@ -89,6 +92,12 @@ export default function Analytics() {
   const [threatsLoading, setThreatsLoading] = useState(true)
   const [threatsError, setThreatsError] = useState<string | null>(null)
 
+  const [entities, setEntities] = useState<EntitySummaryResponse | null>(null)
+  const [entitiesLoading, setEntitiesLoading] = useState(true)
+  const [entitiesError, setEntitiesError] = useState<string | null>(null)
+  const [mentions, setMentions] = useState<EntityMentionsResponse | null>(null)
+  const [mentionsLoading, setMentionsLoading] = useState(false)
+
   const [performance, setPerformance] = useState<PerformanceResponse | null>(null)
   const [perfLoading, setPerfLoading] = useState(true)
   const [perfError, setPerfError] = useState<string | null>(null)
@@ -139,6 +148,36 @@ export default function Analytics() {
     }
   }, [])
 
+  const loadEntities = useCallback(async () => {
+    setEntitiesLoading(true)
+    try {
+      setEntities(await api.getIntelligenceEntities(100))
+      setEntitiesError(null)
+    } catch (e) {
+      setEntitiesError(
+        e instanceof ApiError && e.status === 503
+          ? "Analytics database unavailable - is ClickHouse running?"
+          : e instanceof Error
+            ? e.message
+            : "Failed to load entity intelligence",
+      )
+      setEntities(null)
+    } finally {
+      setEntitiesLoading(false)
+    }
+  }, [])
+
+  const loadMentions = useCallback(async (entity: string) => {
+    setMentionsLoading(true)
+    try {
+      setMentions(await api.searchEntityMentions(entity, 50))
+    } catch (e) {
+      setMentions({ entity, total: 0, mentions: [] })
+    } finally {
+      setMentionsLoading(false)
+    }
+  }, [])
+
   const loadPerformance = useCallback(async () => {
     setPerfLoading(true)
     try {
@@ -162,7 +201,8 @@ export default function Analytics() {
     void loadMetrics()
     void loadThreats()
     void loadPerformance()
-  }, [loadMetrics, loadThreats, loadPerformance])
+    void loadEntities()
+  }, [loadMetrics, loadThreats, loadPerformance, loadEntities])
 
   useEffect(() => {
     setEvaluatedBy(session?.user.username ?? "")
@@ -213,6 +253,7 @@ export default function Analytics() {
     void loadMetrics()
     void loadThreats()
     void loadPerformance()
+    void loadEntities()
   }
 
   const fillEvaluation = (row: ThreatRecentRow) => {
@@ -448,6 +489,111 @@ export default function Analytics() {
             </>
           )
         ) : null}
+      </section>
+
+      {/* ---------------- Entity intelligence ---------------- */}
+      <section className="mb-10">
+        <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
+          <Network className="h-5 w-5 text-sky-400" />
+          Entity intelligence
+        </h2>
+        <p className="mb-4 text-xs leading-relaxed text-slate-500">
+          People, hosts, IPs and emails extracted by the LLM worker across all analyzed content.
+          Click an entity to pivot: every analyzed page mentioning it.
+        </p>
+
+        {entitiesError && (
+          <div className="mb-4">
+            <ErrorBanner message={entitiesError} onRetry={() => void loadEntities()} />
+          </div>
+        )}
+
+        {entitiesLoading && !entities ? (
+          <LoadingBlock label="Loading entity intelligence..." />
+        ) : entities && entities.total === 0 ? (
+          <div className="card p-8 text-center text-sm text-slate-500">
+            No entities extracted yet - they appear after the llm-worker analyzes content.
+          </div>
+        ) : entities ? (
+          <div className="card overflow-x-auto p-0">
+            <table className="w-full min-w-[720px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
+                  <th className="px-4 py-3 font-medium">Entity</th>
+                  <th className="px-4 py-3 font-medium">Type</th>
+                  <th className="px-4 py-3 font-medium">Pages</th>
+                  <th className="px-4 py-3 font-medium">Sample sources</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entities.entities.map((e) => (
+                  <tr
+                    key={`${e.entity_type}:${e.entity}`}
+                    onClick={() => void loadMentions(e.entity)}
+                    title={`Find every page mentioning "${e.entity}"`}
+                    className="cursor-pointer border-b border-slate-800/60 last:border-0 hover:bg-slate-900/40"
+                  >
+                    <td className="px-4 py-2.5 font-mono text-xs break-all text-sky-300">{e.entity}</td>
+                    <td className="px-4 py-2.5">
+                      <span className="rounded-full border border-slate-700 px-2 py-0.5 text-[11px] text-slate-400 capitalize">
+                        {e.entity_type}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 tabular-nums text-slate-300">{formatNumber(e.occurrences)}</td>
+                    <td className="max-w-72 px-4 py-2.5 font-mono text-[11px] text-slate-500">
+                      {e.sample_urls.length ? e.sample_urls[0] : "--"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+
+        {mentionsLoading && <LoadingBlock label={`Searching mentions of "${mentions?.entity ?? ""}"...`} />}
+
+        {mentions && !mentionsLoading && (
+          <div className="card mt-4 overflow-x-auto p-0">
+            <div className="flex items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
+              <span className="text-sm font-semibold text-slate-200">
+                Pages mentioning <span className="font-mono text-sky-300">{mentions.entity}</span>
+              </span>
+              <span className="text-[11px] text-slate-500">{formatNumber(mentions.total)} found</span>
+            </div>
+            {mentions.total === 0 ? (
+              <p className="px-4 py-6 text-center text-sm text-slate-500">No mentions found.</p>
+            ) : (
+              <table className="w-full min-w-[720px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
+                    <th className="px-4 py-3 font-medium">Item</th>
+                    <th className="px-4 py-3 font-medium">Category</th>
+                    <th className="px-4 py-3 font-medium">Severity</th>
+                    <th className="px-4 py-3 font-medium">URL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mentions.mentions.map((m, i) => (
+                    <tr
+                      key={`${m.item_id}-${i}`}
+                      onClick={() => navigate(`/jobs/${m.job_id}/articles?itemId=${encodeURIComponent(m.item_id)}`)}
+                      className="cursor-pointer border-b border-slate-800/60 last:border-0 hover:bg-slate-900/40"
+                    >
+                      <td className="px-4 py-2.5 font-mono text-xs text-sky-600">{m.item_id}</td>
+                      <td className="px-4 py-2.5 capitalize text-slate-200">{m.category.replace(/_/g, " ")}</td>
+                      <td className="px-4 py-2.5">
+                        <SeverityBadge severity={m.severity} />
+                      </td>
+                      <td className="max-w-72 truncate px-4 py-2.5 font-mono text-xs text-slate-400" title={m.url}>
+                        {m.url}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
       </section>
 
       {/* ---------------- System performance / latency ---------------- */}

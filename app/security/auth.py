@@ -194,6 +194,30 @@ async def require_admin(user=Depends(get_current_user)):
     return user
 
 
+async def get_current_user_flexible(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ],
+    token: str | None = None,
+):
+    """Like :func:`get_current_user` but also accepts ``?token=`` query param.
+
+    Used for browser-navigation downloads (``<a href>`` / ``window.open``)
+    that cannot attach an Authorization header. The WebSocket endpoints use
+    the same convention.
+    """
+    if credentials:
+        return await get_current_user(credentials)
+    if token:
+        fake = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        return await get_current_user(fake)
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 def ensure_owner_or_admin(*, owner_id: str, user) -> None:
     """Raise 403 unless the user is an admin or the resource owner."""
     if user["role"] != "admin" and user["user_id"] != owner_id:

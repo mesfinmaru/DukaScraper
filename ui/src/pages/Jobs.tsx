@@ -229,7 +229,14 @@ export default function Jobs() {
                         </Link>
                       </td>
                       <td className="max-w-[340px] px-5 py-3.5">
-                        <p className="truncate font-mono text-xs text-slate-400" title={job.url}>
+                        <p
+                          className="truncate font-mono text-xs text-slate-400"
+                          title={
+                            job.assignment_reason
+                              ? `${job.url} — routed: ${job.assignment_reason.replace(/_/g, " ")}`
+                              : job.url
+                          }
+                        >
                           {job.url}
                         </p>
                       </td>

@@ -2,6 +2,8 @@
 Storage API routes - browse MinIO objects (raw HTML, parsed JSON, exports).
 """
 
+from typing import Annotated, Any
+
 import csv
 import html as html_lib
 import io
@@ -12,13 +14,15 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.common.config.settings import settings
 from app.common.logger.logger import logger
+from app.security.auth import get_current_user_flexible
 from app.storage.minio.client import minio_client
+from app.storage.postgres.client import pg_client
 
 router = APIRouter()
 
@@ -47,15 +51,81 @@ class DownloadManyRequest(BaseModel):
 
 
 @router.get("/")
-async def list_buckets():
+async def list_buckets(user: Annotated[dict, Depends(get_current_user_flexible)]):
     """List the storage buckets managed by this pipeline."""
     return {"buckets": BUCKETS}
 
 
-@router.get("/{bucket_key}")
-async def list_storage_items(bucket_key: str, prefix: str = ""):
+# ---------------------------------------------------------------------------
+# Per-user object scoping
+# ---------------------------------------------------------------------------
+
+
+def _job_id_from_object(name: str) -> str | None:
+    """Extract the job id from a MinIO object name.
+
+    Supports the worker naming scheme (``deep_raw_JOB00000001_ITEM00000001.html``)
+    and folder-style prefixes (``JOB00000001/...`` or ``exports/JOB00000001/...``).
     """
-    List objects in a bucket.
+    match = re.search(r"JOB\d+", name, re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
+async def _filter_objects_for_user(
+    bucket_key: str,
+    items: list[dict[str, Any]],
+    user: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Drop objects whose owning job belongs to another user.
+
+    Admins see everything. Ownership is resolved through the job id embedded in
+    the object name (jobs.user_id); objects whose job cannot be resolved are
+    hidden from non-admins (fail closed).
+    """
+    if user.get("role") == "admin":
+        return items
+    user_id = user.get("user_id")
+    if not user_id:
+        return []
+
+    job_ids = {
+        jid
+        for item in items
+        if (jid := _job_id_from_object(str(item.get("object_name", ""))))
+    }
+    owners: dict[str, str | None] = {}
+    if job_ids:
+        owners = await pg_client.get_job_owners(list(job_ids))
+
+    allowed = []
+    for item in items:
+        jid = _job_id_from_object(str(item.get("object_name", "")))
+        if jid and owners.get(jid) == user_id:
+            allowed.append(item)
+    return allowed
+
+
+async def _ensure_object_access(object_name: str, user: dict[str, Any]) -> None:
+    """Raise 403 unless the user owns the job that produced the object (or is admin)."""
+    if user.get("role") == "admin":
+        return
+    user_id = user.get("user_id")
+    job_id = _job_id_from_object(object_name)
+    if not user_id or not job_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    owners = await pg_client.get_job_owners([job_id])
+    if owners.get(job_id) != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+@router.get("/{bucket_key}")
+async def list_storage_items(
+    bucket_key: str,
+    user: Annotated[dict, Depends(get_current_user_flexible)] = None,
+    prefix: str = "",
+):
+    """
+    List objects in a bucket (scoped to the current user's jobs; admins see all).
     bucket_key: one of 'raw', 'parsed', 'exports'
     """
     if bucket_key not in BUCKETS:
@@ -72,6 +142,7 @@ async def list_storage_items(bucket_key: str, prefix: str = ""):
             }
             for obj in objects
         ]
+        items = await _filter_objects_for_user(bucket_key, items, user)
         return {"bucket": bucket_name, "total": len(items), "items": items}
     except Exception as e:
         logger.error(f"Failed to list bucket {bucket_name}: {e}", exc_info=True)
@@ -94,10 +165,15 @@ def _read_object(bucket_key: str, name: str) -> bytes:
 
 
 @router.get("/{bucket_key}/download")
-async def download_storage_object(bucket_key: str, name: str):
-    """Return a stored object for UI preview/download."""
+async def download_storage_object(
+    bucket_key: str,
+    name: str,
+    user: Annotated[dict, Depends(get_current_user_flexible)] = None,
+):
+    """Return a stored object for UI preview/download (owner or admin only)."""
     if bucket_key not in BUCKETS:
         raise HTTPException(status_code=404, detail="Unknown bucket key")
+    await _ensure_object_access(name, user)
     data = _read_object(bucket_key, name)
     return Response(content=data, media_type="application/octet-stream")
 
@@ -294,7 +370,10 @@ def _parsed_to_html(name: str, parsed: dict) -> tuple[str, str, bytes]:
 
 @router.get("/{bucket_key}/export")
 async def export_storage_object(
-    bucket_key: str, name: str, fmt: str = Query("json", alias="format")
+    bucket_key: str,
+    name: str,
+    fmt: str = Query("json", alias="format"),
+    user: Annotated[dict, Depends(get_current_user_flexible)] = None,
 ):
     """Convert a stored object on-the-fly.
 
@@ -303,6 +382,7 @@ async def export_storage_object(
     """
     if bucket_key not in BUCKETS:
         raise HTTPException(status_code=404, detail="Unknown bucket key")
+    await _ensure_object_access(name, user)
     if fmt not in EXPORT_FORMATS:
         supported = ", ".join(EXPORT_FORMATS)
         if fmt in ("pdf", "docx"):
@@ -325,11 +405,16 @@ async def export_storage_object(
 
 
 @router.post("/{bucket_key}/download-many")
-async def download_many_objects(bucket_key: str, payload: DownloadManyRequest):
+async def download_many_objects(
+    bucket_key: str,
+    payload: DownloadManyRequest,
+    user: Annotated[dict, Depends(get_current_user_flexible)] = None,
+):
     """Download several objects as a single ZIP archive.
 
     Every object is converted to the requested format ('raw' = original
     bytes). Useful for the Storage UI's select-all -> download flow.
+    Objects owned by other users are silently skipped.
     """
     if bucket_key not in BUCKETS:
         raise HTTPException(status_code=404, detail="Unknown bucket key")
@@ -342,21 +427,27 @@ async def download_many_objects(bucket_key: str, payload: DownloadManyRequest):
         )
 
     buffer = io.BytesIO()
+    included = 0
     try:
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
             for name in payload.names:
+                try:
+                    await _ensure_object_access(name, user)
+                except HTTPException:
+                    continue  # skip objects owned by others (fail closed)
                 try:
                     data = _read_object(bucket_key, name)
                 except HTTPException:
                     continue  # skip missing objects
                 filename, _, content = _convert_object(name, data, fmt)
                 archive.writestr(filename, content)
+                included += 1
     except Exception as exc:
         logger.error("Failed to build ZIP archive for bucket %s: %s", bucket_key, exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to build download archive") from exc
 
     bytes_data = buffer.getvalue()
-    disposition = f'attachment; filename="duka-scraper-{bucket_key}-{len(payload.names)}-items.zip"'
+    disposition = f'attachment; filename="duka-scraper-{bucket_key}-{included}-items.zip"'
     return Response(
         content=bytes_data,
         media_type="application/zip",

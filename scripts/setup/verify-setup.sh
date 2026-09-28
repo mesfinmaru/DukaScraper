@@ -78,7 +78,7 @@ echo ""
 
 # --- 3. Kafka topics ---
 echo "3. Kafka topics"
-TOPICS="crawl.requests crawl.raw crawl.parsed crawl.requests.retry crawl.requests.dlq"
+TOPICS="crawl.requests crawl.raw crawl.parsed crawl.requests.dlq"
 for topic in $TOPICS; do
     check "topic: $topic" docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -q "$topic" || \
     warn "topic: $topic" true

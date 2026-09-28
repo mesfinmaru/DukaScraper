@@ -10,6 +10,7 @@ Supports two backends:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import re
@@ -241,7 +242,7 @@ class GmailVerificationHandler:
                         "body": body[:2000],  # Truncate for logging
                     }
 
-            await _async_sleep(poll_interval)
+            await asyncio.sleep(poll_interval)
 
         logger.warning(
             "No verification email from %s within %ds",
@@ -473,7 +474,7 @@ class ImapVerificationReader:
                         # Mark as read if requested
                         if mark_as_read:
                             try:
-                                conn.store(msg_id, "+FLAGS", "\Seen")
+                                conn.store(msg_id, "+FLAGS", "\\Seen")
                             except Exception:
                                 pass
 

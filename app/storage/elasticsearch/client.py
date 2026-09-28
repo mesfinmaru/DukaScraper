@@ -14,7 +14,10 @@ class ElasticsearchManager:
 
     def __init__(self):
         # Update settings.py later to include ES_URL if not present
-        es_url = getattr(settings, "ELASTICSEARCH_URL", "http://localhost:9200")
+        es_url = settings.ELASTICSEARCH_URL
+        # Python client 8.x matches the ES 8.x server (compose pins
+        # elasticsearch==8.19.2); client 9.x sends compatible-with=9 which
+        # ES 8 rejects with BadRequestError 400 on every request.
         self.client = AsyncElasticsearch(hosts=[es_url])
 
     async def connect(self, retries: int = 10, delay_seconds: float = 2.0) -> None:

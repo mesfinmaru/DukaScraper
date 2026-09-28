@@ -16,6 +16,7 @@ declare module 'lucide-react' {
   export const CheckCircle2: LucideIcon
   export const CheckSquare: LucideIcon
   export const ChevronDown: LucideIcon
+  export const ChevronLeft: LucideIcon
   export const ChevronRight: LucideIcon
   export const CircleSlash: LucideIcon
   export const CircleX: LucideIcon
@@ -31,7 +32,9 @@ declare module 'lucide-react' {
   export const FileSearch: LucideIcon
   export const FileText: LucideIcon
   export const FolderSearch: LucideIcon
+  export const Funnel: LucideIcon
   export const Gauge: LucideIcon
+  export const Globe: LucideIcon
   export const HardDrive: LucideIcon
   export const History: LucideIcon
   export const Inbox: LucideIcon
@@ -51,6 +54,8 @@ declare module 'lucide-react' {
   export const Radar: LucideIcon
   export const Radio: LucideIcon
   export const RefreshCcw: LucideIcon
+  export const Sun: LucideIcon
+  export const Moon: LucideIcon
   export const RefreshCw: LucideIcon
   export const Rocket: LucideIcon
   export const RotateCw: LucideIcon

@@ -22,6 +22,7 @@ from app.common.logger.logger import logger
 from app.pipeline.schemas import CrawlRequest
 from app.services.dedup_service import DedupService
 from app.services.link_extraction_service import LinkExtractionService
+from app.storage.postgres.client import pg_client
 
 
 async def extract_and_queue_children(
@@ -89,12 +90,17 @@ async def extract_and_queue_children(
     queued_count = 0
     skipped_count = 0
 
+    # Reserve child slots before publishing them. The current worker keeps
+    # its own slot until it returns, so children cannot complete the job early.
+    await pg_client.register_job_tasks(request.job_id, len(filtered_links))
+
     for link in filtered_links:
         try:
             normalized = link_svc.normalize_url(link)
 
             if await dedup_svc.is_visited(normalized):
                 skipped_count += 1
+                await pg_client.complete_job_task(request.job_id)
                 continue
             await dedup_svc.mark_visited(normalized)
 
@@ -119,6 +125,7 @@ async def extract_and_queue_children(
             )
             queued_count += 1
         except Exception as e:
+            await pg_client.complete_job_task(request.job_id)
             logger.warning(f"Failed to queue child task for {link}: {e}")
 
     # Free up the Bloom filter once we're at (or past) the final recursion level

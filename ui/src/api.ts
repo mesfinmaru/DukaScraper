@@ -24,6 +24,9 @@ import type {
   BatchScrapeResponse,
   CredentialSummary,
   SearchApiResponse,
+  EntityMentionsResponse,
+  EntitySummaryResponse,
+  SemanticSearchResponse,
   ThreatAnalyticsResponse,
   TriggerJobResponse,
   UserJobsResponse,
@@ -194,7 +197,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 function storageObjectUrl(bucketKey: string, name: string): string {
   const base = getConfig().apiBaseUrl.replace(/\/+$/, "")
-  return `${base}/api/v1/storage/${encodeURIComponent(bucketKey)}/download?name=${encodeURIComponent(name)}`
+  const token = getSession()?.token
+  const qs = new URLSearchParams({ name })
+  if (token) qs.set("token", token)
+  return `${base}/api/v1/storage/${encodeURIComponent(bucketKey)}/download?${qs.toString()}`
 }
 
 function webSocketBase(): string {
@@ -229,11 +235,38 @@ export function getJobFeedSocketUrl(): string {
 
 function storageExportUrl(bucketKey: string, name: string, format: string): string {
   const base = getConfig().apiBaseUrl.replace(/\/+$/, "")
-  return `${base}/api/v1/storage/${encodeURIComponent(bucketKey)}/export?name=${encodeURIComponent(name)}&format=${encodeURIComponent(format)}`
+  const qs = new URLSearchParams({ name, format })
+  const token = getSession()?.token
+  if (token) qs.set("token", token)
+  return `${base}/api/v1/storage/${encodeURIComponent(bucketKey)}/export?${qs.toString()}`
 }
 
 export const api = {
   health: () => request<{ status: string }>("/health"),
+
+  /** Readiness: 200 when all dependencies are up, 503 (degraded) otherwise. */
+  ready: async (): Promise<{ ready: boolean; failed?: string[] }> => {
+    const base = getConfig().apiBaseUrl.replace(/\/+$/, "")
+    const token = getSession()?.token
+    const res = await fetch(`${base}/ready`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    })
+    if (res.status === 503) {
+      // Degraded: parse the per-dependency checks so the UI can name what is down.
+      let checks: Record<string, boolean> = {}
+      try {
+        const body = (await res.json()) as { checks?: Record<string, boolean> }
+        checks = body.checks ?? {}
+      } catch {
+        /* ignore body parse errors */
+      }
+      const failed = Object.entries(checks)
+        .filter(([, ok]) => !ok)
+        .map(([name]) => name)
+      return { ready: false, failed }
+    }
+    return { ready: res.ok }
+  },
 
   // ---------- auth ----------
   login: (username: string, password: string) =>
@@ -436,7 +469,12 @@ export const api = {
   getStorageObjectText: async (bucketKey: string, name: string): Promise<string> => {
     let res: Response
     try {
-      res = await fetch(storageObjectUrl(bucketKey, name))
+      res = await fetch(storageObjectUrl(bucketKey, name), {
+        headers: (() => {
+          const token = getSession()?.token
+          return token ? { Authorization: `Bearer ${token}` } : undefined
+        })(),
+      })
     } catch {
       throw new ApiError(0, "Cannot reach the API. Is the backend running?")
     }
@@ -458,6 +496,19 @@ export const api = {
 
   getPerformance: (limit = 25) =>
     request<PerformanceResponse>(`/api/v1/analytics/performance?limit=${limit}`),
+
+  getIntelligenceEntities: (limit = 100) =>
+    request<EntitySummaryResponse>(`/api/v1/analytics/intelligence/entities?limit=${limit}`),
+
+  searchEntityMentions: (entity: string, limit = 50) =>
+    request<EntityMentionsResponse>(
+      `/api/v1/analytics/intelligence/entities/search?entity=${encodeURIComponent(entity)}&limit=${limit}`,
+    ),
+
+  semanticSearch: (q: string, size = 20) =>
+    request<SemanticSearchResponse>(
+      `/api/v1/articles/search/semantic?q=${encodeURIComponent(q)}&size=${size}`,
+    ),
 
   // ---------- monitoring ----------
   getMonitoringHealth: () => request<MonitoringHealthResponse>("/api/v1/monitoring/health"),

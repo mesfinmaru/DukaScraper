@@ -30,11 +30,9 @@ interface SiteCredState {
   status: SiteCredentialStatus | null
   checking: boolean
   saving: boolean
-  saved: boolean
   error: string | null
   email: string
   password: string
-  showForm: boolean
 }
 
 function formatTimestamp(value: string): string {
@@ -85,8 +83,6 @@ export default function NewCrawl() {
   const [allowLogin, setAllowLogin] = useState(false)
   const [allowSignup, setAllowSignup] = useState(false)
   const [allowEmailVerification, setAllowEmailVerification] = useState(false)
-  const [credentialEmail, setCredentialEmail] = useState("")
-  const [credentials, setCredentials] = useState<{ email: string; display_name?: string | null }[]>([])
   const [enableExtraction, setEnableExtraction] = useState(true)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [restrictToDomain, setRestrictToDomain] = useState(true)
@@ -100,19 +96,14 @@ export default function NewCrawl() {
   const [historyLoading, setHistoryLoading] = useState(true)
   const [selectedHistoryUrls, setSelectedHistoryUrls] = useState<Set<string>>(new Set())
 
-  // Per-domain site credential state, keyed by domain of the first URL
-  // (logins are resolved per-domain by the worker; the common case is one target).
-  const [siteCred, setSiteCred] = useState<SiteCredState>({
-    status: null,
-    checking: false,
-    saving: false,
-    saved: false,
-    error: null,
-    email: "",
-    password: "",
-    showForm: false,
-  })
-  const primaryDomain = urls.map((u) => domainOf(u.value)).find(Boolean) ?? null
+  // Per-domain site credential state — one entry per unique target domain so
+  // each site can be checked/configured separately.
+  const [siteCreds, setSiteCreds] = useState<Record<string, SiteCredState>>({})
+  // Domain whose credential popup is open (null = closed).
+  const [credModal, setCredModal] = useState<string | null>(null)
+  const domains = Array.from(
+    new Set(urls.map((u) => domainOf(u.value)).filter((d): d is string => Boolean(d))),
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -132,12 +123,6 @@ export default function NewCrawl() {
         setHistory(
           [...seen.entries()].map(([url, lastCrawled]) => ({ url, lastCrawled })),
         )
-        try {
-          const available = await api.listCredentials()
-          if (!cancelled) setCredentials(available.filter((item) => item.status === "active"))
-        } catch {
-          if (!cancelled) setCredentials([])
-        }
       } catch {
         if (!cancelled) setHistory([])
       } finally {
@@ -158,46 +143,81 @@ export default function NewCrawl() {
     })
   }
 
-  // Look up any stored site credential whenever the primary domain changes.
+  // Look up stored site credentials whenever the target domains change.
   useEffect(() => {
-    setSiteCred((prev) => ({ ...prev, status: null, saved: false, error: null, showForm: false }))
-    if (!primaryDomain) return
     let cancelled = false
     ;(async () => {
-      setSiteCred((prev) => ({ ...prev, checking: true }))
-      try {
-        const status = await api.getSiteCredential(primaryDomain)
-        if (!cancelled) setSiteCred((prev) => ({ ...prev, status, checking: false }))
-      } catch {
-        if (!cancelled) setSiteCred((prev) => ({ ...prev, status: null, checking: false }))
-      }
+      setSiteCreds((prev) => {
+        const next: Record<string, SiteCredState> = {}
+        for (const domain of domains) {
+          next[domain] = prev[domain] ?? {
+            status: null,
+            checking: false,
+            saving: false,
+            error: null,
+            email: "",
+            password: "",
+          }
+        }
+        return next
+      })
+      await Promise.all(
+        domains.map(async (domain) => {
+          setSiteCreds((prev) => ({
+            ...prev,
+            [domain]: { ...prev[domain], status: null, error: null, checking: true },
+          }))
+          try {
+            const status = await api.getSiteCredential(domain)
+            if (!cancelled) {
+              setSiteCreds((prev) => ({
+                ...prev,
+                [domain]: { ...prev[domain], status, checking: false },
+              }))
+            }
+          } catch {
+            if (!cancelled) {
+              setSiteCreds((prev) => ({
+                ...prev,
+                [domain]: { ...prev[domain], status: null, checking: false },
+              }))
+            }
+          }
+        }),
+      )
     })()
     return () => {
       cancelled = true
     }
-  }, [primaryDomain])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urls.map((u) => domainOf(u.value)).join("|")])
 
-  const saveSiteCredential = async () => {
-    if (!primaryDomain || !siteCred.email.trim() || !siteCred.password) return
-    setSiteCred((prev) => ({ ...prev, saving: true, error: null }))
+  const updateSiteCred = (domain: string, patch: Partial<SiteCredState>) => {
+    setSiteCreds((prev) => ({
+      ...prev,
+      [domain]: { ...prev[domain], ...patch },
+    }))
+  }
+
+  const saveSiteCredential = async (domain: string) => {
+    const cred = siteCreds[domain]
+    if (!domain || !cred?.email.trim() || !cred.password) return
+    updateSiteCred(domain, { saving: true, error: null })
     try {
-      await api.saveSiteCredential(primaryDomain, {
-        email: siteCred.email.trim(),
-        password: siteCred.password,
+      await api.saveSiteCredential(domain, {
+        email: cred.email.trim(),
+        password: cred.password,
       })
-      setSiteCred((prev) => ({
-        ...prev,
+      updateSiteCred(domain, {
         saving: false,
-        saved: true,
-        showForm: false,
-        status: { exists: true, email: prev.email.trim(), username: prev.email.trim(), source: "stored" },
-      }))
+        status: { exists: true, email: cred.email.trim(), username: cred.email.trim(), source: "stored" },
+      })
+      setCredModal(null)
     } catch (reason) {
-      setSiteCred((prev) => ({
-        ...prev,
+      updateSiteCred(domain, {
         saving: false,
         error: reason instanceof ApiError ? reason.message : "Failed to save credential",
-      }))
+      })
     }
   }
 
@@ -303,7 +323,6 @@ export default function NewCrawl() {
         allow_login: allowLogin,
         allow_signup: allowSignup,
         allow_email_verification: allowEmailVerification,
-        credential_email: credentialEmail || null,
       })
       const results: SubmitOutcome[] = batch.jobs.map((job, index) => ({
         url: entries[index]?.trimmed ?? "unknown",
@@ -365,6 +384,37 @@ export default function NewCrawl() {
                     </option>
                   ))}
                 </select>
+                {(() => {
+                  const rowDomain = domainOf(entry.value)
+                  if (!(allowLogin || allowSignup) || !rowDomain) return null
+                  const cred = siteCreds[rowDomain]
+                  const hasCred = Boolean(cred?.status?.exists)
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => setCredModal(rowDomain)}
+                      title={cred?.checking
+                        ? "Checking stored credentials…"
+                        : hasCred
+                          ? `Credential saved for ${rowDomain} — click to update`
+                          : `Submit credential for ${rowDomain}`}
+                      className={cn(
+                        "inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg border p-2.5 transition",
+                        hasCred
+                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:border-emerald-400"
+                          : "border-slate-800 bg-slate-950/60 text-slate-500 hover:border-sky-500/50 hover:text-sky-300",
+                      )}
+                    >
+                      {cred?.checking ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : hasCred ? (
+                        <ShieldCheck className="h-4 w-4" />
+                      ) : (
+                        <KeyRound className="h-4 w-4" />
+                      )}
+                    </button>
+                  )
+                })()}
                 <button
                   type="button"
                   onClick={() => removeUrlRow(entry.key)}
@@ -428,111 +478,18 @@ export default function NewCrawl() {
             </label>
             {allowSignup && allowEmailVerification && (
               <p className="text-[11px] text-slate-500 sm:col-span-3">
-                Signups use a <code className="rounded bg-slate-900 px-1 py-0.5 font-mono text-slate-400">seed+dukaXXXXX@gmail.com</code>{" "}
-                alias of your configured seed inbox — verification emails are read automatically (Gmail API or IMAP) and confirmed without manual steps.
+                Signups use your configured seed inbox; usernames and display names are generated from server settings.
+                Verification emails are read and confirmed automatically — no manual steps. Sites requiring
+                phone/SMS verification are marked failed.
               </p>
             )}
           </div>
 
-          {(allowLogin || allowSignup) && primaryDomain && (
-            <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-sm">
-                  <KeyRound className="h-4 w-4 text-sky-400" />
-                  <span className="font-medium text-slate-200">Site credential for</span>
-                  <code className="rounded bg-slate-900 px-1.5 py-0.5 font-mono text-xs text-sky-300">{primaryDomain}</code>
-                </div>
-                {siteCred.checking ? (
-                  <span className="flex items-center gap-2 text-xs text-slate-500">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking stored credentials…
-                  </span>
-                ) : siteCred.status?.exists ? (
-                  <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-400">
-                    <ShieldCheck className="h-4 w-4" />
-                    Stored ({siteCred.status.email}) — reused automatically
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setSiteCred((prev) => ({ ...prev, showForm: !prev.showForm }))}
-                    className="cursor-pointer text-xs font-medium text-sky-400 transition hover:text-sky-300"
-                  >
-                    {siteCred.showForm ? "Cancel" : "+ Save credential for this site"}
-                  </button>
-                )}
-              </div>
-
-              {siteCred.error && (
-                <p className="mt-2 rounded border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-400">{siteCred.error}</p>
-              )}
-
-              {siteCred.saved && (
-                <p className="mt-2 text-xs font-medium text-emerald-400">
-                  Saved — future crawls of {primaryDomain} will log in automatically.
-                </p>
-              )}
-
-              {siteCred.showForm && (
-                <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div>
-                    <label className="label" htmlFor="sitecred-email">Email / username</label>
-                    <input
-                      id="sitecred-email"
-                      className={inputCls}
-                      value={siteCred.email}
-                      onChange={(e) => setSiteCred((prev) => ({ ...prev, email: e.target.value }))}
-                      placeholder="admin@example.com"
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div>
-                    <label className="label" htmlFor="sitecred-pass">Password</label>
-                    <input
-                      id="sitecred-pass"
-                      type="password"
-                      className={inputCls}
-                      value={siteCred.password}
-                      onChange={(e) => setSiteCred((prev) => ({ ...prev, password: e.target.value }))}
-                      placeholder="Site password"
-                      autoComplete="new-password"
-                    />
-                  </div>
-                  <div className="sm:col-span-2">
-                    <button
-                      type="button"
-                      onClick={() => void saveSiteCredential()}
-                      disabled={siteCred.saving || !siteCred.email.trim() || !siteCred.password}
-                      className="btn-primary w-full py-2 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {siteCred.saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-                      {siteCred.saving ? "Saving…" : `Save credential for ${primaryDomain}`}
-                    </button>
-                    <p className="mt-1.5 text-[11px] text-slate-500">
-                      Stored encrypted. The worker fills these automatically on the next crawl — no manual login needed.
-                    </p>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
           {(allowLogin || allowSignup) && (
-            <div>
-              <label className="label" htmlFor="credential-profile">Credential profile</label>
-              <select
-                id="credential-profile"
-                className={inputCls}
-                value={credentialEmail}
-                onChange={(e) => setCredentialEmail(e.target.value)}
-              >
-                <option value="">Use stored domain credential when available</option>
-                {credentials.map((credential) => (
-                  <option key={credential.email} value={credential.email}>
-                    {credential.display_name ? `${credential.display_name} - ` : ""}{credential.email}
-                  </option>
-                ))}
-              </select>
-            </div>
+            <p className="text-[11px] text-slate-500">
+              Need a login for a target site? Use the key icon next to each URL to submit that site's
+              username and password — stored encrypted per domain and filled in automatically by the worker.
+            </p>
           )}
 
           <div>
@@ -730,6 +687,105 @@ export default function NewCrawl() {
           )}
         </div>
       </div>
+
+      {/* Site credential popup — one per target domain, opened via the key icon. */}
+      {credModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setCredModal(null)}
+        >
+          {(() => {
+            const domain = credModal
+            const cred = siteCreds[domain] ?? {
+              status: null,
+              checking: false,
+              saving: false,
+              error: null,
+              email: "",
+              password: "",
+            }
+            return (
+              <div
+                className="w-full max-w-md rounded-xl border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="mb-4 flex items-center gap-2">
+                  <KeyRound className="h-4 w-4 text-sky-400" />
+                  <span className="text-sm font-semibold text-slate-100">Site credential</span>
+                  <code className="rounded bg-slate-900 px-1.5 py-0.5 font-mono text-xs text-sky-300">{domain}</code>
+                  {cred.status?.exists && (
+                    <span className="ml-auto flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      Saved
+                    </span>
+                  )}
+                </div>
+
+                {cred.status?.exists && (
+                  <p className="mb-3 text-[11px] text-slate-500">
+                    A credential is already stored for this site — submit new values to update it.
+                  </p>
+                )}
+
+                {cred.error && (
+                  <p className="mb-3 rounded border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-400">
+                    {cred.error}
+                  </p>
+                )}
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="label" htmlFor={`sitecred-email-${domain}`}>Email / username</label>
+                    <input
+                      id={`sitecred-email-${domain}`}
+                      className={inputCls}
+                      value={cred.email}
+                      onChange={(e) => updateSiteCred(domain, { email: e.target.value })}
+                      placeholder="admin@example.com"
+                      autoComplete="off"
+                      autoFocus
+                    />
+                  </div>
+                  <div>
+                    <label className="label" htmlFor={`sitecred-pass-${domain}`}>Password</label>
+                    <input
+                      id={`sitecred-pass-${domain}`}
+                      type="password"
+                      className={inputCls}
+                      value={cred.password}
+                      onChange={(e) => updateSiteCred(domain, { password: e.target.value })}
+                      placeholder="Site password"
+                      autoComplete="new-password"
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-5 flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCredModal(null)}
+                    className="btn-secondary px-4 py-2 text-sm"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void saveSiteCredential(domain)}
+                    disabled={cred.saving || !cred.email.trim() || !cred.password}
+                    className="btn-primary px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {cred.saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                    {cred.saving ? "Saving…" : "Save credential"}
+                  </button>
+                </div>
+                <p className="mt-3 text-[11px] text-slate-500">
+                  Stored encrypted. The worker fills these in automatically on the next crawl — no manual login needed.
+                </p>
+              </div>
+            )
+          })()}
+        </div>
+      )}
     </div>
   )
 }

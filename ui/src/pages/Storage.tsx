@@ -1,16 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useLocation } from "react-router-dom"
 import {
   Archive,
+  ChevronLeft,
+  ChevronRight,
   Download,
   Eye,
+  Funnel,
   FolderSearch,
   HardDrive,
   Loader2,
   Square,
 } from "lucide-react"
 import { api, ApiError } from "../api"
-import type { BucketOverviewResponse, BucketItemsResponse } from "../types"
+import { useAuth } from "../config"
+import type { BucketOverviewResponse, BucketItemsResponse, JobSummary } from "../types"
 import { cn, formatBytes, formatDateTime, formatNumber } from "../utils"
 import {
   CopyButton,
@@ -58,8 +62,12 @@ function saveBlob(blob: Blob, filename: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+const PAGE_SIZES = [25, 50, 100, 200]
+
 export default function Storage() {
   const location = useLocation()
+  const { session } = useAuth()
+  const isAdmin = session?.user.role === "admin"
   const state = (location.state as { tab?: TabKey; prefix?: string } | null) ?? {}
   const stateTab = state.tab
   const statePrefix = state.prefix
@@ -79,6 +87,10 @@ export default function Storage() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [batchBusy, setBatchBusy] = useState(false)
   const [batchError, setBatchError] = useState<string | null>(null)
+  const [jobs, setJobs] = useState<JobSummary[]>([])
+  const [jobFilter, setJobFilter] = useState<string>("all")
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
   const selectAllRef = useRef<HTMLInputElement>(null)
 
   const canConvert = tab !== "exports"
@@ -90,7 +102,56 @@ export default function Storage() {
   }, [tab])
 
   const items = data?.items ?? []
-  const allSelected = items.length > 0 && selected.size === items.length
+
+  // Client-side job filter (object names embed the producing job id).
+  const filteredItems = useMemo(
+    () => (jobFilter === "all" ? items : items.filter((i) => i.object_name.includes(jobFilter))),
+    [items, jobFilter],
+  )
+  const filteredTotal = filteredItems.length
+  const totalPages = Math.max(1, Math.ceil(filteredTotal / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const pageStart = (safePage - 1) * pageSize
+  const pagedItems = useMemo(
+    () => filteredItems.slice(pageStart, pageStart + pageSize),
+    [filteredItems, pageStart, pageSize],
+  )
+
+  // Reset to the first page whenever the view changes.
+  useEffect(() => {
+    setPage(1)
+  }, [tab, prefix, jobFilter, pageSize])
+
+  // Jobs for the filter dropdown (same scoping as the Jobs page).
+  useEffect(() => {
+    if (!session) {
+      setJobs([])
+      return
+    }
+    let cancelled = false
+    const loadJobs = async () => {
+      try {
+        const res = isAdmin
+          ? await api.getAllJobs()
+          : await api.getUserJobs(session.user.user_id)
+        if (!cancelled) {
+          setJobs(
+            [...res.jobs].sort((a, b) =>
+              (b.created_at ?? "").localeCompare(a.created_at ?? ""),
+            ),
+          )
+        }
+      } catch {
+        if (!cancelled) setJobs([]) // dropdown just stays empty
+      }
+    }
+    void loadJobs()
+    return () => {
+      cancelled = true
+    }
+  }, [session, isAdmin])
+
+  const allSelected = pagedItems.length > 0 && selected.size === pagedItems.length
   const someSelected = selected.size > 0 && !allSelected
 
   useEffect(() => {
@@ -100,7 +161,7 @@ export default function Storage() {
   }, [someSelected])
 
   const toggleSelectAll = () => {
-    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.object_name)))
+    setSelected(allSelected ? new Set() : new Set(pagedItems.map((i) => i.object_name)))
   }
 
   const toggleOne = (name: string) => {
@@ -181,7 +242,7 @@ export default function Storage() {
   useEffect(() => {
     setSelected((prev) => {
       if (prev.size === 0) return prev
-      const visible = new Set(items.map((i) => i.object_name))
+      const visible = new Set(pagedItems.map((i) => i.object_name))
       let changed = false
       const next = new Set<string>()
       for (const name of prev) {
@@ -190,7 +251,7 @@ export default function Storage() {
       }
       return changed ? next : prev
     })
-  }, [items])
+  }, [pagedItems])
 
   useEffect(() => {
     api
@@ -200,7 +261,7 @@ export default function Storage() {
   }, [])
 
   const totalBytes =
-    data?.items.reduce((sum, item) => sum + (item.size_bytes ?? 0), 0) ?? 0
+    filteredItems.reduce((sum, item) => sum + (item.size_bytes ?? 0), 0)
 
   return (
     <div>
@@ -240,6 +301,24 @@ export default function Storage() {
             spellCheck={false}
           />
         </div>
+
+        <div className="relative">
+          <Funnel className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-500" />
+          <select
+            value={jobFilter}
+            onChange={(e) => setJobFilter(e.target.value)}
+            className="input cursor-pointer py-2 pr-8 pl-9 font-mono text-xs"
+            aria-label="Filter by job"
+            title="Show only objects produced by this job"
+          >
+            <option value="all">All jobs</option>
+            {jobs.map((j) => (
+              <option key={j.job_id} value={j.job_id}>
+                {j.job_id} · {j.status}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {error && (
@@ -258,14 +337,21 @@ export default function Storage() {
               <span className="font-mono">{data.bucket}</span>
             </h2>
             <p className="text-xs text-slate-500">
-              {formatNumber(data.total)} object{data.total === 1 ? "" : "s"}
-              {totalBytes > 0 && <> · {formatBytes(totalBytes)} total</>}
+              {formatNumber(filteredTotal)} object{filteredTotal === 1 ? "" : "s"}
+              {jobFilter !== "all" && ` of ${formatNumber(data.total)}`}
+              {totalBytes > 0 && <> · {formatBytes(totalBytes)}</>}
             </p>
           </div>
 
-          {items.length === 0 ? (
+          {filteredItems.length === 0 ? (
             <EmptyState
-              title={prefix ? `No objects under "${prefix}"` : "Bucket is empty"}
+              title={
+                jobFilter !== "all"
+                  ? `No objects from ${jobFilter}`
+                  : prefix
+                    ? `No objects under "${prefix}"`
+                    : "Bucket is empty"
+              }
               hint={
                 tab === "exports"
                   ? "Export files appear here after the exporter consumer processes parsed items."
@@ -288,8 +374,8 @@ export default function Storage() {
                 </label>
                 <span className="text-[11px] text-slate-500">
                   {selected.size > 0
-                    ? `${selected.size} of ${items.length} selected`
-                    : `${items.length} visible`}
+                    ? `${selected.size} of ${pagedItems.length} selected`
+                    : `${pagedItems.length} visible`}
                 </span>
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   {canConvert && (
@@ -348,7 +434,7 @@ export default function Storage() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60">
-                    {items.map((item) => (
+                    {pagedItems.map((item) => (
                       <tr
                         key={item.object_name}
                         className={cn(
@@ -400,6 +486,48 @@ export default function Storage() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/70 bg-slate-950/40 px-5 py-3">
+                <span className="text-xs text-slate-500">
+                  {filteredTotal === 0
+                    ? "No objects"
+                    : `Showing ${formatNumber(pageStart + 1)}–${formatNumber(Math.min(pageStart + pageSize, filteredTotal))} of ${formatNumber(filteredTotal)}`}
+                </span>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    className="cursor-pointer rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs font-medium text-slate-300 focus:border-sky-500/50 focus:outline-none"
+                    aria-label="Rows per page"
+                  >
+                    {PAGE_SIZES.map((s) => (
+                      <option key={s} value={s}>
+                        {s} / page
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={safePage <= 1}
+                    aria-label="Previous page"
+                    className="inline-flex cursor-pointer items-center rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/40 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                  </button>
+                  <span className="font-mono text-xs whitespace-nowrap text-slate-400">
+                    {safePage} / {totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    disabled={safePage >= totalPages}
+                    aria-label="Next page"
+                    className="inline-flex cursor-pointer items-center rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/40 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
             </>
           )}

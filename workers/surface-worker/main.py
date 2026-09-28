@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import io
 import json
 import logging
@@ -21,10 +22,22 @@ if APP_ENV == "wsl":
     from app.common.config import wsl_settings  # noqa
 
 from app.common.config.settings import settings
+from app.common.job_events import (
+    install_job_log_relay,
+    publish_job_stage,
+    reset_current_job_id,
+    set_current_job_id,
+)
 from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
-from workers.common import check_escalation, extract_and_queue_children
+from workers.common import (
+    PageProcessingError,
+    check_escalation,
+    complete_job_task_from_message,
+    extract_and_queue_children,
+    fail_job_from_message,
+)
 from workers.health import HealthServer
 from workers.metrics import WorkerMetrics
 from app.pipeline.schemas import CrawlRequest, CrawlResult
@@ -133,14 +146,19 @@ async def save_to_minio(job_id: str, payload_bytes: bytes):
     await asyncio.to_thread(_upload_to_minio_sync, job_id, payload_bytes)
 
 
-async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, reason: str) -> None:
-    """Requeue a job to the DEEP worker after detecting auth/WAF/empty-shell signals."""
+async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, reason: str) -> bool:
+    """Requeue a job to the DEEP worker after detecting auth/WAF/empty-shell signals.
+
+    Returns True when the message was requeued (the deep worker now owns this
+    site's timeline) and False when the escalation budget was exhausted — the
+    caller must close the site out itself in that case.
+    """
     if request.retry_count >= MAX_RETRY_COUNT:
         logger.warning(
             f"Job {request.job_id} exceeded max escalation retries ({MAX_RETRY_COUNT}); "
             f"giving up on {request.url}"
         )
-        return
+        return False
 
     escalated_request = request.model_copy(
         update={
@@ -149,6 +167,9 @@ async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, re
             "escalation_reason": reason,
         }
     )
+    # Transfer this message's outstanding-task slot to the deep message so the
+    # job cannot complete while the escalated page is still in flight.
+    await pg_client.register_job_tasks(request.job_id, 1)
     await producer.send_and_wait(
         CONSUME_TOPIC,
         value=escalated_request.model_dump_json().encode("utf-8"),
@@ -158,6 +179,7 @@ async def escalate_to_deep(producer: AIOKafkaProducer, request: CrawlRequest, re
         f"Escalated job {request.job_id} ({request.url}) to DEEP worker "
         f"(reason={reason}, retry_count={escalated_request.retry_count})"
     )
+    return True
 
 
 async def process_request(producer: AIOKafkaProducer, message_value: bytes):
@@ -190,37 +212,43 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             f"for URL: {request.url}"
         )
         await pg_client.update_job_status(request.job_id, "running")
+        job_token = set_current_job_id(request.job_id)
+        try:
+            await _process_request_inner(producer, request)
+        finally:
+            reset_current_job_id(job_token)
+
+    except ValidationError as e:
+        logger.error(f"Invalid message format: {e}")
+    except json.JSONDecodeError:
+        logger.error(f"Malformed JSON in Kafka message: {message_value[:200]}")
+    except Exception as e:
+        logger.error(f"Unexpected error processing job: {e}", exc_info=True)
+
+
+async def _process_request_inner(producer: AIOKafkaProducer, request: CrawlRequest) -> None:
+    """Crawl pipeline for one request (called with the job-log tag active)."""
+    try:
+        url = request.url
         item_id = await pg_client.allocate_item_id()
+        await publish_job_stage(
+            job_id=request.job_id, url=url, stage="site_started", state="active",
+        )
         politeness = PolitenessService(settings.REDIS_URL, DEFAULT_HEADERS["User-Agent"])
         try:
             if not await politeness.allowed(request.url):
+                # NOTE: one robots-disallowed page must not flip the whole job
+                # to 'skipped' — recursive jobs have many sites in flight and
+                # the outstanding-task counter owns the final status.
                 await pg_client.record_crawl_log(request.job_id, item_id, request.url, WORKER_TYPE, "robots_disallowed", "skipped", request.retry_count)
-                await pg_client.update_job_status(request.job_id, "skipped")
+                await publish_job_stage(
+                    job_id=request.job_id, url=url, stage="site_finished", state="failed",
+                    detail="Blocked by robots.txt",
+                )
                 return
             await politeness.wait_for_turn(request.url)
         finally:
             await politeness.close()
-
-        # --- Content Deduplication (3-tier) ---
-        # Check if we've already crawled this exact URL or similar content.
-        if settings.DEDUP_ENABLED and request.depth > 0:
-            try:
-                u_fp = url_fingerprint(request.url)
-                existing = await pg_client.check_url_duplicate(
-                    u_fp, stale_hours=settings.DEDUP_STALE_HOURS,
-                )
-                if existing:
-                    logger.info(
-                        "Dedup hit (URL exact) for %s -> reusing item %s",
-                        request.url, existing.get("item_id", "?"),
-                    )
-                    await pg_client.record_crawl_log(
-                        request.job_id, item_id, request.url, WORKER_TYPE,
-                        "dedup_url_exact", "skipped", request.retry_count,
-                    )
-                    return
-            except Exception as dedup_err:
-                logger.debug("Dedup check failed (non-fatal): %s", dedup_err)
 
         # Select rule-based proxy for this specific request
         proxy_url = proxy_manager.get_proxy(request.language, request.url)
@@ -228,6 +256,9 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")
 
         start_time = time.perf_counter()
+        await publish_job_stage(
+            job_id=request.job_id, url=url, stage="fetching", state="active",
+        )
         try:
             status_code, html, final_url = await fetch_with_agent_rotation(
                 job_id=request.job_id,
@@ -236,17 +267,24 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
                 timeout=settings.http_timeout_seconds,
                 max_attempts=3,
             )
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="fetching", state="passed",
+                detail=f"HTTP {status_code}",
+            )
         except Exception as e:
             logger.warning(f"Request error for {request.url}: {e}")
             html = ""
             status_code = 599
             final_url = request.url
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="fetching", state="failed",
+                detail="Fetch error",
+            )
 
         latency_ms = int((time.perf_counter() - start_time) * 1000)
 
         # DISABLED: RSS feed extraction
         # preferred_feed = LinkExtractionService.select_preferred_content_url(html, request.url)
-        preferred_feed = None
         # if preferred_feed and preferred_feed != request.url:
         #     logger.info(
         #         f"RSS feed detected for {request.url}; preferring {preferred_feed} instead of manual page scrape."
@@ -272,8 +310,25 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         # to the deep worker with empty/unnecessary content.
         should_escalate, reason = check_escalation(status_code, html, WORKER_TYPE)
         if should_escalate:
-            await escalate_to_deep(producer, request, reason)
-            return  # Do not publish a partial/blocked CrawlResult; DEEP worker will produce the real one
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="challenge_detected", state="active",
+                detail=reason,
+            )
+            escalated = await escalate_to_deep(producer, request, reason)
+            if escalated:
+                return  # Do not publish a partial/blocked CrawlResult; DEEP worker will produce the real one
+            # Escalation budget exhausted: close this site out as failed instead
+            # of leaving its spinner running forever.
+            await pg_client.record_crawl_log(
+                request.job_id, item_id, final_url, WORKER_TYPE,
+                "escalation_exhausted", "failed", request.retry_count,
+                details=f"Escalation to deep worker exhausted: {reason}",
+            )
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="site_finished", state="failed",
+                detail=f"Escalation exhausted: {reason}",
+            )
+            return
 
         try:
             ch_client.write_crawler_performance(
@@ -297,9 +352,18 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
         # stuck with no output (the bug that caused surface→deep empty
         # forwarding).  Let the parser/downstream handle quality.
         if validation.status == "failed":
+            # Per-page failure: mark THIS site failed, never the whole job —
+            # other sites in the recursive crawl may still be running.
             await pg_client.record_crawl_log(request.job_id, item_id, final_url, WORKER_TYPE, validation.reason, validation.status, request.retry_count)
-            await pg_client.update_job_status(request.job_id, "failed")
             await publish_crawl_dead_letter(producer, request, validation.reason, WORKER_TYPE)
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="parsing", state="failed",
+                detail=validation.reason,
+            )
+            await publish_job_stage(
+                job_id=request.job_id, url=url, stage="site_finished", state="failed",
+                detail=validation.reason,
+            )
             logger.info("Hard failure %s: %s", request.url, validation.reason)
             return
 
@@ -417,7 +481,13 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
             key=request.job_id.encode("utf-8"),
         )
         await pg_client.record_crawl_log(request.job_id, item_id, final_url, WORKER_TYPE, validation.reason, validation.status, request.retry_count)
-        await pg_client.update_job_status(request.job_id, "completed")
+        await publish_job_stage(
+            job_id=request.job_id, url=url, stage="parsing", state="passed",
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=url, stage="site_finished", state="passed",
+            detail=f"Queued {queued_count} child links",
+        )
         logger.info(
             "Published result for %s (lang=%s, status=%s, children=%d)",
             request.url, validation.language, validation.status, queued_count,
@@ -425,19 +495,46 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
 
     except ValidationError as e:
         logger.error(f"Invalid message format: {e}")
-    except json.JSONDecodeError:
-        logger.error(f"Malformed JSON in Kafka message: {message_value[:200]}")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error processing job: {e}", exc_info=True)
+        # Re-raise so the safety net fails the job AND closes this site's
+        # timeline — swallowing here left the site spinner running forever.
+        raise PageProcessingError(
+            f"Surface worker crashed while processing {request.url}: {e}"
+        ) from e
 
 
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes):
-    """Enforces concurrency limits using asyncio.Semaphore."""
+    """Enforces concurrency limits using asyncio.Semaphore.
+
+    An exception escaping ``process_request`` fails the job with the error as
+    its failure reason so it never stays in ``running`` forever, and the
+    settling message carries ``failed=True`` so the last task cannot complete
+    a job that actually crashed.
+    """
+    failed_reason: str | None = None
     try:
         async with semaphore:
             await process_request(producer, message_value)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.error("Unhandled exception in surface worker task: %s", exc, exc_info=True)
+        failed_reason = f"Surface worker crashed while processing: {exc}"
+        await fail_job_from_message(
+            WORKER_TYPE,
+            message_value,
+            failed_reason,
+        )
+    finally:
+        await complete_job_task_from_message(
+            message_value,
+            worker_type=WORKER_TYPE,
+            failed=failed_reason is not None,
+            fail_reason=failed_reason,
+        )
 
 
 async def main():
@@ -449,11 +546,14 @@ async def main():
     await metrics.start()
 
     await pg_client.connect()
+    install_job_log_relay()
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{WORKER_TYPE}-group",
-        auto_offset_reset="latest",
+        # 'earliest' so messages published while this worker was down are still
+        # consumed after a restart (the per-job dedup check skips finished jobs).
+        auto_offset_reset="earliest",
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
@@ -485,7 +585,8 @@ async def main():
             metrics.record_consumed()
             logger.debug("Received message from topic '%s' (partition=%s, offset=%s)",
                          CONSUME_TOPIC, msg.partition, msg.offset)
-            asyncio.create_task(process_message_safely(producer, msg.value))
+            task_ctx = contextvars.copy_context()
+            asyncio.create_task(process_message_safely(producer, msg.value), context=task_ctx)
     except asyncio.CancelledError:
         logger.info("Surface worker cancellation requested.")
     finally:

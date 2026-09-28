@@ -9,7 +9,7 @@ aiohttp>=3.11.0
 # --- Databases, Storage & Messaging ---
 sqlalchemy>=2.0.36
 asyncpg>=0.30.0
-elasticsearch>=8.17.0
+elasticsearch==8.19.2
 redis>=5.2.0
 minio>=7.2.12
 aiokafka>=0.11.0

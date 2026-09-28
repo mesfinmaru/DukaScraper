@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react"
 import type { ReactNode } from "react"
-import { CircleSlash } from "lucide-react"
+import { Moon, Sun } from "lucide-react"
 import { cn } from "./utils"
 
 type Theme = "dark" | "light"
@@ -66,7 +66,11 @@ export function ThemeToggle({ className }: { className?: string }) {
         className,
       )}
     >
-      <CircleSlash className="h-3.5 w-3.5" />
+      {light ? (
+        <Sun className="h-3.5 w-3.5" />
+      ) : (
+        <Moon className="h-3.5 w-3.5" />
+      )}
     </button>
   )
 }

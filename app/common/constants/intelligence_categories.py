@@ -34,3 +34,53 @@ CATEGORY_DESCRIPTIONS = {
     IntelligenceCategory.MISINFORMATION: "Coordinated disinfo campaigns, propaganda, astroturfing",
     IntelligenceCategory.OTHER: "Low-value / general noise",
 }
+
+
+# Canonical anchor texts per category. The llm-worker embeds these once and
+# compares them against each article embedding, giving the classifier
+# similarity-grounded hints that are independent of previously scraped pages
+# (fixes the self-referential RAG loop). Keep them descriptive and distinct.
+CATEGORY_ANCHOR_TEXTS = {
+    IntelligenceCategory.DATA_LEAK: (
+        "A post or document exposing stolen credentials, email and password "
+        "lists, database dumps, personally identifiable information, leaked "
+        "API keys, or confidential corporate records made public without "
+        "authorization. Typical language mentions account logins, password "
+        "combolists, customer databases, or internal files published by "
+        "hackers or whistleblowers."
+    ),
+    IntelligenceCategory.GOV_ISSUE: (
+        "Reporting or discussion of government policy decisions, political "
+        "instability, ministerial statements, elections, new legislation, "
+        "court rulings, public administration, or regional affairs of public "
+        "interest. Typical language cites officials, ministries, parliament, "
+        "agencies, or diplomatic developments."
+    ),
+    IntelligenceCategory.CYBER_THREAT: (
+        "Technical disclosure or discussion of malware, ransomware, phishing "
+        "campaigns, software exploits and vulnerabilities, botnets, "
+        "command-and-control infrastructure, distributed denial-of-service "
+        "attacks, or other digital threats to computer systems and networks."
+    ),
+    IntelligenceCategory.PHYSICAL_THREAT: (
+        "Content describing violent extremism, armed conflict, sabotage, "
+        "trafficking of weapons or contraband, kidnapping, or credible plans "
+        "for physical harm against people or critical infrastructure."
+    ),
+    IntelligenceCategory.MISINFORMATION: (
+        "Coordinated disinformation, state propaganda, fabricated news "
+        "stories, astroturfed social campaigns, or false claims presented as "
+        "fact in order to manipulate public opinion or obscure verified "
+        "events."
+    ),
+    IntelligenceCategory.OTHER: (
+        "General news, sports, weather, entertainment, lifestyle, product "
+        "reviews, or everyday community content with no intelligence value "
+        "and no connection to security, politics, or threats."
+    ),
+}
+
+
+def get_category_anchor_texts() -> dict[str, str]:
+    """Return {category_value: anchor_text} for embedding-based grounding."""
+    return {str(cat): text for cat, text in CATEGORY_ANCHOR_TEXTS.items()}
