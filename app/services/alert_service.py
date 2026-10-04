@@ -30,6 +30,7 @@ MIN_ALERT_SEVERITY = 4
 
 #: Severity of the most urgent alert, used for the badge/"critical" styling.
 MAX_SEVERITY = 5
+SYSTEM_ALERT_SEVERITY = 3
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class Alert:
     """One high-severity intelligence finding awaiting operator attention."""
 
     alert_id: str
-    job_id: str
+    job_id: str | None
     item_id: str
     url: str
     title: str
@@ -50,6 +51,7 @@ class Alert:
     llm_model: str
     created_at: str | None
     read: bool = False
+    alert_type: str = "threat"
 
     def to_dict(self) -> dict:
         return {
@@ -67,6 +69,7 @@ class Alert:
             "llm_model": self.llm_model,
             "created_at": self.created_at,
             "read": self.read,
+            "alert_type": self.alert_type,
         }
 
 
@@ -83,8 +86,10 @@ def qualifies_as_alert(severity: int, minimum: int = MIN_ALERT_SEVERITY) -> bool
     return minimum <= value <= MAX_SEVERITY
 
 
-def alert_priority(severity: int) -> str:
+def alert_priority(severity: int, alert_type: str = "threat") -> str:
     """Human label for a severity value: critical / high / low."""
+    if alert_type == "system":
+        return "system"
     try:
         value = int(severity)
     except (TypeError, ValueError):
@@ -127,7 +132,7 @@ def build_alert_email(alert: Alert, base_url: str = "") -> tuple[str, str]:
     lines = [
         f"Severity : {alert.severity}/5 ({label})",
         f"Category : {category}",
-        f"Job      : {alert.job_id}",
+        f"Job      : {alert.job_id or 'platform'}",
         f"Language : {alert.language or 'unknown'}",
         "",
         summarize_alert(alert),
@@ -244,6 +249,53 @@ async def record_alert(
     return alert_id
 
 
+async def record_system_alert(
+    *,
+    dedupe_key: str,
+    title: str,
+    summary: str,
+    category: str = "system",
+    severity: int = SYSTEM_ALERT_SEVERITY,
+    entities: list[str] | None = None,
+) -> str | None:
+    """Persist one operational alert, returning None for duplicate events."""
+    from app.storage.postgres.client import pg_client
+
+    alert_id = await pg_client.insert_system_alert(
+        dedupe_key=dedupe_key,
+        title=title,
+        summary=summary,
+        category=category,
+        severity=severity,
+        entities=entities or [],
+    )
+    if alert_id:
+        logger.warning("Raised system alert %s (%s)", alert_id, title)
+    return alert_id
+
+
+async def notify_system_alert_email(alert_id: str) -> int:
+    """Email a newly-created system alert to every active administrator."""
+    from app.common.config.settings import settings
+    from app.storage.postgres.client import pg_client
+
+    if not getattr(settings, "ALERT_EMAILS_ENABLED", False):
+        return 0
+    row = await pg_client.get_alert(alert_id)
+    if row is None:
+        return 0
+    alert = _row_to_alert(row)
+    subject, body = build_alert_email(alert, getattr(settings, "UI_BASE_URL", ""))
+    sent = 0
+    for email in await pg_client.list_admin_emails():
+        try:
+            await send_alert_email(email, subject, body)
+            sent += 1
+        except Exception:
+            logger.exception("System alert %s email delivery failed for %s", alert_id, email)
+    return sent
+
+
 async def list_alerts(
     *,
     user_id: str,
@@ -252,6 +304,7 @@ async def list_alerts(
     minimum_severity: int = MIN_ALERT_SEVERITY,
     limit: int = 50,
     offset: int = 0,
+    alert_type: str = "all",
 ) -> tuple[list[Alert], int]:
     """Return ``(alerts, total)`` for one user, newest first.
 
@@ -267,6 +320,7 @@ async def list_alerts(
         minimum_severity=minimum_severity,
         limit=limit,
         offset=offset,
+        alert_type=alert_type,
     )
     return [_row_to_alert(r) for r in rows], total
 
@@ -327,4 +381,5 @@ def _row_to_alert(row) -> Alert:
         llm_model=data.get("llm_model") or "",
         created_at=created.isoformat() if created else None,
         read=bool(data.get("is_read")),
+        alert_type=data.get("alert_type") or "threat",
     )

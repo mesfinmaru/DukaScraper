@@ -481,7 +481,9 @@ CREATE TABLE IF NOT EXISTS llm_analysis_queue (
 
     item_id         VARCHAR(20) PRIMARY KEY,
 
-    job_id          VARCHAR(20) NOT NULL,
+    alert_type      VARCHAR(16) NOT NULL DEFAULT 'threat',
+
+    job_id          VARCHAR(20),
 
     payload         JSONB NOT NULL,
 
@@ -550,9 +552,13 @@ CREATE TABLE IF NOT EXISTS alerts (
     UNIQUE(item_id)
 );
 
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS alert_type VARCHAR(16) NOT NULL DEFAULT 'threat';
+ALTER TABLE alerts ALTER COLUMN job_id DROP NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_alerts_created  ON alerts (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts (severity DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_job      ON alerts (job_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_type     ON alerts (alert_type, created_at DESC);
 
 -- Per-user read markers. Keyed on (alert_id, user_id) so two operators of the
 -- same job each clear their own badge; CASCADE keeps rows from outliving their

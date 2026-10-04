@@ -35,6 +35,7 @@ router = APIRouter()
 
 @router.get("/alerts")
 async def get_alerts(
+    alert_type: str = Query("all", pattern="^(all|threat|system)$"),
     unread_only: bool = Query(False, description="Only alerts this user has not read"),
     min_severity: int = Query(
         MIN_ALERT_SEVERITY,
@@ -55,11 +56,12 @@ async def get_alerts(
         minimum_severity=min_severity,
         limit=limit,
         offset=offset,
+        alert_type=alert_type,
     )
     items = []
     for alert in rows:
         payload = alert.to_dict()
-        payload["priority"] = alert_priority(alert.severity)
+        payload["priority"] = alert_priority(alert.severity, alert.alert_type)
         payload["short_summary"] = summarize_alert(alert)
         items.append(payload)
     return {
@@ -69,6 +71,7 @@ async def get_alerts(
         "offset": offset,
         "has_more": offset + len(items) < total,
         "unread_only": unread_only,
+        "alert_type": alert_type,
     }
 
 

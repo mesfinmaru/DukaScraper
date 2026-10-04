@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     # whole job — the message task is cancelled at this deadline and the site
     # is closed out as failed.
     DEEP_MESSAGE_BUDGET_SECONDS: float = 240.0
+    # How many Camoufox stealth fallbacks may run at the same time.
+    # Each fallback is a SECOND headful browser launched on top of the job's
+    # already-running Chromium context, and that pairing is what exhausts
+    # memory: on a 7.6 GB container with 5 concurrent deep jobs the worker hit
+    # OSError "Cannot allocate memory", and portal logins died on Playwright's
+    # 30s actionability wait while the machine swapped. Queueing fallbacks
+    # behind a small semaphore keeps many users' crawls from degrading each
+    # other. Raise it only if the container memory limit grows with it.
+    DEEP_MAX_CONCURRENT_CAMOUFOX: int = 2
 
     # ==================================================================
     # Job watchdog — fails jobs stuck in running/pending forever
@@ -333,6 +342,51 @@ class Settings(BaseSettings):
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/128.0.0.0 Safari/537.36"
     )
+
+    # Timezone the stealth browsers present. Empty means "derive it": the deep
+    # worker uses the per-profile pairing (locale + zone), and this method backs
+    # the Chromium context and any profile that declares no zone of its own.
+    #
+    # This is not cosmetic. A fingerprint that claims Windows + en-US while the
+    # JS clock reports UTC is self-contradictory - no real Windows user runs
+    # UTC - and Cloudflare's managed challenge answers exactly that combination
+    # with an interstitial it never lets through: the challenge engine starts,
+    # Turnstile loads, no widget is ever offered and no cf_clearance is issued.
+    # Measured on www.scrapingcourse.com/cloudflare-challenge: 0/3 with the
+    # implicit UTC default, 3/3 (interleaved, ~19s) once an explicit timezone
+    # was supplied. Pin it only to force one specific zone; leaving it empty is
+    # the normal configuration.
+    DEEP_BROWSER_TIMEZONE: str = ""
+
+    # How the deep worker picks the browser timezone/locale for the Camoufox
+    # challenge fallback. Three values, case-insensitive; the boolean spellings
+    # are still accepted (true -> "on", false -> "off") so older deployments
+    # keep behaving as configured.
+    #
+    #   "auto" (default) - the first fallback attempt uses the profile's own
+    #       deterministic locale/timezone pair, which needs no network and
+    #       measured 3/3 challenge passes. Only when that attempt is still on
+    #       the challenge does a later attempt escalate to geoip. So the common
+    #       anti-bot case stays offline, and the extra network dependency is
+    #       paid only once a challenge actually persists. It is never touched by
+    #       the normal crawl: Camoufox - and therefore this setting - is only
+    #       reached after a Cloudflare-style challenge is detected.
+    #   "on"  - use geoip on every fallback attempt.
+    #   "off" - never use geoip; always the per-profile pairing.
+    #
+    # geoip resolves the zone/locale/geolocation from the egress IP. It needs the
+    # `camoufox[geoip]` extra plus egress to the MaxMind mirror and a public-IP
+    # service; when either is missing the worker falls back to the per-profile
+    # timezone on its own. It is not simply "better": it keeps the zone coherent
+    # with the IP, which is what you want behind a proxy in another region, but
+    # it adds that lookup to the solve path and measured 2/3 versus 3/3 for the
+    # deterministic pairing. Hence "auto" rather than always-on.
+    DEEP_BROWSER_GEOIP: str = "auto"
+
+    # Last-resort timezone when neither the operator nor the process supplies a
+    # usable one. It is deliberately not UTC: the browsers default to an en-US
+    # locale, and a US zone is the only value that keeps that pairing coherent.
+    DEEP_BROWSER_TIMEZONE_FALLBACK: str = "America/New_York"
 
     DEEP_BROWSER_CONTEXT_KWARGS: dict[str, object] = {
         "viewport": {"width": 1920, "height": 1080},
@@ -601,6 +655,40 @@ class Settings(BaseSettings):
             return True
         return False
 
+    def browser_timezone(self) -> str:
+        """Timezone the stealth browsers should present.
+
+        Order: explicit configuration, then the process TZ, then a fallback that
+        is coherent with the default en-US locale. Never returns an empty string,
+        because an *absent* timezone is the failure mode this exists to prevent -
+        the browser then reports the container's UTC clock next to a Windows
+        user agent, and Cloudflare's managed challenge stops resolving.
+        """
+        if self.DEEP_BROWSER_TIMEZONE:
+            return self.DEEP_BROWSER_TIMEZONE
+        process_tz = os.environ.get("TZ", "").strip()
+        if process_tz and process_tz.upper() not in {"UTC", "GMT", "ETC/UTC", "UCT"}:
+            return process_tz
+        return self.DEEP_BROWSER_TIMEZONE_FALLBACK
+
+    def browser_geoip_mode(self) -> str:
+        """Normalize ``DEEP_BROWSER_GEOIP`` to one of ``"auto"``, ``"on"``, ``"off"``.
+
+        Accepts the boolean spellings so a pre-existing ``DEEP_BROWSER_GEOIP=true``
+        keeps its meaning: ``True`` -> ``"on"``, ``False`` -> ``"off"``. Anything
+        unrecognized resolves to ``"auto"``, which is the safe, offline-first
+        behavior rather than an accidental always-on lookup.
+        """
+        raw = self.DEEP_BROWSER_GEOIP
+        if isinstance(raw, bool):
+            return "on" if raw else "off"
+        value = str(raw).strip().lower()
+        if value in {"on", "true", "1", "yes"}:
+            return "on"
+        if value in {"off", "false", "0", "no"}:
+            return "off"
+        return "auto"
+
     @staticmethod
     def _detect_docker() -> bool:
         """Auto-detect Docker environment."""
@@ -625,6 +713,13 @@ class Settings(BaseSettings):
         # Inject user_agent into browser context kwargs
         if "user_agent" not in self.DEEP_BROWSER_CONTEXT_KWARGS:
             self.DEEP_BROWSER_CONTEXT_KWARGS["user_agent"] = self.DEEP_DEFAULT_USER_AGENT
+
+        # Chromium reads its zone from the context, so the resolved value has to
+        # replace the placeholder in DEEP_BROWSER_CONTEXT_KWARGS; otherwise the
+        # worker would keep presenting a hardcoded America/New_York even when the
+        # operator configured something else (or geoip found a different zone).
+        if self.DEEP_BROWSER_CONTEXT_KWARGS.get("timezone_id"):
+            self.DEEP_BROWSER_CONTEXT_KWARGS["timezone_id"] = self.browser_timezone()
 
         # --- Auto-detect environment ---
         if self._detect_docker():

@@ -103,6 +103,15 @@ RUN set -eux; \
     done; \
     python -c "from camoufox.pkgman import camoufox_path; print('Camoufox browser ready at', camoufox_path(download_if_missing=False))"
 
+# GeoIP databases, for resolving the browser's timezone/locale from the egress
+# IP (DEEP_BROWSER_GEOIP). They are ~45 MB and camoufox downloads them on first
+# use, which would happen inside a challenge attempt and eat its budget. Fetch
+# them at build time instead, where a failure is a slow build rather than a
+# failed crawl. Non-fatal on purpose: a deployment without access to the
+# MaxMind mirror still works, it just falls back to the per-profile timezone.
+RUN python -c "from camoufox.geolocation import download_mmdb; download_mmdb()" \
+        || echo "WARNING: GeoIP database pre-fetch failed; it will download on first use (falling back to the per-profile timezone until then)"
+
 # Patchright uses its own browser cache and executable revision. Installing
 # Playwright's Chromium binary does not satisfy patchright.async_api.
 RUN patchright install chromium

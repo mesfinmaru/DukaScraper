@@ -3,8 +3,8 @@ import { NavLink, Outlet, useLocation } from "react-router-dom"
 import {
   Activity,
   BarChart3,
-  Bell,
   HardDrive,
+  Inbox,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -20,7 +20,6 @@ import { useAuth } from "../config"
 import { DEFAULT_REFRESH_MS, useAutoRefresh } from "../useAutoRefresh"
 import { cn } from "../utils"
 import { ThemeToggle } from "../theme"
-import { AlertBell } from "./AlertBell"
 import { HealthPill } from "./HealthPill"
 import { Logo } from "./Logo"
 import { useConfirm } from "./ui"
@@ -32,7 +31,7 @@ const NAV_ITEMS = [
   { to: "/search", label: "Search", icon: Search, end: false },
   { to: "/storage", label: "Storage", icon: HardDrive, end: false },
   { to: "/analytics", label: "Analytics", icon: BarChart3, end: false },
-  { to: "/alerts", label: "Alerts", icon: Bell, end: false },
+  { to: "/alerts", label: "Alerts", icon: Inbox, end: false },
 ]
 
 const ADMIN_NAV_ITEMS = [
@@ -43,9 +42,8 @@ const ADMIN_NAV_ITEMS = [
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const { session } = useAuth()
   const navItems = [...NAV_ITEMS, ...(session?.user.role === "admin" ? ADMIN_NAV_ITEMS : [])]
-  // The bell in the header carries the live count; the sidebar mirrors it so
-  // the number is visible when the header is scrolled away or on mobile where
-  // the sidebar is a drawer.
+  // Keep the unread count in the navigation so it remains visible on every
+  // page without competing with the account and health controls in the header.
   const [unread, setUnread] = useState(0)
   const loadUnread = useCallback(async () => {
     try {
@@ -170,7 +168,6 @@ export function Layout() {
 
           <div className="ml-auto flex items-center gap-3">
             <HealthPill online={online} />
-            <AlertBell />
             <ThemeToggle />
             <span className="hidden h-6 w-px bg-slate-800 sm:block" />
             {session && (

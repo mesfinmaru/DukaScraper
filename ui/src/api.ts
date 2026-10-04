@@ -785,12 +785,14 @@ export const api = {
 
   // ---------- alerts ----------
   getAlerts: (params: {
+    alert_type?: "all" | "threat" | "system"
     unread_only?: boolean
     min_severity?: number
     limit?: number
     offset?: number
   } = {}) => {
     const qs = new URLSearchParams()
+    if (params.alert_type && params.alert_type !== "all") qs.set("alert_type", params.alert_type)
     if (params.unread_only) qs.set("unread_only", "true")
     if (params.min_severity) qs.set("min_severity", String(params.min_severity))
     if (params.limit) qs.set("limit", String(params.limit))

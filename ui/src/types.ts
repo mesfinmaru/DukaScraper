@@ -349,7 +349,7 @@ export interface EvaluationResponse {
  */
 export interface AlertRow {
   alert_id: string
-  job_id: string
+  job_id: string | null
   item_id: string
   url: string
   title: string
@@ -362,7 +362,8 @@ export interface AlertRow {
   llm_model: string
   created_at: string | null
   read: boolean
-  priority: "critical" | "high" | "low"
+  priority: "critical" | "high" | "system" | "low"
+  alert_type: "threat" | "system"
   /** Whitespace-collapsed, length-capped summary for dense list rows. */
   short_summary: string
 }
@@ -374,6 +375,7 @@ export interface AlertsResponse {
   offset: number
   has_more: boolean
   unread_only: boolean
+  alert_type: "all" | "threat" | "system"
 }
 
 export interface UnreadAlertsResponse {

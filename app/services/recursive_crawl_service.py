@@ -24,6 +24,23 @@ from app.services.dedup_service import DedupService
 from app.services.link_extraction_service import LinkExtractionService
 from app.storage.postgres.client import pg_client
 
+#: Auth-related job params that children inherit so auto-login/auto-signup
+#: keeps applying when the crawl *reaches* a login/signup page deeper in the
+#: tree. Without this only the seed page ever authenticated, while the seed
+#: itself rarely is the login page. Gated on real auth pages by the worker
+#: (password field or auth-shaped URL), so inheriting does not announce or
+#: attempt a login on ordinary pages.
+AUTH_JOB_PARAM_KEYS: tuple[str, ...] = (
+    "allow_login",
+    "allow_signup",
+    "allow_email_verification",
+    "credentials",
+    "credential_email",
+    "auto_signup",
+    "auto_signup_email",
+    "auto_password",
+)
+
 
 async def extract_and_queue_children(
     producer: AIOKafkaProducer,
@@ -116,6 +133,11 @@ async def extract_and_queue_children(
                 parent_url=request.url,
                 target_layer=child_worker,
                 recursive_config=request.recursive_config,
+                job_params={
+                    key: request.job_params[key]
+                    for key in AUTH_JOB_PARAM_KEYS
+                    if key in request.job_params
+                },
             )
 
             await producer.send_and_wait(

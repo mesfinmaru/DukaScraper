@@ -153,6 +153,7 @@ if "app.services.portal_handler" in sys.modules and sys.modules[
 _is_cloudflare_challenge = _mod._is_cloudflare_challenge
 _html_has_cloudflare_challenge = _mod._html_has_cloudflare_challenge
 _html_is_challenge_interstitial = _mod._html_is_challenge_interstitial
+_html_is_still_challenge_page = _mod._html_is_still_challenge_page
 _CF_CHALLENGE_MARKERS = _mod._CF_CHALLENGE_MARKERS
 
 
@@ -433,6 +434,121 @@ async def test_normal_localized_page_is_not_a_challenge():
     assert await _is_cloudflare_challenge(page) is False
 
 
+# ═════════════════════════════════════════════════════════════════════
+# Real pages that embed an unfilled Turnstile widget
+#
+# Regression: the live detector used to return True for "widget present but
+# token empty", so scrapingcourse.com/login/cf-turnstile — a plain login
+# page whose FORM embeds Turnstile — read as an unsolved Cloudflare
+# challenge forever. The solver clicked, the auto-resolve wait timed out,
+# Camoufox loaded the real page in ~6s but its poll never saw "cleared",
+# and the job died on "page budget exceeded" while sibling pages of the
+# same crawl sat completed. Measured in the container: is_challenge=True,
+# strong markers=[], loose text markers=[], title=the site's own page.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class RealTurnstileLoginPage(DictFakePage):
+    """The actual /login/cf-turnstile page: real content + an empty widget."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            title="Cloudflare Login Challenge to Learn Web Scraping - ScrapingCourse.com",
+            body=(
+                "Scraping Course Login with CloudFlare Turnstile Challenge "
+                "Challenge Login to see products"
+            ),
+            turnstile={"widget": True, "token": False},
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_turnstile_login_page_is_not_a_challenge():
+    """A real page with an unfilled Turnstile widget must NOT read as a challenge."""
+    assert await _is_cloudflare_challenge(RealTurnstileLoginPage()) is False
+
+
+@pytest.mark.asyncio
+async def test_interstitial_is_still_detected_regardless_of_widget():
+    """A genuine interstitial must still be detected (title signal)."""
+    page = DictFakePage(
+        "Just a moment...",
+        "Performing security verification",
+        turnstile={"widget": True, "token": False},
+    )
+    assert await _is_cloudflare_challenge(page) is True
+
+
+@pytest.mark.asyncio
+async def test_turnstile_state_exposes_widget_and_token():
+    """The widget/token gate lives in _turnstile_state, not the detector."""
+    widget_page = RealTurnstileLoginPage()
+    assert await _mod._turnstile_state(widget_page) == (True, False)
+
+    solved_page = DictFakePage(
+        "Login", "form", turnstile={"widget": True, "token": True}
+    )
+    assert await _mod._turnstile_state(solved_page) == (True, True)
+
+    plain_page = DictFakePage("Login", "form")
+    assert await _mod._turnstile_state(plain_page) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_ensure_turnstile_token_short_circuits_without_widget():
+    """Pages without a widget must not be clicked or polled."""
+    page = DictFakePage("Table parsing", "lots of content")
+    assert await _mod._ensure_turnstile_token(page, timeout=0.5) is True
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Login-page gating for auto-login/auto-signup
+#
+# With allow_login/allow_signup enabled, a crawl must only attempt (and
+# only announce) authentication on actual login/signup pages instead of
+# publishing "logging in" on every URL it visits.
+# ═════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://www.scrapingcourse.com/login", True),
+        ("https://www.scrapingcourse.com/login/cf-turnstile", True),
+        ("https://example.com/users/sign_in?return=/", True),
+        ("https://example.com/wp-login.php", True),
+        ("https://example.com/register", True),
+        ("https://example.com/account/settings", True),
+        ("https://accounts.google.com/v3/signin/identifier", True),
+        ("https://login.microsoftonline.com/common/oauth2", True),
+        ("https://www.scrapingcourse.com/table-parsing", False),
+        ("https://www.scrapingcourse.com/ecommerce", False),
+        ("https://example.com/author/jane", False),
+        ("https://example.com/blog/my-post", False),
+        ("https://example.com/", False),
+    ],
+)
+def test_is_login_like_url(url: str, expected: bool) -> None:
+    """Auth-shaped URLs match; ordinary crawl targets do not."""
+    assert _mod._is_login_like_url(url) is expected
+
+
+@pytest.mark.asyncio
+async def test_handle_login_reports_no_form():
+    """handle_login returns False when the page has no password input.
+
+    Callers publish the "Login form submitted" stage only on True, so a
+    crawl never claims a login happened on a page without a form.
+    """
+    page = MagicMock()
+    page.query_selector = AsyncMock(return_value=None)
+    result = await _mod.DeepWorker.handle_login(
+        page, {"username": "u@example.com", "password": "p"}
+    )
+    assert result is False
+    page.query_selector.assert_awaited()
+
+
 def test_real_logged_in_dashboard_is_not_an_interstitial():
     """A real page that embeds Turnstile must NOT be failed by the store gate.
 
@@ -454,3 +570,148 @@ def test_real_logged_in_dashboard_is_not_an_interstitial():
     assert _html_has_cloudflare_challenge(html) is True
     # ...but the storage gate must let this page through.
     assert _html_is_challenge_interstitial(html) is False
+
+
+def test_solved_challenge_success_page_is_not_still_a_challenge():
+    """The page Camoufox lands on after clearing must not be flagged as stuck.
+
+    Regression: after a successful bypass the deep worker logged "Camoufox
+    fallback FAILED - content is still the challenge interstitial" for a page
+    whose visible text was "You bypassed the Cloudflare challenge!". The success
+    page embeds the Turnstile widget (challenges.cloudflare.com), which the loose
+    detector counts; the still-challenge gate must not use it.
+    """
+    html = (
+        "<!DOCTYPE html><html lang=\"en\"><head>"
+        "<title>Cloudflare Challenge - ScrapingCourse.com</title>"
+        "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\" "
+        "async defer></script></head><body>"
+        "<h1>Cloudflare Challenge</h1>"
+        "<p>You bypassed the Cloudflare challenge! :D</p>"
+        "</body></html>"
+    )
+    assert _html_has_cloudflare_challenge(html) is True  # widget present
+    assert _html_is_still_challenge_page(html) is False   # but it is solved
+
+
+def test_real_interstitial_is_still_a_challenge():
+    """The genuine interstitial must still be caught by the gate."""
+    html = (
+        "<!DOCTYPE html><html><head><title>Just a moment...</title>"
+        "<script>window._cf_chl_opt={};</script></head>"
+        "<body>Performing security verification</body></html>"
+    )
+    assert _html_is_still_challenge_page(html) is True
+
+
+def test_transitional_success_screen_is_still_a_challenge():
+    """"Verification successful. Waiting for ... to respond" must be caught."""
+    html = (
+        "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        "<body>Verification successful. Waiting for www.scrapingcourse.com "
+        "to respond</body></html>"
+    )
+    assert _html_is_still_challenge_page(html) is True
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Turnstile gating: managed widgets and the Camoufox handoff
+#
+# Measured in the container against the live
+# scrapingcourse.com/login/cf-turnstile page:
+#   Patchright Chromium : 0 tokens in 60s, window.turnstile never even
+#                         defined, five silent widget retries, no checkbox
+#                         in the iframe (blank 300x65 frame).
+#   Camoufox            : 645-char token in 7.1s with NO interaction.
+# The widget is *managed* mode, so there is nothing to click — Cloudflare
+# rejects the Chromium fingerprint, not the interaction. The fix is to stop
+# waiting on Chromium and hand the page to Camoufox; and _ensure_turnstile_token
+# must poll before clicking so a self-solving widget is never disturbed.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class SelfSolvingTurnstilePage(DictFakePage):
+    """A managed widget: no checkbox, token simply appears after N polls."""
+
+    def __init__(self, polls_until_token: int = 2) -> None:
+        super().__init__("Login", "form", turnstile={"widget": True, "token": False})
+        self._polls_until_token = polls_until_token
+        self._polls = 0
+        self.click_attempts = 0
+
+    async def evaluate(self, expr: str):
+        if "document.title" in expr:
+            return {"title": self._title, "text": self._body[:2000]}
+        self._polls += 1
+        if self._polls >= self._polls_until_token:
+            self._turnstile = {"widget": True, "token": True}
+        return self._turnstile
+
+    async def query_selector(self, sel: str):  # any iframe lookup
+        return None
+
+    async def content_frame(self):  # pragma: no cover - not reached
+        return None
+
+
+@pytest.mark.asyncio
+async def test_page_has_unsolved_turnstile_flags_the_gate() -> None:
+    """An empty widget is the gate that forces the Camoufox handoff."""
+    assert await _mod._page_has_unsolved_turnstile(RealTurnstileLoginPage()) is True
+
+
+@pytest.mark.asyncio
+async def test_page_has_unsolved_turnstile_false_once_token_arrives() -> None:
+    """A solved widget is not a gate — no wasted browser handoff."""
+    solved = DictFakePage("Login", "form", turnstile={"widget": True, "token": True})
+    assert await _mod._page_has_unsolved_turnstile(solved) is False
+
+
+@pytest.mark.asyncio
+async def test_page_has_unsolved_turnstile_false_on_ordinary_pages() -> None:
+    """Ordinary crawl pages must never trigger a stealth-browser launch."""
+    plain = DictFakePage("Table parsing", "lots of content")
+    assert await _mod._page_has_unsolved_turnstile(plain) is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_turnstile_token_polls_before_clicking() -> None:
+    """A managed widget solves itself; clicking it first is a wrong move.
+
+    The old implementation clicked immediately and then polled, which on a
+    managed widget is a wasted interaction on a page that has no checkbox.
+    """
+    page = SelfSolvingTurnstilePage(polls_until_token=2)
+    clicked: list[int] = []
+    original = _mod._click_turnstile_widget
+
+    async def _spy(pg, *a, **k):
+        clicked.append(1)
+        return False
+
+    _mod._click_turnstile_widget = _spy
+    try:
+        assert await _mod._ensure_turnstile_token(page, timeout=8.0) is True
+    finally:
+        _mod._click_turnstile_widget = original
+    # The token was already there before any click was attempted.
+    assert clicked == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_turnstile_token_clicks_when_passive_window_expires() -> None:
+    """An interactive checkbox widget still gets clicked before giving up."""
+    page = SelfSolvingTurnstilePage(polls_until_token=10_000)
+    clicked: list[int] = []
+    original = _mod._click_turnstile_widget
+
+    async def _spy(pg, *a, **k):
+        clicked.append(1)
+        return False
+
+    _mod._click_turnstile_widget = _spy
+    try:
+        assert await _mod._ensure_turnstile_token(page, timeout=1.0) is False
+    finally:
+        _mod._click_turnstile_widget = original
+    assert len(clicked) == 1

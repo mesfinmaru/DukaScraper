@@ -1,0 +1,41 @@
+    self._init_common_settings(resolved_tz_source)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\httpclient.py", line 214, in _init_common_settings
+    super()._init_common_settings(tz_source)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\client.py", line 213, in _init_common_settings
+    result = run_sync(init_sequence(config), self._execute_operation)
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\_backend\orchestration.py", line 224, in run_sync
+    operation = sequence.send(response)
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\_backend\orchestration.py", line 116, in init_sequence
+    server_settings = _setting_definitions(settings_result)
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\_backend\orchestration.py", line 72, in _setting_definitions
+    for row in _named_rows(result, "server settings"):
+               ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\query.py", line 373, in named_results
+    for row in zip(*self.result_set) if self.column_oriented else self.result_set:
+                                                                  ^^^^^^^^^^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\query.py", line 307, in result_set
+    return self.result_rows
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\query.py", line 333, in result_rows
+    for block in stream:
+                 ^^^^^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\common.py", line 285, in __next__
+    return next(self.gen)
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\query.py", line 353, in _row_block_stream
+    for block in self._column_block_stream():
+                 ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\transform.py", line 99, in gen
+    next_block = get_block()
+  File "C:\Users\mesfi\AppData\Local\Programs\Python\Python313\Lib\site-packages\clickhouse_connect\driver\transform.py", line 32, in get_block
+    num_cols = source.read_leb128()
+  File "clickhouse_connect/driverc/buffer.pyx", line 280, in clickhouse_connect.driverc.buffer.ResponseBuffer.read_leb128
+  File "clickhouse_connect/driverc/buffer.pyx", line 150, in clickhouse_connect.driverc.buffer.ResponseBuffer._read_byte_load
+clickhouse_connect.driver.exceptions.StreamCompleteException
+2026-10-04 21:03:09 | INFO     | DukaScraper.ProxyManager       | ProxyManager initialized with 0 proxies.
+=========================== short test summary info ===========================
+ERROR tests/system/test_capability_matrix.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 51.52s
+PYEXIT=2

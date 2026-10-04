@@ -170,35 +170,6 @@ DEFAULT_USER_AGENT: str = settings.DEEP_DEFAULT_USER_AGENT
 BROWSER_CONTEXT_KWARGS: dict[str, object] = settings.DEEP_BROWSER_CONTEXT_KWARGS
 
 # ---------------------------------------------------------------------------
-# Concurrency guard for the Camoufox stealth fallback.
-#
-# Measured ceiling, not a guess: the deep worker runs up to
-# DEEP_MAX_CONCURRENT_JOBS Chromium contexts, and every one of those that hits
-# Cloudflare launches a *second*, headful Firefox on top. On a 7.6 GB container
-# that combination exhausts memory — observed as OSError "Cannot allocate
-# memory" while importing the worker module, and as portal logins dying on
-# "Click Login button: Timeout 30000ms exceeded" (Playwright's actionability
-# wait cannot complete when the machine is swapping).
-#
-# A shared X display was measured and ruled out as the cause: two concurrent
-# portal logins on one display succeeded 2/2, and two on separate displays
-# 2/2 in the same time. The limit is RAM, so the fallback is what gets bounded.
-# ---------------------------------------------------------------------------
-def _resolve_camoufox_limit() -> int:
-    """Read the Camoufox concurrency limit, tolerating bad or absent config.
-
-    int() rather than max() directly, so a mocked or non-numeric settings value
-    cannot take the whole worker down at import time.
-    """
-    try:
-        return max(1, int(settings.DEEP_MAX_CONCURRENT_CAMOUFOX))
-    except (TypeError, ValueError):
-        return 2
-
-
-_camoufox_slots = asyncio.Semaphore(_resolve_camoufox_limit())
-
-# ---------------------------------------------------------------------------
 # Stealth: comprehensive JavaScript-level anti-detection overrides.
 # Injected BEFORE any page scripts via context.add_init_script().
 # Covers 6 detection vectors that Cloudflare Turnstile probes:
@@ -217,34 +188,12 @@ STEALTH_INIT_SCRIPT: str = settings.DEEP_STEALTH_INIT_SCRIPT
 # When Patchright fails to clear a Cloudflare managed challenge, we fall back
 # to Camoufox (Firefox-based, anti-fingerprint) and rotate through these
 # profiles to avoid repeated detection by the same fingerprint.
-#
-# Every profile pairs its locale with a timezone that a real machine using that
-# locale would plausibly report. The pairing is the point, not decoration.
-#
-# Camoufox draws its fingerprint from BrowserForge, whose property set has no
-# timezone, so unless a launch supplies one the browser falls back to the
-# *process* timezone. In a container that is UTC, which produced a fingerprint
-# claiming Windows + en-US while the JS clock said UTC - a combination no real
-# Windows user has, and one Cloudflare answers with an interstitial that never
-# resolves: the challenge engine starts, Turnstile loads, no widget is ever
-# rendered, no cf_clearance is issued, and every retry burns its full budget.
-#
-# Measured against www.scrapingcourse.com/cloudflare-challenge, interleaved so
-# IP-reputation drift cannot explain it: 0/3 passes with the implicit UTC
-# default, 3/3 passes (~19s each) once each profile carried a timezone.
-#
-# These are the primary pairing. geoip (below) is an escalation, not a
-# replacement: it derives the zone from the actual egress IP, which is what you
-# want behind a proxy in another country, but it costs a network lookup, so
-# DEEP_BROWSER_GEOIP="auto" only reaches for it after the first, network-free
-# attempt has failed to clear a challenge.
 CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
     {
         "os": "windows",
         "screen": (1920, 1080),
         "window": (1920, 1040),
         "locale": "en-US",
-        "timezone": "America/New_York",
         "webgl": ("Intel", "Intel(R) UHD Graphics 630"),
     },
     {
@@ -252,7 +201,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (2560, 1440),
         "window": (2560, 1400),
         "locale": "en-GB",
-        "timezone": "Europe/London",
         "webgl": ("Apple", "Apple M1"),
     },
     {
@@ -260,7 +208,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (1920, 1080),
         "window": (1920, 1040),
         "locale": "de-DE",
-        "timezone": "Europe/Berlin",
         "webgl": ("Mesa", "Mesa OpenGL"),
     },
     {
@@ -268,7 +215,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (1366, 768),
         "window": (1366, 728),
         "locale": "fr-FR",
-        "timezone": "Europe/Paris",
         "webgl": ("NVIDIA", "NVIDIA GeForce GTX 1050 Ti"),
     },
     {
@@ -276,7 +222,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (1440, 900),
         "window": (1440, 860),
         "locale": "es-ES",
-        "timezone": "Europe/Madrid",
         "webgl": ("Apple", "Apple M2"),
     },
     {
@@ -284,7 +229,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (2560, 1440),
         "window": (2560, 1400),
         "locale": "ja-JP",
-        "timezone": "Asia/Tokyo",
         "webgl": ("NVIDIA", "NVIDIA GeForce RTX 3060"),
     },
     {
@@ -292,7 +236,6 @@ CAMOUFOX_FINGERPRINT_PROFILES: list[dict[str, object]] = [
         "screen": (2560, 1440),
         "window": (2560, 1400),
         "locale": "pt-BR",
-        "timezone": "America/Sao_Paulo",
         "webgl": ("AMD", "AMD Radeon RX 580"),
     },
 ]
@@ -306,123 +249,6 @@ def _get_camoufox_profile(attempt: int) -> dict[str, object]:
     """
     idx = attempt % len(CAMOUFOX_FINGERPRINT_PROFILES)
     return CAMOUFOX_FINGERPRINT_PROFILES[idx]
-
-
-#: Cached result of the one-off geoip pre-flight. None means "not probed yet".
-_geoip_probe_result: bool | None = None
-
-
-def camoufox_geoip_usable() -> bool:
-    """One-off check that `geoip=True` will actually work in this process.
-
-    `geoip=True` needs the `camoufox[geoip]` extra *and* a reachable public-IP
-    service *and* the MaxMind database. Camoufox raises at launch when any of
-    those is missing, which would burn one of the three challenge attempts and
-    75 seconds of the page budget - so the whole lookup is done once here, up
-    front, and the answer is cached.
-
-    Doing the work rather than just checking imports is deliberate: an image
-    built without network access to the MaxMind mirror has maxminddb installed
-    and no database, and only the real call distinguishes the two.
-    """
-    global _geoip_probe_result
-    if _geoip_probe_result is not None:
-        return _geoip_probe_result
-    try:
-        from camoufox.geolocation import get_geolocation
-        from camoufox.utils import public_ip
-
-        get_geolocation(public_ip())
-        _geoip_probe_result = True
-        logger.info("Camoufox geoip ready — browser timezone will follow the egress IP")
-    except Exception as exc:
-        _geoip_probe_result = False
-        logger.warning(
-            "Camoufox geoip unavailable (%s) — falling back to the per-profile "
-            "timezone; install camoufox[geoip] and allow egress for IP-coherent zones",
-            exc,
-        )
-    return _geoip_probe_result
-
-
-def _geoip_mode() -> str:
-    """The configured geoip behavior, normalized to "auto"/"on"/"off".
-
-    Prefers ``settings.browser_geoip_mode()`` but does not require it: the unit
-    test harness replaces the settings module with a mock, so reading the raw
-    attribute and normalizing here keeps the two paths in agreement.
-    """
-    resolver = getattr(settings, "browser_geoip_mode", None)
-    if callable(resolver):
-        mode = resolver()
-        if isinstance(mode, str) and mode in {"auto", "on", "off"}:
-            return mode
-    raw = getattr(settings, "DEEP_BROWSER_GEOIP", "auto")
-    if isinstance(raw, bool):
-        return "on" if raw else "off"
-    value = str(raw).strip().lower()
-    if value in {"on", "true", "1", "yes"}:
-        return "on"
-    if value in {"off", "false", "0", "no"}:
-        return "off"
-    return "auto"
-
-
-def _camoufox_launch_kwargs(
-    profile: dict[str, object],
-    webgl_config: tuple[str, str] | None,
-    attempt: int = 0,
-) -> dict[str, object]:
-    """Build the AsyncCamoufox kwargs that make the fingerprint self-consistent.
-
-    The timezone is the part that matters. Camoufox's BrowserForge fingerprint
-    has no timezone property, so an unset one silently becomes the container's
-    UTC - see CAMOUFOX_FINGERPRINT_PROFILES for what that costs.
-
-    geoip resolves the zone (and the locale) from the actual egress IP, which is
-    the only way to stay coherent behind a proxy in another country, but it also
-    costs a network lookup inside the solve path. The configured mode decides how
-    eagerly it is used (see ``_geoip_mode``):
-
-      * ``off``  - never; always the profile's own locale/timezone pair.
-      * ``on``   - every attempt, when available.
-      * ``auto`` - only from the *second* attempt onward, i.e. once the
-        deterministic, network-free first attempt has already failed to clear
-        the challenge. The common case stays offline; geoip is the escalation.
-
-    Whatever the mode, when geoip is unavailable the profile's locale/timezone
-    pair is applied explicitly - never left implicit.
-    """
-    os_name = str(profile["os"])
-    screen_size = profile["screen"]
-    window_size = profile["window"]
-
-    kwargs: dict[str, object] = {
-        "headless": False,
-        "humanize": True,
-        "os": os_name,
-        "screen": Screen(max_width=screen_size[0], max_height=screen_size[1]),
-        "window": (window_size[0], window_size[1]),
-    }
-    if webgl_config:
-        kwargs["webgl_config"] = webgl_config
-
-    mode = _geoip_mode()
-    wants_geoip = mode == "on" or (mode == "auto" and attempt > 0)
-    if wants_geoip and camoufox_geoip_usable():
-        # IP-derived zone/locale/geolocation; do not pass a conflicting locale
-        # on top, or the two sources disagree and the mismatch is detectable.
-        kwargs["geoip"] = True
-        return kwargs
-
-    kwargs["locale"] = str(profile["locale"])
-    # DEEP_BROWSER_TIMEZONE wins over the profile when an operator pinned one.
-    kwargs["config"] = {
-        "timezone": str(
-            settings.DEEP_BROWSER_TIMEZONE or profile.get("timezone") or settings.browser_timezone()
-        ),
-    }
-    return kwargs
 
 
 def _get_camoufox_webgl_config(
@@ -682,29 +508,10 @@ async def _is_cloudflare_challenge(page: Page) -> bool:
         for marker in _CF_CHALLENGE_MARKERS:
             if marker.lower() in snippet_lower:
                 return True
-        # NOTE: "widget present but token empty" used to return True here.
-        # That made every REAL page embedding an unfilled Turnstile widget
-        # (scrapingcourse.com/login/cf-turnstile is exactly that: a normal
-        # login page whose form embeds Turnstile) read as an unsolved
-        # Cloudflare challenge forever — the solver clicked, the auto-resolve
-        # wait timed out, Camoufox loaded the real page in ~6s but its poll
-        # never saw "cleared", and the job died on "page budget exceeded"
-        # while sibling pages of the same crawl sat completed. A widget is a
-        # login-form gate, not an interstitial; it is handled by
-        # _ensure_turnstile_token() right before the form is submitted.
-    except Exception:
-        pass
-    return False
 
-
-async def _turnstile_state(page: Page) -> tuple[bool, bool]:
-    """Return (widget_present, token_present) for an embedded Turnstile widget.
-
-    Used to decide whether a login/signup form may be submitted yet — NOT
-    whether the page is a Cloudflare challenge (see _is_cloudflare_challenge).
-    """
-    try:
-        state = await page.evaluate(
+        # Turnstile login pages can look like ordinary forms in visible text.
+        # Detect the active widget before credentials are submitted.
+        turnstile_state = await page.evaluate(
             """() => {
                 const widget = Boolean(
                     document.querySelector('.cf-turnstile') ||
@@ -718,28 +525,11 @@ async def _turnstile_state(page: Page) -> tuple[bool, bool]:
                 return {widget, token};
             }"""
         )
-        if isinstance(state, dict):
-            return bool(state.get("widget")), bool(state.get("token"))
+        if isinstance(turnstile_state, dict) and turnstile_state.get("widget") and not turnstile_state.get("token"):
+            return True
     except Exception:
         pass
-    return False, False
-
-
-async def _page_has_unsolved_turnstile(page: Page) -> bool:
-    """True when the page carries a Turnstile widget that holds no token.
-
-    That is the quiet form of the interstitial: the page is a normal, useful
-    page, but Cloudflare silently refuses to issue a token to this browser, so
-    any form behind the widget can only be submitted for a 419 PAGE EXPIRED.
-    Measured on scrapingcourse.com/login/cf-turnstile — Patchright Chromium
-    produced zero tokens in 60s with window.turnstile never even defined, while
-    Camoufox produced a 645-char token in 7.1s untouched.
-    """
-    try:
-        widget, token = await _turnstile_state(page)
-    except Exception:
-        return False
-    return bool(widget) and not token
+    return False
 
 
 def _html_has_cloudflare_challenge(html: str) -> bool:
@@ -767,18 +557,8 @@ def _html_is_still_challenge_page(html: str) -> bool:
     """Return whether captured HTML is still a Cloudflare challenge
     interstitial — including the transitional post-verification screen
     ("Verification successful. Waiting for … to respond") that never
-    reloads and must never be stored as page content.
-
-    Uses only the *strong* interstitial markers, not the loose challenge
-    detector. The loose detector matches ``challenges.cloudflare.com`` too, and
-    a genuinely solved page can still embed the Turnstile widget: after Camoufox
-    clears the challenge, the success page ("You bypassed the Cloudflare
-    challenge!") carries the Turnstile script. Gating on the loose detector
-    logged that success as "fallback FAILED — still the interstitial" even while
-    the correct content was being stored. The strong markers identify the
-    interstitial itself and leave the solved page alone.
-    """
-    if _html_is_challenge_interstitial(html):
+    reloads and must never be stored as page content."""
+    if _html_has_cloudflare_challenge(html):
         return True
     if not html:
         return False
@@ -862,166 +642,6 @@ async def _wait_for_challenge_resolution(
     return False
 
 
-async def _click_turnstile_widget(page: Page) -> bool:
-    """Click the Turnstile widget on the current page, if one is rendered.
-
-    Selector click first, then a geometry-based coordinate click for widgets
-    whose checkbox lives in a deeply nested iframe. Returns True when a click
-    was performed — not when the challenge is solved (the token appears a few
-    seconds later; poll `_turnstile_state` for that).
-    """
-    iframe_selectors = [
-        "iframe[src*='challenges.cloudflare.com']",
-        "iframe[src*='turnstile']",
-        "iframe[src*='cf-chl']",
-        "iframe[title*='Cloudflare']",
-        "iframe[id*='cf-']",
-    ]
-
-    checkbox_selectors = [
-        "input[type='checkbox']",
-        "#challenge-stage",
-        ".cb-i",
-        "#cf-turnstile-response",
-        "label.ctp-checkbox-label",
-        "#challenge-form input",
-    ]
-    for sel in iframe_selectors:
-        turnstile_frame_element = await page.query_selector(sel)
-        if not turnstile_frame_element:
-            continue
-        try:
-            frame = await turnstile_frame_element.content_frame()
-            if frame is None:
-                continue
-            for csel in checkbox_selectors:
-                checkbox = await frame.query_selector(csel)
-                if checkbox:
-                    await asyncio.sleep(0.5)
-                    await checkbox.click()
-                    logger.info("Turnstile checkbox clicked via selector: %s", csel)
-                    return True
-        except Exception as exc:
-            logger.debug("Turnstile iframe interaction error (selector %s): %s", sel, exc)
-
-    # Coordinate fallback: the checkbox often lives inside a nested iframe
-    # whose internal selectors differ from the common ones.
-    for sel in iframe_selectors:
-        frame_element = await page.query_selector(sel)
-        if not frame_element:
-            continue
-        try:
-            box = await frame_element.bounding_box()
-            if not box or box["width"] < 10 or box["height"] < 10:
-                continue
-            # The checkbox sits ~30px from the widget's left edge.
-            target_x = box["x"] + min(30.0, box["width"] / 2)
-            target_y = box["y"] + box["height"] / 2
-            await page.mouse.move(target_x - 20, target_y - 10)
-            await asyncio.sleep(0.2)
-            await page.mouse.move(target_x, target_y, steps=8)
-            await asyncio.sleep(0.3)
-            await page.mouse.click(target_x, target_y)
-            logger.info(
-                "Turnstile widget clicked by coordinates (%.0f, %.0f)",
-                target_x, target_y,
-            )
-            return True
-        except Exception as exc:
-            logger.debug("Turnstile coordinate click failed (selector %s): %s", sel, exc)
-    return False
-
-
-async def _poll_turnstile_token(page: Page, deadline: float) -> bool:
-    """Poll ``_turnstile_state`` until a token shows up or *deadline* passes."""
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(1.5, remaining))
-        try:
-            _, token = await _turnstile_state(page)
-        except Exception:
-            token = False
-        if token:
-            logger.info("Turnstile token acquired")
-            return True
-
-
-async def _ensure_turnstile_token(page: Page, timeout: float = 12.0) -> bool:
-    """Make sure an embedded Turnstile widget holds a token before submit.
-
-    Polls BEFORE clicking. Most real Turnstile widgets are *managed* mode:
-    they have no checkbox at all and solve themselves within a few seconds
-    once the browser is trusted, so clicking first is a wasted interaction
-    that can land on an unrelated element. Measured on
-    scrapingcourse.com/login/cf-turnstile: Camoufox produced a 645-char token
-    in 7.1s with no interaction at all, while Patchright Chromium produced
-    nothing in 60s — the widget was never the interaction problem, the
-    fingerprint was.
-
-    Returns True when the page has no widget (nothing to wait for) or a token
-    is present. A False return means the form may be rejected server-side
-    (419 PAGE EXPIRED); callers log it but still try, since some sites accept
-    a submit without a visible token.
-    """
-    try:
-        widget, token = await _turnstile_state(page)
-    except Exception:
-        return True
-    if not widget or token:
-        return True
-    logger.info("Turnstile widget present without token — solving it before form submit")
-    deadline = time.monotonic() + timeout
-    # Phase 1 — passive. Managed/invisible widgets resolve on their own.
-    if await _poll_turnstile_token(
-        page, min(deadline, time.monotonic() + min(timeout * 0.5, 8.0))
-    ):
-        return True
-    # Phase 2 — interactive: an explicit checkbox widget needs a click.
-    await _click_turnstile_widget(page)
-    if not await _poll_turnstile_token(page, deadline):
-        logger.warning(
-            "Turnstile token still missing after %.0fs — submitting anyway", timeout
-        )
-        return False
-    return True
-
-
-# Auth-shaped URL detection: login/signup pages and nothing else.
-# Word-boundary style regex so /login, /users/sign_in, wp-login.php match
-# while /author, /blog, /table-parsing do not.
-_AUTH_PATH_RE = re.compile(
-    r"(^|[/_.\-])(log[-_]?in|sign[-_]?in|sign[-_]?up|register(?:ation)?|"
-    r"wp-login|authenticate|auth|account|join|session)(?=$|[/_.\-?&#])",
-    re.IGNORECASE,
-)
-
-
-def _is_login_like_url(url: str) -> bool:
-    """True when *url* looks like a login/signup page.
-
-    Used to gate auto-login/auto-signup work — both the real attempt and the
-    "logging in" progress stages — to the pages that can actually perform it,
-    so a crawl does not announce authentication on every URL it visits.
-    """
-    try:
-        from urllib.parse import urlparse
-
-        parsed = urlparse(str(url))
-        target = parsed.path or "/"
-        if parsed.query:
-            target = f"{target}?{parsed.query}"
-        host = (parsed.hostname or "").lower()
-    except Exception:
-        target = str(url).lower()
-        host = ""
-    # Auth-hosted domains (login.example.com, accounts.google.com, …).
-    if host.startswith(("login.", "log-in.", "auth.", "accounts.", "sso.")):
-        return True
-    return _AUTH_PATH_RE.search(target) is not None
-
-
 # =========================================================================
 # CAPTCHA Solver
 # =========================================================================
@@ -1054,7 +674,76 @@ class UniversalCaptchaSolver:
 
         logger.info("Cloudflare challenge detected — attempting resolution …")
 
-        clicked = await _click_turnstile_widget(page)
+        # Try to find and interact with the Turnstile iframe
+        iframe_selectors = [
+            "iframe[src*='challenges.cloudflare.com']",
+            "iframe[src*='turnstile']",
+            "iframe[src*='cf-chl']",
+            "iframe[title*='Cloudflare']",
+            "iframe[id*='cf-']",
+        ]
+
+        clicked = False
+        for sel in iframe_selectors:
+            turnstile_frame_element = await page.query_selector(sel)
+            if not turnstile_frame_element:
+                continue
+
+            try:
+                frame = await turnstile_frame_element.content_frame()
+                if frame is None:
+                    continue
+
+                checkbox_selectors = [
+                    "input[type='checkbox']",
+                    "#challenge-stage",
+                    ".cb-i",
+                    "#cf-turnstile-response",
+                    "label.ctp-checkbox-label",
+                    "#challenge-form input",
+                ]
+                for csel in checkbox_selectors:
+                    checkbox = await frame.query_selector(csel)
+                    if checkbox:
+                        await asyncio.sleep(0.5)
+                        await checkbox.click()
+                        clicked = True
+                        logger.info("Turnstile checkbox clicked via selector: %s", csel)
+                        break
+            except Exception as exc:
+                logger.debug("Turnstile iframe interaction error (selector %s): %s", sel, exc)
+            if clicked:
+                break
+
+        if not clicked:
+            # The Turnstile checkbox often lives inside a deeply nested iframe
+            # whose internal selectors differ from the common ones. Locate any
+            # checkbox-like element by geometry inside each candidate frame
+            # and click it by screen coordinates.
+            for sel in iframe_selectors:
+                frame_element = await page.query_selector(sel)
+                if not frame_element:
+                    continue
+                try:
+                    box = await frame_element.bounding_box()
+                    if not box or box["width"] < 10 or box["height"] < 10:
+                        continue
+                    # The checkbox sits ~30px from the widget's left edge.
+                    target_x = box["x"] + min(30.0, box["width"] / 2)
+                    target_y = box["y"] + box["height"] / 2
+                    await page.mouse.move(target_x - 20, target_y - 10)
+                    await asyncio.sleep(0.2)
+                    await page.mouse.move(target_x, target_y, steps=8)
+                    await asyncio.sleep(0.3)
+                    await page.mouse.click(target_x, target_y)
+                    clicked = True
+                    logger.info(
+                        "Turnstile widget clicked by coordinates (%.0f, %.0f)",
+                        target_x, target_y,
+                    )
+                    break
+                except Exception as exc:
+                    logger.debug("Turnstile coordinate click failed (selector %s): %s", sel, exc)
 
         if not clicked:
             # Managed challenge — the JS may auto-solve without a visible click.
@@ -1174,16 +863,6 @@ class DeepWorker:
         self.captcha_solver: UniversalCaptchaSolver = UniversalCaptchaSolver()
         self.camoufox_authenticated = False
         self.camoufox_portal_data: dict[str, object] = {}
-        # Rendered text of the page the Camoufox portal login landed on. That
-        # page is client-rendered, so its innerText is the only place the real
-        # post-login text exists — serializing its HTML afterwards recovers
-        # almost none of it. Kept so the authenticated page is not stored as a
-        # few hundred characters of shell.
-        self.camoufox_portal_text: str = ""
-        # True once an unsolved Turnstile gate has been handed to the Camoufox
-        # fallback. Re-waiting for a token on the Chromium page after that is
-        # pure waste: Chromium never gets one.
-        self.turnstile_handed_off = False
         # Most-recent navigation error per job_id. _navigate_and_solve has no
         # payload in scope, so it stashes the error here for process_job to
         # pick up; keyed so concurrent messages don't clobber each other.
@@ -1260,22 +939,19 @@ class DeepWorker:
     @staticmethod
     async def handle_login(
         page: Page, credentials: dict[str, str] | None
-    ) -> bool:
+    ) -> None:
         """Detects common login forms and auto-fills credentials if provided.
 
         Looks for ``<input type="password">`` and, if present alongside a
         valid credentials dict, fills the username/email field and submits.
-
-        Returns True only when a form was actually found and submitted, so
-        callers can decide whether the "login" progress stage is real.
         """
         password_input = await page.query_selector("input[type='password']")
         if not password_input:
-            return False
+            return
 
         if not credentials or "username" not in credentials or "password" not in credentials:
             logger.warning("Password field detected but valid credentials payload missing — skipping login.")
-            return False
+            return
 
         logger.info("Authentication barrier detected — auto-filling credentials …")
 
@@ -1328,8 +1004,6 @@ class DeepWorker:
                 logger.info("Login credentials submitted.")
             except Exception as exc:
                 logger.warning("Navigation wait timed out after login click: %s", exc)
-            return True
-        return False
 
     # -- Core Rendering Pipeline ---------------------------------------------
 
@@ -1558,28 +1232,7 @@ class DeepWorker:
                         job_id, renavig_err,
                     )
                     still_challenge = await _is_cloudflare_challenge(page)
-        # An embedded Turnstile widget that never produced a token is the same
-        # problem as the interstitial, only quieter: Cloudflare silently refuses
-        # to issue a token to this browser. Measured on
-        # scrapingcourse.com/login/cf-turnstile — Patchright Chromium sat at zero
-        # tokens for 60s with window.turnstile never even defined (five silent
-        # widget retries), while Camoufox returned a 645-char token in 7.1s
-        # untouched. The widget is managed mode, so there is no checkbox to click
-        # and no click strategy can fix it; the fingerprint is what is rejected.
-        # Hand the whole page — login form included — to the Camoufox fallback,
-        # which is the only browser here that can hold a token.
-        turnstile_gate = False
-        if not still_challenge and HAS_CAMOUFOX:
-            turnstile_gate = await _page_has_unsolved_turnstile(page)
-            if turnstile_gate:
-                self.turnstile_handed_off = True
-                logger.info(
-                    "[%s] Turnstile widget present without a token — Chromium "
-                    "cannot solve this gate, handing the page to Camoufox",
-                    job_id,
-                )
-
-        if (still_challenge or turnstile_gate) and HAS_CAMOUFOX:
+        if still_challenge and HAS_CAMOUFOX:
             logger.info(
                 "[%s] Patchright unable to clear Cloudflare — trying Camoufox fallback",
                 job_id,
@@ -1587,7 +1240,6 @@ class DeepWorker:
             try:
                 response, content = await self._try_camoufox_bypass(
                     page, url, job_id, timeout_ms, credentials, portal_config,
-                    turnstile_gate=turnstile_gate,
                 )
                 # If the fallback also failed, the content is still the challenge
                 # page — flag it loudly so downstream never mistakes it for a
@@ -1618,7 +1270,6 @@ class DeepWorker:
         timeout_ms: int,
         credentials: dict[str, str] | None = None,
         portal_config: PortalConfig | None = None,
-        turnstile_gate: bool = False,
     ) -> tuple[Response | None, str]:
         """Fall back to Camoufox (Firefox-based anti-fingerprint browser)
         when Patchright cannot clear a Cloudflare managed challenge.
@@ -1630,11 +1281,6 @@ class DeepWorker:
              back to the Patchright context and re-navigate.
           4. If re-navigation is still blocked, return Camoufox content directly.
           5. Retry with a different fingerprint profile on failure.
-
-        *turnstile_gate* marks the quieter variant of the same problem: the page
-        is not an interstitial but carries a Turnstile widget that Patchright
-        can never satisfy. Authentication then has to happen inside Camoufox,
-        because the Chromium page cannot hold a token to submit the form with.
 
         Returns (response, html_content). The html_content is always a string,
         even when all fallbacks fail.
@@ -1657,17 +1303,12 @@ class DeepWorker:
             screen_size = profile["screen"]
             locale = profile["locale"]
             webgl_vendor, webgl_renderer = profile["webgl"]
+            window_size = profile["window"]
             webgl_config = _get_camoufox_webgl_config(os_name, screen_size)
-            # Log the timezone too: an implicit UTC is invisible in the logs and
-            # was the whole reason these attempts used to fail. Seeing the value
-            # here is what makes a regression diagnosable at a glance.
-            _launch_kwargs = _camoufox_launch_kwargs(profile, webgl_config, attempt)
-            _tz_shown = "geoip" if _launch_kwargs.get("geoip") else (
-                _launch_kwargs.get("config") or {}).get("timezone", "?")
 
             logger.info(
-                "[%s] 🦊 Camoufox fallback attempt %d/%d — os=%s screen=%s locale=%s timezone=%s",
-                job_id, attempt + 1, max_retries, os_name, screen_size, locale, _tz_shown,
+                "[%s] 🦊 Camoufox fallback attempt %d/%d — os=%s screen=%s locale=%s",
+                job_id, attempt + 1, max_retries, os_name, screen_size, locale,
             )
             await publish_job_stage(
                 job_id=job_id, url=url, stage="camoufox_fallback", state="active",
@@ -1675,46 +1316,12 @@ class DeepWorker:
             )
 
             # Hard cap per attempt: 75s covers launch + 60s poll + settle.
-            # Re-derive it from the message's remaining page budget on EVERY
-            # attempt: a fixed 75s ignored what was left, so attempt 2 could
-            # start with 70s on the clock, get cancelled mid-poll by the
-            # 240s wrapper, and attempt 3 never got to run at all — the whole
-            # site then died on "page budget exceeded" with attempts left.
-            _remaining = _remaining_message_budget()
-            if _remaining is not None:
-                if _remaining < 45.0:
-                    logger.warning(
-                        "[%s] Only %.0fs of page budget left — skipping further "
-                        "Camoufox attempts (best content so far: %d chars)",
-                        job_id, _remaining, len(best_content),
-                    )
-                    break
-                _attempt_cap = min(75.0, _remaining - 5.0)
-            else:
-                _attempt_cap = 75.0
+            # Without this, a single slow attempt can exhaust the 240s budget.
+            _attempt_cap = 75.0
             # Hoisted so the finally block can always restore env vars,
             # even when asyncio.timeout fires before _cam_env is applied.
             _orig_environ: dict[str, str | None] = {}
-            # Bound before the try so the finally block can always release it.
-            _slot_acquired = False
             try:
-                # Every in-flight fallback is a SECOND headful browser on top
-                # of the job's Chromium context. Past a couple of them the
-                # container runs out of memory and everything degrades at once,
-                # so fallbacks queue for a slot instead of piling up.
-                try:
-                    await asyncio.wait_for(
-                        _camoufox_slots.acquire(), timeout=30.0
-                    )
-                    _slot_acquired = True
-                except (asyncio.TimeoutError, TimeoutError):
-                    logger.warning(
-                        "[%s] No Camoufox slot free within 30s — another "
-                        "job's fallback is still holding the memory budget; "
-                        "returning the best Patchright content",
-                        job_id,
-                    )
-                    break
                 async with asyncio.timeout(_attempt_cap):
                     # Access AsyncCamoufox via sys.modules at call time so
                     # monkeypatching in tests (and runtime hot-swap) takes effect.
@@ -1745,12 +1352,19 @@ class DeepWorker:
                     # 1x1 px on Linux (daijro/camoufox#458), so the real
                     # window/compositor and GL surface are degenerate even though
                     # Camoufox still spoofs the JS-visible screen metrics. Our own
-                    # Xvfb is a true 1920x1080 display. Sharing that one display across
-                    # concurrent fallbacks was measured and found harmless (2/2
-                    # logins on :99, 2/2 on private displays, same wall time) —
-                    # the real ceiling is memory, which is what the semaphore
-                    # above bounds.
-                    async with _AsyncCamoufox(**_launch_kwargs) as cf_browser:
+                    # Xvfb is a true 1920x1080 display.
+                    async with _AsyncCamoufox(
+                        headless=False,
+                        humanize=True,
+                        os=os_name,
+                        screen=Screen(
+                            max_width=screen_size[0],
+                            max_height=screen_size[1],
+                        ),
+                        window=(window_size[0], window_size[1]),
+                        locale=locale,
+                        **({"webgl_config": webgl_config} if webgl_config else {}),
+                    ) as cf_browser:
                         cf_page = await cf_browser.new_page()
 
                         try:
@@ -1780,32 +1394,13 @@ class DeepWorker:
                         cf_cleared = False
                         _poll_elapsed = 0.0
                         _poll_interval = 1.0
-                        # The poll must fit inside the attempt cap with room
-                        # for launch and close, or the cap fires while the
-                        # browser is still waiting on the challenge.
-                        _max_poll = max(20.0, min(60.0, _attempt_cap - 15.0))
-                        _widget_clicked = False
+                        _max_poll = 60.0
                         while _poll_elapsed < _max_poll:
                             await asyncio.sleep(_poll_interval)
                             _poll_elapsed += _poll_interval
                             if not await _is_cloudflare_challenge(cf_page):
                                 cf_cleared = True
                                 break
-                            # Interactive challenges need a click — polling
-                            # alone times out on them (the Patchright path
-                            # already clicks; this used to be the one path
-                            # that never did).
-                            if _poll_elapsed >= 8.0 and not _widget_clicked:
-                                try:
-                                    _widget_clicked = await _click_turnstile_widget(cf_page)
-                                except Exception as click_err:
-                                    # Mark as attempted so a page object without
-                                    # the full API does not retry every second.
-                                    _widget_clicked = True
-                                    logger.debug(
-                                        "[%s] Camoufox widget click failed: %s",
-                                        job_id, click_err,
-                                    )
                             if _poll_elapsed >= 10.0 and await _cf_verification_success_stuck(cf_page):
                                 logger.info(
                                     "[%s] Camoufox attempt %d: verification passed but "
@@ -1869,14 +1464,6 @@ class DeepWorker:
                                 "[%s] Running configured portal login inside Camoufox",
                                 job_id,
                             )
-                            # The login form is often Turnstile-gated — that is
-                            # frequently WHY we came through Camoufox. Both
-                            # handlers below submit the form the instant it is
-                            # filled, and a token-less submit is rejected
-                            # server-side with 419 PAGE EXPIRED, so wait for the
-                            # token first. It arrives on its own in Camoufox
-                            # (7.1s measured on scrapingcourse.com).
-                            await _ensure_turnstile_token(cf_page, timeout=20.0)
                             portal_result = await PortalHandler(
                                 cf_page, portal_config
                             ).run(credentials)
@@ -1885,9 +1472,6 @@ class DeepWorker:
                                 self.camoufox_portal_data = dict(
                                     portal_result.get("extracted_data", {})
                                 )
-                                self.camoufox_portal_text = (
-                                    portal_result.get("rendered_text") or ""
-                                )
                                 logger.info(
                                     "[%s] Camoufox portal login succeeded",
                                     job_id,
@@ -1895,19 +1479,6 @@ class DeepWorker:
                             else:
                                 logger.warning(
                                     "[%s] Camoufox portal login did not succeed",
-                                    job_id,
-                                )
-                        elif turnstile_gate and credentials:
-                            # No portal config, but the form on this page is
-                            # Turnstile-gated. Run the generic login here rather
-                            # than on the Chromium page, which cannot hold a
-                            # token to submit it with.
-                            await _ensure_turnstile_token(cf_page, timeout=20.0)
-                            if await self.handle_login(cf_page, credentials):
-                                self.camoufox_authenticated = True
-                                logger.info(
-                                    "[%s] Camoufox generic login submitted on a "
-                                    "Turnstile-gated page",
                                     job_id,
                                 )
 
@@ -2039,9 +1610,6 @@ class DeepWorker:
                         os.environ.pop(_env_key, None)
                     else:
                         os.environ[_env_key] = _env_val
-                # Hand the memory slot back so a queued fallback can start.
-                if _slot_acquired:
-                    _camoufox_slots.release()
 
         return best_response, best_content
 
@@ -2201,29 +1769,10 @@ class DeepWorker:
             portal_structured_data: dict[str, object] = {}
             rendered_text: str = ""
 
-            # --- Auth gating -------------------------------------------------------
-            # Auto-login/auto-signup must only run (and only be announced) on
-            # pages that are actually a login/signup page: a password field in
-            # the DOM or an auth-shaped URL. Without this, every page of a
-            # crawl re-ran portal login steps and published "logging in" /
-            # "signing up" stages — including pages still sitting behind a
-            # challenge — which is exactly what users saw in site progress.
-            _has_auth_form = False
-            try:
-                _has_auth_form = (
-                    await page.query_selector(
-                        "input[type='password'], input[name='password']"
-                    )
-                    is not None
-                )
-            except Exception:
-                pass
-            _auth_page = _has_auth_form or _is_login_like_url(url)
-
             # --- Auto-signup handler (optional pre-crawl step) ---
             auto_signup_enabled = bool(payload.get("auto_signup"))  # type: ignore[arg-type]
             auto_signup_credential_email = payload.get("credential_email")  # type: ignore[arg-type]
-            if auto_signup_enabled and _auth_page and not self.camoufox_authenticated:
+            if auto_signup_enabled and not self.camoufox_authenticated:
                 # If Cloudflare is still blocking, try one more aggressive solve attempt
                 if is_still_challenge:
                     logger.info("[%s] Cloudflare still blocking — attempting pre-signup solve", job_id)
@@ -2334,31 +1883,14 @@ class DeepWorker:
             # Skip the generic login block when the signup handler already ran:
             # its result covers both signup and login, and re-running login on a
             # page with no form produced misleading "Login form submitted" stages.
-            # Also skip it entirely on pages that are not login pages at all —
-            # a crawl with credentials enabled must not attempt (or announce)
-            # a login on every URL it visits.
             _signup_ran = _last_signup_result is not None
             if (
                 not self.camoufox_authenticated
                 and not is_still_challenge
                 and credentials
                 and not _signup_ran
-                and _auth_page
             ):
                 await self._log_page_state(page, job_id, "pre_login")
-
-                # A Turnstile-gated form is not a challenge interstitial —
-                # nothing else solves it on this path, and submitting without
-                # a token is rejected server-side. Skipped once the gate has
-                # already been handed to Camoufox: this Chromium page never
-                # gets a token, so waiting again would just burn the budget.
-                if _has_auth_form and not self.turnstile_handed_off:
-                    await _ensure_turnstile_token(page)
-                if _has_auth_form:
-                    await publish_job_stage(
-                        job_id=job_id, url=url, stage="login", state="active",
-                        detail="Login page found — logging in",
-                    )
 
                 if portal_config:
                     # Use portal handler for config-driven login + navigation + extraction
@@ -2389,22 +1921,17 @@ class DeepWorker:
                         detail="Portal login " + ("succeeded" if portal_result.get("login_successful") else "failed"),
                     )
                 else:
-                    # Fallback: generic login. handle_login reports whether it
-                    # actually found a form and submitted it — publish the stage
-                    # only then, so pages without a real login form (or with a
-                    # form that could not be filled) never claim "Login form
-                    # submitted" in site progress.
-                    submitted = await self.handle_login(page, credentials)
-                    if submitted:
-                        await publish_job_stage(job_id=job_id, url=url, stage="login", state="passed", detail="Login form submitted")
-                        # Wait for post-login JS rendering (SPA product pages)
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=20_000)
-                        except Exception:
-                            logger.debug("[%s] networkidle timed out after login", job_id)
-                        # Extra settle time for dynamic content
-                        await asyncio.sleep(3.0)
-                        content = await page.content()
+                    # Fallback: generic login (existing behavior)
+                    await self.handle_login(page, credentials)
+                    await publish_job_stage(job_id=job_id, url=url, stage="login", state="passed", detail="Login form submitted")
+                    # Wait for post-login JS rendering (SPA product pages)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=20_000)
+                    except Exception:
+                        logger.debug("[%s] networkidle timed out after login", job_id)
+                    # Extra settle time for dynamic content
+                    await asyncio.sleep(3.0)
+                    content = await page.content()
 
                 # --- Diagnostic after login ---
                 await self._log_page_state(page, job_id, "post_login")
@@ -2415,50 +1942,20 @@ class DeepWorker:
                     job_id,
                 )
                 portal_structured_data = self.camoufox_portal_data
-                # Prefer the text the portal handler read while it was still on
-                # the rendered, authenticated page.
-                if (
-                    self.camoufox_portal_text
-                    and len(self.camoufox_portal_text) > len(rendered_text)
-                ):
-                    rendered_text = self.camoufox_portal_text
             elif is_still_challenge:
-                # `is_still_challenge` is read from the *Patchright* page, which
-                # can remain on the interstitial even when Camoufox cleared the
-                # challenge and supplied the content we are about to extract.
-                # Only call it a failure when the captured content is itself the
-                # interstitial; otherwise the job succeeded and a failed stage
-                # here would show the challenge as failed in the UI.
-                if _html_is_still_challenge_page(content):
-                    logger.warning(
-                        "[%s] Page is STILL a Cloudflare challenge after all retries — "
-                        "skipping login.",
-                        job_id,
-                    )
-                    await publish_job_stage(
-                        job_id=job_id, url=url, stage="challenge", state="failed",
-                        detail="Cloudflare challenge could not be cleared",
-                    )
-                else:
-                    logger.info(
-                        "[%s] Patchright page is still on the interstitial, but "
-                        "cleared content was captured via Camoufox — using it "
-                        "without login.",
-                        job_id,
-                    )
+                logger.warning(
+                    "[%s] Page is STILL a Cloudflare challenge after all retries — "
+                    "skipping login.",
+                    job_id,
+                )
+                await publish_job_stage(
+                    job_id=job_id, url=url, stage="challenge", state="failed",
+                    detail="Cloudflare challenge could not be cleared",
+                )
 
             # --- Extract JS-rendered visible text (for SPAs / dynamic content) ---
             rendered_text: str = ""
-            if used_camoufox_content:
-                # Whenever the Camoufox capture is the content we are going to
-                # store, its text MUST come from that same HTML. Reading
-                # document.body.innerText instead reads the live Chromium page,
-                # which is still parked on whatever page Chromium could not get
-                # past — so a Turnstile-gated login stored the 209-char login
-                # form text while the real 13,198-char authenticated dashboard
-                # was silently discarded. The `and still_challenge` guard that
-                # used to be here only covered the interstitial case, leaving
-                # every other Camoufox capture with stale, pre-auth text.
+            if used_camoufox_content and still_challenge:
                 try:
                     from bs4 import BeautifulSoup
 
@@ -2900,19 +2397,12 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                     "username": stored.get("username") or stored.get("email"),
                     "password": stored["password"],
                 }
-                logger.info("[%s] Reusing stored credential for %s", request.job_id, _hostname)
-                # Announce the login only when this URL is actually a login
-                # page. Publishing it for every crawled URL made site progress
-                # claim "logging in" across the whole crawl — including before
-                # any challenge had been passed. Non-login URLs get their
-                # "login" stage from process_job, at the moment the form on a
-                # real login page is actually being filled.
-                if _is_login_like_url(request.url):
-                    await publish_job_stage(
-                        job_id=request.job_id, url=request.url, item_id=item_id,
-                        stage="login", state="active",
-                        detail=f"Stored credential found for {_hostname} — logging in",
-                    )
+                logger.info(                "[%s] Reusing stored credential for %s", request.job_id, _hostname)
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, item_id=item_id,
+                stage="login", state="active",
+                detail=f"Stored credential found for {_hostname} — logging in",
+            )
         if not request.job_params.get("credentials") and request.job_params.get("allow_signup"):
             # Full-auto signup: synthesize a new identity (dukaXXXXX / Duka@12345).
             # auto_signup_handler persists it to credential_usage after a
@@ -2945,15 +2435,11 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 request.job_id, _hostname, _gen_user,
                 request.job_params["auto_signup_email"],
             )
-            # Same gating as login: only announce a signup on a signup- or
-            # login-shaped URL — the attempt itself (in process_job) also
-            # requires a real auth page, so other URLs stay silent.
-            if _is_login_like_url(request.url):
-                await publish_job_stage(
-                    job_id=request.job_id, url=request.url, item_id=item_id,
-                    stage="signup", state="active",
-                    detail=f"No stored credential — signing up as {_gen_user}",
-                )
+            await publish_job_stage(
+                job_id=request.job_id, url=request.url, item_id=item_id,
+                stage="signup", state="active",
+                detail=f"No stored credential — signing up as {_gen_user}",
+            )
 
     # Build the payload for the browser renderer
     payload: dict[str, object] = {
@@ -3482,18 +2968,10 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
     error as its failure reason, so a crash never leaves the job stuck in
     ``running`` forever (the API-side watchdog is the last resort). A page
     that hangs (dead browser socket, endless challenge loop) is cancelled at
-    ``DEEP_MESSAGE_BUDGET_SECONDS`` and closed out as a PER-SITE failure —
-    one slow site must not stall the whole job behind the semaphore, and it
-    must not flip a partially-successful recursive crawl to ``failed`` either:
-    the outcome rules in ``pg_client.complete_job_task`` decide the job's
-    status from what actually completed.
+    ``DEEP_MESSAGE_BUDGET_SECONDS`` and the site is closed out as failed —
+    one slow site must not stall the whole job behind the semaphore.
     """
     failed_reason: str | None = None
-    # True only when this message must take the whole job down with it (an
-    # exception escaping process_request). A page that merely ran out of its
-    # time budget is a per-page failure: its site timeline closes as failed,
-    # the reason lands in crawl_log, and sibling pages keep their results.
-    fatal = False
     async with _semaphore:
         # Publish this message's page-budget deadline so optional work (such as
         # a Camoufox browser repair) can tell how much time the job has left
@@ -3531,30 +3009,9 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
                 except Exception:
                     pass
                 if owns_message(message_value, WORKER_TYPE):
-                    # Record the per-page failure (with the reason) instead of
-                    # failing the job: sibling pages of the same crawl are
-                    # unaffected and the job can still complete. The job only
-                    # ends up failed when NO page completed — decided by the
-                    # last settling message in complete_job_task.
-                    try:
-                        await pg_client.record_crawl_log(
-                            job_id,
-                            None,
-                            url or "",
-                            WORKER_TYPE,
-                            "browser_render",
-                            "failed",
-                            0,
-                            details=failed_reason or "page budget exceeded",
-                        )
-                    except Exception as log_err:
-                        logger.warning(
-                            "[%s] Could not record budget failure: %s",
-                            job_id, log_err,
-                        )
+                    await fail_job_from_message(WORKER_TYPE, message_value, failed_reason)
         except Exception as exc:
             logger.exception("Deep-worker message task failed")
-            fatal = True
             failed_reason = f"Deep worker crashed while processing: {exc}"
             if owns_message(message_value, WORKER_TYPE):
                 await fail_job_from_message(
@@ -3569,7 +3026,7 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
             await complete_job_task_from_message(
                 message_value,
                 worker_type=WORKER_TYPE,
-                failed=fatal,
+                failed=failed_reason is not None,
                 fail_reason=failed_reason,
             )
 

@@ -292,6 +292,16 @@ class PostgreSQLClient:
                 "FROM users ORDER BY created_at DESC"
             )
 
+    async def list_admin_emails(self):
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT email FROM users WHERE role = 'admin' AND is_active = TRUE "
+                "AND email_verified = TRUE AND email <> ''"
+            )
+        return [row["email"] for row in rows]
+
     async def update_user_profile(self, user_id: str, *, full_name: str | None, email: str | None, password_hash: str | None):
         if not self.system_pool:
             raise RuntimeError("Database not connected")
@@ -1015,6 +1025,23 @@ class PostgreSQLClient:
             await self.update_job_status(job_id, "failed")
         except Exception as exc:
             logger.error("Could not mark job %s failed: %s", job_id, exc)
+        try:
+            from app.services.alert_service import notify_system_alert_email, record_system_alert
+
+            alert_id = await record_system_alert(
+                dedupe_key=f"job-failed:{job_id}:{event_type}",
+                title="Crawl job failed",
+                summary=(
+                    f"Job {job_id} was marked failed by {worker_type}. "
+                    f"{(reason or 'No failure reason was recorded').strip()}"
+                )[:2000],
+                category="job_failure",
+                entities=[job_id, worker_type],
+            )
+            if alert_id:
+                await notify_system_alert_email(alert_id)
+        except Exception as exc:
+            logger.warning("Could not raise system alert for failed job %s: %s", job_id, exc)
 
     async def get_stale_running_jobs(self, max_inactive_seconds: float) -> list[dict]:
         """Return non-terminal jobs with no activity for *max_inactive_seconds*.
@@ -1123,10 +1150,10 @@ class PostgreSQLClient:
 
         async with self.system_pool.acquire() as conn:
             row = await conn.fetchrow(
-                """INSERT INTO alerts
-                       (job_id, item_id, url, title, category, severity, language,
+                 """INSERT INTO alerts
+                       (alert_type, job_id, item_id, url, title, category, severity, language,
                         summary, entities, analysis_source, llm_model)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)
+                    VALUES ('threat',$1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)
                    ON CONFLICT (item_id) DO UPDATE SET
                        job_id = EXCLUDED.job_id,
                        url = EXCLUDED.url,
@@ -1145,6 +1172,34 @@ class PostgreSQLClient:
             )
         return row["alert_id"]
 
+    async def insert_system_alert(
+        self,
+        *,
+        dedupe_key: str,
+        title: str,
+        summary: str,
+        category: str = "system",
+        severity: int = 3,
+        entities: list[str] | None = None,
+    ) -> str | None:
+        """Insert one admin-only operational alert; duplicate events are ignored."""
+        if not self.system_pool:
+            await self.connect()
+        import json as _json
+
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO alerts
+                       (alert_type, job_id, item_id, url, title, category, severity,
+                        summary, entities, analysis_source, llm_model)
+                   VALUES ('system', NULL, $1, '', $2, $3, $4, $5, $6::jsonb, 'system', '')
+                   ON CONFLICT (item_id) DO NOTHING
+                   RETURNING alert_id""",
+                dedupe_key, title, category, int(severity), summary or "",
+                _json.dumps(entities or [], ensure_ascii=False),
+            )
+        return row["alert_id"] if row else None
+
     async def list_alerts(
         self,
         *,
@@ -1154,6 +1209,7 @@ class PostgreSQLClient:
         minimum_severity: int = 4,
         limit: int = 50,
         offset: int = 0,
+        alert_type: str = "all",
     ) -> tuple[list, int]:
         """Page the caller's alerts, newest first, with the total count.
 
@@ -1170,24 +1226,28 @@ class PostgreSQLClient:
             # $4. asyncpg refuses to prepare a query with a skipped, unbound
             # placeholder ("could not determine data type of parameter $3").
             count_scope, count_params = self._alert_scope(job_ids, start_index=3)
+            count_type = "" if alert_type == "all" else f" AND a.alert_type = ${3 + len(count_params)}"
             total = await conn.fetchval(
                 f"""SELECT COUNT(*)
                       FROM alerts a
                  LEFT JOIN alert_reads ar
                         ON ar.alert_id = a.alert_id AND ar.user_id = $1
-                     WHERE a.severity >= $2{count_scope}{unread}""",
-                user_id, int(minimum_severity), *count_params,
+                     WHERE (a.alert_type = 'system' OR a.severity >= $2){count_scope}{count_type}{unread}""",
+                 user_id, int(minimum_severity), *count_params,
+                 *((alert_type,) if alert_type != "all" else ()),
             )
             page_scope, page_params = self._alert_scope(job_ids, start_index=5)
+            page_type = "" if alert_type == "all" else f" AND a.alert_type = ${5 + len(page_params)}"
             rows = await conn.fetch(
                 f"""SELECT a.*, (ar.alert_id IS NOT NULL) AS is_read
                       FROM alerts a
                  LEFT JOIN alert_reads ar
                         ON ar.alert_id = a.alert_id AND ar.user_id = $1
-                     WHERE a.severity >= $2{unread}{page_scope}
+                     WHERE (a.alert_type = 'system' OR a.severity >= $2){unread}{page_scope}{page_type}
                      ORDER BY a.created_at DESC, a.alert_id DESC
                      LIMIT $3 OFFSET $4""",
-                user_id, int(minimum_severity), int(limit), int(offset), *page_params,
+                 user_id, int(minimum_severity), int(limit), int(offset), *page_params,
+                 *((alert_type,) if alert_type != "all" else ()),
             )
         return list(rows), int(total or 0)
 
@@ -1205,7 +1265,7 @@ class PostgreSQLClient:
         """
         if job_ids is None:
             return "", ()
-        return f" AND a.job_id = ANY(${start_index}::text[])", (sorted(job_ids),)
+        return f" AND a.alert_type = 'threat' AND a.job_id = ANY(${start_index}::text[])", (sorted(job_ids),)
 
     async def count_unread_alerts(
         self, *, user_id: str, job_ids: set[str] | None
@@ -1221,7 +1281,7 @@ class PostgreSQLClient:
                       FROM alerts a
                  LEFT JOIN alert_reads ar
                         ON ar.alert_id = a.alert_id AND ar.user_id = $1
-                     WHERE a.severity >= 4{scope}
+                       WHERE (a.alert_type = 'system' OR a.severity >= 4){scope}
                        AND ar.alert_id IS NULL""",
                 user_id, *scope_params,
             )
@@ -1275,7 +1335,7 @@ class PostgreSQLClient:
                     SELECT a.alert_id, $1 FROM alerts a
                  LEFT JOIN alert_reads ar
                         ON ar.alert_id = a.alert_id AND ar.user_id = $1
-                    WHERE a.severity >= 4{scope} AND ar.alert_id IS NULL
+                    WHERE (a.alert_type = 'system' OR a.severity >= 4){scope} AND ar.alert_id IS NULL
                     ON CONFLICT (alert_id, user_id) DO NOTHING""",
                 user_id, *scope_params,
             )
@@ -2256,7 +2316,8 @@ class PostgreSQLClient:
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS alerts (
     alert_id VARCHAR(24) PRIMARY KEY DEFAULT ('ALR' || LPAD(nextval('alert_seq')::TEXT, 14, '0')),
-    job_id VARCHAR(20) NOT NULL,
+    alert_type VARCHAR(16) NOT NULL DEFAULT 'threat',
+    job_id VARCHAR(20),
     item_id VARCHAR(20) NOT NULL,
     url TEXT NOT NULL,
     title TEXT DEFAULT '',
@@ -2273,12 +2334,19 @@ class PostgreSQLClient:
 """
             )
             await conn.execute(
+                "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS alert_type VARCHAR(16) NOT NULL DEFAULT 'threat'"
+            )
+            await conn.execute("ALTER TABLE alerts ALTER COLUMN job_id DROP NOT NULL")
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts (created_at DESC)"
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts (severity DESC, created_at DESC)"
             )
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_job ON alerts (job_id)")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts (alert_type, created_at DESC)"
+            )
 
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS alert_reads (

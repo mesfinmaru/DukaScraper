@@ -14,11 +14,12 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Link, useSearchParams } from "react-router-dom"
-import { AlertTriangle, BellOff, CheckCheck, ExternalLink, ShieldAlert } from "lucide-react"
+import { AlertTriangle, ExternalLink, ShieldAlert } from "lucide-react"
 import { api } from "../api"
+import { useAuth } from "../config"
 import { DEFAULT_REFRESH_MS, useAutoRefresh } from "../useAutoRefresh"
 import type { AlertRow } from "../types"
-import { EmptyState, ErrorBanner, LoadingBlock, PageHeader, Spinner } from "../components/ui"
+import { EmptyState, ErrorBanner, LoadingBlock, PageHeader } from "../components/ui"
 import { cn } from "../utils"
 
 const PAGE_SIZE = 25
@@ -29,6 +30,7 @@ const SEEN_MARGIN_PX = 120
 const PRIORITY_STYLES: Record<string, string> = {
   critical: "border-rose-500/50 bg-rose-500/15 text-rose-300",
   high: "border-amber-500/50 bg-amber-500/15 text-amber-300",
+  system: "border-cyan-500/50 bg-cyan-500/15 text-cyan-300",
   low: "border-slate-600 bg-slate-800/60 text-slate-400",
 }
 
@@ -60,12 +62,14 @@ function timeAgo(iso: string | null): string {
 }
 
 export default function Alerts() {
+  const { session } = useAuth()
   const [params] = useSearchParams()
   const focusId = params.get("alert")
 
   const [rows, setRows] = useState<AlertRow[]>([])
   const [total, setTotal] = useState(0)
   const [offset, setOffset] = useState(0)
+  const [alertType, setAlertType] = useState<"all" | "threat" | "system">("all")
   const [unreadOnly, setUnreadOnly] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -78,6 +82,7 @@ export default function Alerts() {
   const fetchPage = useCallback(
     async (nextOffset: number, replace: boolean) => {
       const data = await api.getAlerts({
+        alert_type: alertType,
         limit: PAGE_SIZE,
         offset: nextOffset,
         unread_only: unreadOnly,
@@ -87,7 +92,7 @@ export default function Alerts() {
       setRows((prev) => (replace ? data.alerts : [...prev, ...data.alerts]))
       return data.alerts
     },
-    [unreadOnly],
+    [alertType, unreadOnly],
   )
 
   const load = useCallback(async () => {
@@ -184,12 +189,14 @@ export default function Alerts() {
   }
 
   const unreadCount = rows.filter((r) => !r.read).length
+  const alertTabs: Array<"all" | "threat" | "system"> =
+    session?.user.role === "admin" ? ["all", "threat", "system"] : ["all", "threat"]
 
   return (
     <div>
       <PageHeader
         title="Alerts"
-        description="High-severity (4 and 5) findings raised by the analysis pipeline. Everything here already scored above the noise floor; nothing below severity 4 is recorded."
+        description="A single operational inbox for threat findings and system incidents. Threats stay scoped to your jobs; system incidents are visible to administrators."
         actions={
           <>
             <button
@@ -211,12 +218,31 @@ export default function Alerts() {
               title="Clear the unread badge"
               className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {marking ? <Spinner className="h-3 w-3" /> : <CheckCheck className="h-3.5 w-3.5" />}
               Mark all read
             </button>
           </>
         }
       />
+
+      <div className="mb-4 flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-slate-950/70 p-1">
+        {alertTabs.map((type) => (
+          <button
+            key={type}
+            type="button"
+            onClick={() => setAlertType(type)}
+            className={cn(
+              "cursor-pointer rounded-md px-3 py-1.5 text-xs font-semibold transition",
+              alertType === type
+                ? type === "system"
+                  ? "bg-cyan-500/15 text-cyan-300"
+                  : "bg-indigo-500/15 text-indigo-300"
+                : "text-slate-500 hover:bg-white/5 hover:text-slate-300",
+            )}
+          >
+            {type === "all" ? "All alerts" : type === "threat" ? "Threat alerts" : "System alerts"}
+          </button>
+        ))}
+      </div>
 
       {error && <ErrorBanner message={error} onRetry={() => void load()} />}
 
@@ -241,9 +267,9 @@ export default function Alerts() {
           <LoadingBlock label="Loading alerts" />
         ) : rows.length === 0 ? (
           <EmptyState
-            icon={<BellOff className="h-8 w-8" />}
-            title={unreadOnly ? "No unread alerts" : "No high-severity alerts"}
-            hint="Alerts appear when the analysis pipeline classifies a finding as severity 4 or 5."
+            icon={<AlertTriangle className="h-8 w-8" />}
+            title={unreadOnly ? "No unread alerts" : alertType === "system" ? "No system alerts" : alertType === "threat" ? "No threat alerts" : "No alerts"}
+            hint={alertType === "system" ? "System incidents such as failed or crashed jobs appear here for administrators." : "Threat alerts appear when the analysis pipeline identifies a high-severity finding."}
           />
         ) : (
           rows.map((a) => (
@@ -253,13 +279,20 @@ export default function Alerts() {
                 "rounded-lg border p-3 transition",
                 a.read
                   ? "border-slate-800 bg-slate-900/30 opacity-70"
-                  : "border-indigo-500/30 bg-slate-900/70 ring-1 ring-indigo-500/10",
+                  : a.alert_type === "system"
+                    ? "border-cyan-500/40 bg-cyan-950/20 ring-1 ring-cyan-500/10"
+                    : "border-indigo-500/30 bg-slate-900/70 ring-1 ring-indigo-500/10",
+                a.alert_id === focusId && "ring-2 ring-amber-400/60",
               )}
+              id={`alert-${a.alert_id}`}
             >
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <SeverityPill severity={a.severity} priority={a.priority} />
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                      {a.alert_type === "system" ? "System alert" : "Threat alert"}
+                    </span>
                     <span className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
                       {a.category.replace(/_/g, " ") || "uncategorised"}
                     </span>
@@ -275,9 +308,10 @@ export default function Alerts() {
                   <h2 className="mt-1.5 text-sm font-semibold text-slate-100">
                     {a.title || a.url}
                   </h2>
-                  {a.short_summary && a.short_summary !== a.title && (
-                    <p className="mt-1 text-xs leading-relaxed text-slate-400">{a.short_summary}</p>
-                  )}
+                  <div className="mt-2 rounded-md border border-slate-800/80 bg-black/20 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Summary</div>
+                    <p className="mt-1 text-sm leading-relaxed text-slate-200">{a.short_summary}</p>
+                  </div>
                 </div>
                 <span className="shrink-0 text-[11px] text-slate-600">{timeAgo(a.created_at)}</span>
               </div>
@@ -308,13 +342,17 @@ export default function Alerts() {
                   <ExternalLink className="h-3 w-3" />
                   Source
                 </a>
-                <Link
-                  to={`/jobs/${a.job_id}/articles`}
-                  className="text-slate-400 hover:text-indigo-400"
-                >
-                  Job articles
-                </Link>
-                <span className="font-mono text-slate-600">{a.job_id}</span>
+                {a.job_id && (
+                  <>
+                    <Link
+                      to={`/jobs/${a.job_id}/articles`}
+                      className="text-slate-400 hover:text-indigo-400"
+                    >
+                      Job articles
+                    </Link>
+                    <span className="font-mono text-slate-600">{a.job_id}</span>
+                  </>
+                )}
                 {a.analysis_source !== "llm" && (
                   <span
                     className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-amber-400"
