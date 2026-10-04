@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
 import { AlertTriangle, Check, Copy, Inbox, Loader2, X } from "lucide-react"
 import type { JobStatus } from "../types"
@@ -10,7 +10,7 @@ export function Spinner({ className }: { className?: string }) {
 
 export function LoadingBlock({ label = "Loading..." }: { label?: string }) {
   return (
-    <div className="flex items-center justify-center gap-3 py-16 text-slate-500">
+    <div className="flex items-center justify-center gap-3 py-12 text-slate-500">
       <Spinner className="h-5 w-5" />
       <span className="text-sm">{label}</span>
     </div>
@@ -19,20 +19,39 @@ export function LoadingBlock({ label = "Loading..." }: { label?: string }) {
 
 export function ErrorBanner({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-      <div className="flex items-start gap-3">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" aria-hidden />
-        <p className="text-sm break-words text-rose-300">{message}</p>
-      </div>
+    <div className="msg msg-error items-center px-4 py-3 text-sm sm:justify-between">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+      <p className="min-w-0 flex-1 break-words">{message}</p>
       {onRetry && (
         <button
           type="button"
           onClick={onRetry}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/50 bg-black px-3 py-1.5 text-xs font-semibold text-rose-400 transition hover:bg-rose-500/20"
+          className="btn-secondary shrink-0 px-3 py-1.5 text-xs"
         >
-          Retry
+          Try again
         </button>
       )}
+    </div>
+  )
+}
+
+/** Inline message box. `tone` picks the palette; both themes get a readable
+ *  pairing from the .msg-* rules in index.css. */
+export function Msg({
+  tone = "error",
+  children,
+  className,
+}: {
+  tone?: "error" | "success" | "warn"
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <div
+      role={tone === "error" ? "alert" : "status"}
+      className={cn("msg", `msg-${tone}`, className)}
+    >
+      {children}
     </div>
   )
 }
@@ -47,7 +66,7 @@ export function EmptyState({
   icon?: ReactNode
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
+    <div className="flex flex-col items-center justify-center gap-2 px-6 py-10 text-center">
       <div className="text-slate-600">{icon ?? <Inbox className="h-8 w-8" />}</div>
       <p className="text-sm font-medium text-slate-300">{title}</p>
       {hint && <p className="max-w-md text-xs text-slate-500">{hint}</p>}
@@ -63,6 +82,12 @@ const STATUS_STYLES: Record<JobStatus, { label: string; className: string }> = {
   running: {
     label: "Running",
     className: "border border-sky-500/40 bg-sky-500/10 text-sky-600",
+  },
+  paused: {
+    label: "Paused",
+    // Slate rather than amber: amber already means "waiting to start", and a
+    // paused job is neither pending nor active.
+    className: "border border-slate-500/40 bg-slate-500/10 text-slate-400",
   },
   completed: {
     label: "Completed",
@@ -148,24 +173,77 @@ export function CopyButton({ value, label }: { value: string; label?: string }) 
   )
 }
 
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
 export function Modal({
   open,
   onClose,
   title,
   children,
+  hideClose,
 }: {
   open: boolean
   onClose: () => void
   title: string
   children: ReactNode
+  /** Confirmation dialogs send focus to their primary button instead, so the
+   *  corner X would be a redundant stop in the tab order. */
+  hideClose?: boolean
 }) {
+  const panelRef = useRef<HTMLDivElement>(null)
+
   useEffect(() => {
     if (!open) return
+    // Remember where focus came from so closing returns the user to the button
+    // they pressed - important for keyboard and screen-reader users.
+    const restoreTo = document.activeElement as HTMLElement | null
+    const { overflow } = document.body.style
+    document.body.style.overflow = "hidden"
+
+    // Wait a frame so the panel is laid out before we reach into it.
+    const raf = requestAnimationFrame(() => {
+      const panel = panelRef.current
+      if (!panel) return
+      const target =
+        panel.querySelector<HTMLElement>("[data-autofocus]") ??
+        panel.querySelector<HTMLElement>(FOCUSABLE)
+      target?.focus()
+    })
+
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose()
+      if (e.key === "Escape") {
+        e.stopPropagation()
+        onClose()
+        return
+      }
+      if (e.key !== "Tab") return
+      // Cycle focus inside the dialog instead of escaping to the page behind.
+      const panel = panelRef.current
+      if (!panel) return
+      const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+        (el) => el.offsetParent !== null,
+      )
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement
+      if (e.shiftKey && (active === first || !panel.contains(active))) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault()
+        first.focus()
+      }
     }
-    window.addEventListener("keydown", onKey)
-    return () => window.removeEventListener("keydown", onKey)
+
+    document.addEventListener("keydown", onKey, true)
+    return () => {
+      cancelAnimationFrame(raf)
+      document.removeEventListener("keydown", onKey, true)
+      document.body.style.overflow = overflow
+      restoreTo?.focus?.()
+    }
   }, [open, onClose])
 
   if (!open) return null
@@ -173,22 +251,120 @@ export function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="card relative z-10 w-full max-w-md p-6 shadow-xl">
-        <div className="mb-4 flex items-center justify-between">
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className="card relative z-10 w-full max-w-md p-6 shadow-xl"
+      >
+        <div className="mb-4 flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold text-slate-100">{title}</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="rounded-md p-1 text-slate-500 transition hover:bg-slate-900 hover:text-slate-200"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          {!hideClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="rounded-md p-1 text-slate-500 transition hover:bg-slate-900 hover:text-slate-200"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
         </div>
         {children}
       </div>
     </div>
   )
+}
+
+export type ConfirmOptions = {
+  title: string
+  /** One short sentence. Keep it plain - the reader is not a developer. */
+  message: ReactNode
+  confirmLabel?: string
+  cancelLabel?: string
+  /** "danger" paints the confirm button red, for deletes and sign-outs. */
+  tone?: "danger" | "default"
+}
+
+export function ConfirmDialog({
+  options,
+  onConfirm,
+  onCancel,
+}: {
+  options: ConfirmOptions | null
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  if (!options) return null
+  const {
+    title,
+    message,
+    confirmLabel = "Yes",
+    cancelLabel = "Cancel",
+    tone = "default",
+  } = options
+  return (
+    <Modal open onClose={onCancel} title={title} hideClose>
+      <p className="text-sm leading-relaxed text-slate-300">{message}</p>
+      <div className="mt-6 flex justify-end gap-2">
+        <button type="button" className="btn-secondary" onClick={onCancel}>
+          {cancelLabel}
+        </button>
+        <button
+          type="button"
+          data-autofocus
+          className={tone === "danger" ? "btn-danger" : "btn-primary"}
+          onClick={onConfirm}
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </Modal>
+  )
+}
+
+/**
+ * Promise-based replacement for `window.confirm`.
+ *
+ *   const { confirm, confirmDialog } = useConfirm()
+ *   if (!(await confirm({ title: "Delete user?", message: "...", tone: "danger" }))) return
+ *   ...
+ *   return <>{...}{confirmDialog}</>
+ *
+ * Call sites read the same as before, but the browser's native grey popup is
+ * replaced by the app's own dialog.
+ */
+export function useConfirm() {
+  const [options, setOptions] = useState<ConfirmOptions | null>(null)
+  const resolver = useRef<((ok: boolean) => void) | null>(null)
+
+  const confirm = useCallback((opts: ConfirmOptions) => {
+    // A second confirm while one is open resolves the first as cancelled rather
+    // than leaving its promise dangling forever.
+    resolver.current?.(false)
+    setOptions(opts)
+    return new Promise<boolean>((resolve) => {
+      resolver.current = resolve
+    })
+  }, [])
+
+  const settle = useCallback((ok: boolean) => {
+    setOptions(null)
+    const resolve = resolver.current
+    resolver.current = null
+    resolve?.(ok)
+  }, [])
+
+  const confirmDialog = (
+    <ConfirmDialog
+      options={options}
+      onConfirm={() => settle(true)}
+      onCancel={() => settle(false)}
+    />
+  )
+
+  return { confirm, confirmDialog }
 }
 
 export function PageHeader({
@@ -201,7 +377,7 @@ export function PageHeader({
   actions?: ReactNode
 }) {
   return (
-    <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+    <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div>
         <h1 className="text-2xl font-bold tracking-tight text-slate-100">{title}</h1>
         {description && <p className="mt-1 max-w-2xl text-sm text-slate-400">{description}</p>}

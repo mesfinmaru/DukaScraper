@@ -1,6 +1,8 @@
 export type JobStatus =
   | "pending"
   | "running"
+  /** Paused by the user. Resumable; in-flight pages were kept. */
+  | "paused"
   | "completed"
   | "failed"
   | "skipped"
@@ -23,6 +25,8 @@ export interface ScrapeRequest {
   max_depth?: number
   recursive_config?: RecursiveConfig
   job_params?: Record<string, unknown>
+  /** Advisory hint for the kind of content sought. Defaults to "all". */
+  datatype?: CrawlDatatype
 }
 
 export interface BatchScrapeRequest {
@@ -35,6 +39,8 @@ export interface BatchScrapeRequest {
   allow_login: boolean
   allow_signup: boolean
   allow_email_verification: boolean
+  /** Advisory hint for the kind of content sought. Defaults to "all". */
+  datatype?: CrawlDatatype
   credential_email?: string | null
   job_params?: Record<string, unknown>
 }
@@ -53,6 +59,50 @@ export interface TriggerJobResponse {
   kafka_topic: string
 }
 
+/**
+ * Search networks for topic discovery.
+ *
+ * "all" searches surface, deep and dark together and merges the seeds. It is
+ * not a crawler choice - discovered seeds are routed to workers by the normal
+ * assignment engine, exactly like hand-entered URLs.
+ */
+export type DiscoveryNetwork = "surface" | "deep" | "dark" | "all"
+
+/**
+ * Advisory hint for the kind of content a crawl is after. Advisory because the
+ * worker still fetches whatever a URL actually returns; a page that redirects
+ * to a PDF is captured either way.
+ */
+export type CrawlDatatype = "all" | "html" | "pdf" | "document" | "audio"
+
+/**
+ * Topic-based discovery: start a crawl from a query instead of a URL.
+ * The discovery-worker resolves it into seed URLs and emits ordinary
+ * CrawlRequests, so the result is indistinguishable from a URL crawl.
+ */
+export interface DiscoverRequest {
+  query: string
+  network: DiscoveryNetwork
+  user_id?: string | null
+  language?: string
+  max_results?: number
+  engines?: string[] | null
+  max_depth?: number
+  recursive_config?: RecursiveConfig
+  job_params?: Record<string, unknown>
+  /** Advisory hint for the kind of content sought. Defaults to "all". */
+  datatype?: CrawlDatatype
+}
+
+export interface DiscoverResponse {
+  message: string
+  job_id: string
+  network: string
+  query: string
+  max_results: number
+  kafka_topic: string
+}
+
 export interface CredentialSummary {
   email: string
   display_name?: string | null
@@ -63,6 +113,8 @@ export interface CredentialSummary {
 export interface JobSummary {
   job_id: string
   url: string
+  /** Host the job crawls (e.g. "bbc.com"). Derived server-side from `url`. */
+  site_name?: string
   status: JobStatus
   created_at: string | null
   user_id?: string
@@ -98,6 +150,30 @@ export interface ConfirmEmailCodeResponse {
 }
 
 export interface LoginResponse {
+  access_token: string
+  refresh_token: string
+  token_type: string
+  user: UserInfo
+}
+
+/** Login of an unverified (admin-provisioned) account — no tokens yet. */
+export interface RequiresVerificationResponse {
+  status: "REQUIRES_VERIFICATION"
+  user_id: string
+  redirect_to: string
+  masked_email: string
+  expires_in_seconds: number
+}
+
+export type LoginResult = LoginResponse | RequiresVerificationResponse
+
+export function isRequiresVerification(
+  res: LoginResult,
+): res is RequiresVerificationResponse {
+  return (res as RequiresVerificationResponse).status === "REQUIRES_VERIFICATION"
+}
+
+export interface VerifyOtpResponse {
   access_token: string
   refresh_token: string
   token_type: string
@@ -145,6 +221,7 @@ export interface UserJobsResponse {
 export interface JobDetail {
   job_id: string
   user_id: string
+  site_name?: string
   url: string
   language: string
   status: JobStatus
@@ -170,6 +247,13 @@ export interface ArticleItem {
 
 export interface ArticleItemDetail extends ArticleItem {
   job_id: string
+  /**
+   * First slice of the extracted text, so expanding a row shows what was
+   * actually captured. Empty when the parsed object is missing or unreadable.
+   */
+  text_sample: string
+  /** True when the real text is longer than the sample. */
+  text_sample_truncated: boolean
 }
 
 export interface JobArticlesResponse {
@@ -196,11 +280,25 @@ export interface StorageObject {
   object_name: string
   size_bytes: number | null
   last_modified: string | null
+  /** Owning job, parsed out of the object name. Null when it cannot be resolved. */
+  job_id?: string | null
+  /**
+   * Site label: the first path segment of folder-style names
+   * (`example.com/JOB.../ITEM...`). Empty for legacy flat names, which have no
+   * folder - those fall back to showing the job instead.
+   */
+  site?: string
 }
 
 export interface BucketItemsResponse {
   bucket: string
-  total: number
+  /** Exact count only when this page reached the end; null while more remain. */
+  total: number | null
+  limit: number
+  offset: number
+  has_more: boolean
+  /** Key to pass as `after` for the next page; null at the end of the bucket. */
+  next_cursor: string | null
   items: StorageObject[]
 }
 
@@ -214,6 +312,15 @@ export interface MetricsResponse {
   source_type: MetricGroup
   topic: MetricGroup
   category: MetricGroup
+  /**
+   * How much of the corpus was actually reviewed. Accuracy from a handful of
+   * labels is not comparable to accuracy from a thousand, so the UI shows this
+   * next to the score instead of letting the bare percentage imply certainty.
+   */
+  coverage: {
+    labeled_items: number
+    total_analyzed_items: number
+  }
   note: string
 }
 
@@ -232,6 +339,59 @@ export interface EvaluationResponse {
   job_id: string
 }
 
+/**
+ * A high-severity (4 or 5) intelligence finding surfaced to operators.
+ *
+ * `analysis_source` is carried all the way to this screen on purpose: an alert
+ * labelled by the heuristic fallback looks identical to a model verdict unless
+ * the UI says otherwise, and a threat feed that cannot be trusted is worse than
+ * no feed.
+ */
+export interface AlertRow {
+  alert_id: string
+  job_id: string
+  item_id: string
+  url: string
+  title: string
+  category: string
+  severity: number
+  language: string
+  summary: string
+  entities: string[]
+  analysis_source: string
+  llm_model: string
+  created_at: string | null
+  read: boolean
+  priority: "critical" | "high" | "low"
+  /** Whitespace-collapsed, length-capped summary for dense list rows. */
+  short_summary: string
+}
+
+export interface AlertsResponse {
+  alerts: AlertRow[]
+  total: number
+  limit: number
+  offset: number
+  has_more: boolean
+  unread_only: boolean
+}
+
+export interface UnreadAlertsResponse {
+  unread: number
+}
+
+/**
+ * Short-lived token that authorises the monitoring embed proxy.
+ *
+ * An <iframe> cannot send an Authorization header, so the embed token rides in
+ * the query string instead. It grants read access to Grafana/Prometheus only and
+ * expires on its own.
+ */
+export interface EmbedTokenResponse {
+  token: string
+  expires_in: number
+}
+
 export interface ThreatRecentRow {
   item_id: string
   job_id: string
@@ -247,7 +407,23 @@ export interface ThreatAnalyticsResponse {
   total: number
   by_severity: { severity: number; count: number }[]
   by_category: { category: string; count: number }[]
+  /** Distinct values present, for the filter dropdowns. */
+  categories: string[]
+  sources: string[]
+  limit: number
+  offset: number
+  /** True when rows remain after this page. */
+  has_more: boolean
   recent: ThreatRecentRow[]
+}
+
+/** Query options for the flagged-content list. */
+export interface ThreatQuery {
+  offset?: number
+  limit?: number
+  category?: string
+  severity?: number
+  source_type?: string
 }
 
 export interface EntitySummaryRow {
@@ -389,6 +565,7 @@ export const INTELLIGENCE_CATEGORIES = [
 export const JOB_STATUSES: JobStatus[] = [
   "pending",
   "running",
+  "paused",
   "completed",
   "failed",
   "skipped",

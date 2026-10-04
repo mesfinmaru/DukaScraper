@@ -6,8 +6,6 @@ import {
   ChevronRight,
   CircleX,
   Clock3,
-  Loader2,
-  RefreshCw,
   Rocket,
   Search,
   ShieldAlert,
@@ -20,6 +18,7 @@ import { JOB_STATUSES } from "../types"
 import type { ThreatAnalyticsResponse, UserJobsResponse } from "../types"
 import { cn, formatNumber, relativeTime } from "../utils"
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader, StatusBadge } from "../components/ui"
+import { useAutoRefresh } from "../useAutoRefresh"
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "#f59e0b",
@@ -184,7 +183,6 @@ export default function Dashboard() {
   const [threats, setThreats] = useState<ThreatAnalyticsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [refreshTick, setRefreshTick] = useState(0)
 
   const load = useCallback(async () => {
     try {
@@ -197,7 +195,7 @@ export default function Dashboard() {
       setData(res)
       setError(null)
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load jobs")
+      setError(e instanceof Error ? e.message : "Could not load your jobs.")
     } finally {
       setLoading(false)
     }
@@ -215,7 +213,12 @@ export default function Dashboard() {
     setLoading(true)
     void load()
     void loadThreats()
-  }, [load, loadThreats, refreshTick])
+  }, [load, loadThreats])
+
+  // Counts and the threat summary move on their own; poll both so the page
+  // needs no manual refresh.
+  useAutoRefresh({ load })
+  useAutoRefresh({ load: loadThreats })
 
   const jobs = useMemo(() => data?.jobs ?? [], [data])
   const sorted = useMemo(
@@ -239,25 +242,10 @@ export default function Dashboard() {
       <PageHeader
         title="Dashboard"
         actions={
-          <>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => setRefreshTick((t) => t + 1)}
-              disabled={loading}
-            >
-              {loading ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <RefreshCw className="h-4 w-4" />
-              )}
-              Refresh
-            </button>
-            <Link to="/new-crawl" className="btn-primary">
-              <Rocket className="h-4 w-4" />
-              New crawl
-            </Link>
-          </>
+          <Link to="/new-crawl" className="btn-primary">
+            <Rocket className="h-4 w-4" />
+            New crawl
+          </Link>
         }
       />
 
@@ -270,7 +258,7 @@ export default function Dashboard() {
       {loading && !data ? (
         <LoadingBlock label="Loading your jobs..." />
       ) : (
-        <div className="space-y-6">
+        <div className="space-y-5">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard
               label="Total jobs"
@@ -279,7 +267,7 @@ export default function Dashboard() {
               tone="bg-sky-500/15"
             />
             <StatCard
-              label="Active (pending + running)"
+              label="Active(pending+running)"
               value={activeCount}
               icon={<Clock3 className="h-5 w-5 text-amber-500" />}
               tone="bg-amber-500/15"
@@ -298,7 +286,7 @@ export default function Dashboard() {
             />
           </div>
 
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <div className="grid grid-cols-1 items-start gap-5 lg:grid-cols-2">
             <div className="card p-5">
               <div className="mb-2 flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-slate-200">Jobs by status</h2>

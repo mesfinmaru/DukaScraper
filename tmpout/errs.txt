@@ -1,0 +1,297 @@
+INFO:     172.18.0.1:43566 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43578 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43590 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43584 - "GET /api/v1/monitoring/embed-token HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43582 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43594 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43608 - "GET /api/v1/monitoring/embed-token HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43610 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43626 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43638 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:43644 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43672 - "GET /prometheus/graph?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token=1791114279.3046674522357543877025fd25f9b349d03ef8ebafe53c5252f5c6f09377bd20 HTTP/1.1" 302 Found
+INFO:     172.18.0.1:43660 - "GET /grafana/d/duka-overview?orgId=1&refresh=30s&kiosk&token=1791114279.3046674522357543877025fd25f9b349d03ef8ebafe53c5252f5c6f09377bd20 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43686 - "GET /prometheus/query?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token=1791114279.3046674522357543877025fd25f9b349d03ef8ebafe53c5252f5c6f09377bd20 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43690 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43724 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:43696 - "GET /grafana/public/build/grafana.app-react19.956286b013bf6a89b7b0.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43702 - "GET /grafana/public/build/grafana.dark-react19.f15eddd39193045180e3.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43736 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43708 - "GET /prometheus/assets/index-BvKf2n0L.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43720 - "GET /prometheus/assets/index-AJC8xPli.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43742 - "GET /grafana/public/build/runtime-react19.1e399e4e5f00a0a39b1e.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43756 - "GET /grafana/public/build/6029-react19.bd349141416938549393.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43770 - "GET /grafana/public/build/1985-react19.2be0e698212ccbea673c.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43772 - "GET /grafana/public/build/1591-react19.c8d5e532991b209273a0.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43808 - "GET /prometheus/api/v1/query?query=time%28%29 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43792 - "GET /prometheus/api/v1/label/__name__/values HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43818 - "GET /api/v1/alerts?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43824 - "GET /prometheus/api/v1/query_range?query=sum%28rate%28duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D%29%29&step=28&start=1791106180.85&end=1791113380.85 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43832 - "GET /grafana/public/build/5371-react19.89cdc086cc9d56cd5c8b.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48586 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43856 - "GET /grafana/public/build/app-react19.e965c450a82d9d6351af.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43842 - "GET /grafana/public/build/841-react19.23ad916c6d7b6c3ee301.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43862 - "GET /grafana/public/build/1266-react19.0b7c4f7bf8764823720c.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43866 - "GET /grafana/public/build/img/grafana_icon.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43882 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43870 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43896 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43904 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43930 - "GET /grafana/api/plugins/grafana-pyroscope-app/settings HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43932 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43948 - "GET /grafana/public/build/6813-react19.73b010cb0f06edcd4e44.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43934 - "GET /grafana/public/build/3809-react19.0455189d52203a533cf9.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43956 - "GET /grafana/public/build/8348-react19.40963a8de0093766d769.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43964 - "GET /grafana/public/build/DashboardPageProxy-react19.c8c31e4a1f6a2c358260.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43980 - "GET /grafana/public/build/static/img/grafana_icon.1e0deb6b.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44016 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:44000 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43992 - "GET /grafana/public/fonts/inter/Inter-Regular.woff2 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44024 - "GET /grafana/public/plugins/grafana-pyroscope-app/module.js?_cache=2.3.1 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44040 - "GET /grafana/public/build/1044-react19.e0b528d98cc1b4be9bd9.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44042 - "GET /grafana/public/build/4251-react19.5d5cbe2bdf4a80316646.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44048 - "GET /grafana/public/build/8122-react19.7ed44c66171c07485ccf.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44052 - "GET /grafana/apis/dashboard.grafana.app/ HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44054 - "GET /grafana/public/build/img/icons/unicons/spinner.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44058 - "GET /grafana/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/duka-overview/dto HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44068 - "GET /grafana/api/folders/fg071lnvrprswd?accesscontrol=true&isLegacyCall=false HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44084 - "GET /grafana/api/prometheus/grafana/api/v1/rules?dashboard_uid=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44100 - "GET /grafana/public/build/img/icons/unicons/angle-double-left.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44106 - "GET /grafana/public/build/img/icons/unicons/clock-nine.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44122 - "GET /grafana/public/build/img/icons/unicons/angle-down.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44134 - "GET /grafana/public/build/img/icons/unicons/angle-double-right.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.13:58372 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44150 - "GET /grafana/public/fonts/inter/Inter-Medium.woff2 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44154 - "GET /grafana/public/build/img/icons/unicons/search-minus.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44166 - "GET /grafana/public/build/img/icons/unicons/sync.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44172 - "GET /grafana/public/build/static/img/grafana_text_logo_light.467e047c.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44184 - "GET /grafana/public/build/img/icons/unicons/ellipsis-v.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44200 - "GET /grafana/public/build/3720-react19.8c1bc088838d84244b39.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44220 - "GET /grafana/public/build/prometheusPlugin-react19.990ad665af6eb47788f3.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44224 - "GET /grafana/public/build/919-react19.b3baa2c37e6ad989212a.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44236 - "GET /grafana/public/build/grafanaPlugin-react19.1ffefaa34488258a1da6.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44206 - "GET /grafana/public/build/420-react19.07fe91ba0e627ec91d73.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44246 - "GET /grafana/public/build/7854-react19.e4b594173176e72619ff.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44250 - "GET /grafana/public/build/2780-react19.9e8150857d0490bf7894.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44262 - "GET /grafana/public/build/3021-react19.ddf601dfdb48b9cfaba9.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44268 - "GET /grafana/public/build/timeseriesPanel-react19.848ec2b41348c5ee6abc.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44284 - "GET /grafana/public/build/statPanel-react19.970d65a6a9d6baf511c7.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44290 - "GET /grafana/api/annotations?from=1791109783527&to=1791113383527&limit=100&matchAny=false&dashboardUID=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44306 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44314 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44316 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44322 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:44324 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:44340 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48294 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48310 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48316 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48314 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48334 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48328 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48336 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:48374 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48390 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48358 - "POST /grafana/api/frontend-metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48382 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48406 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:48412 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.13:48460 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43906 - "GET /prometheus/api/v1/notifications/live HTTP/1.1" 502 Bad Gateway
+INFO:     172.18.0.13:34078 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:52022 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:52032 - "GET /api/v1/alerts?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:52024 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:52036 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50144 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43346 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43362 - "GET /api/v1/alerts?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:43378 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46276 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.13:35954 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45300 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45286 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45304 - "GET /api/v1/monitoring/embed-token HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45316 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45336 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45328 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45348 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45342 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45358 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45386 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45374 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:45388 - "GET /grafana/d/duka-overview?orgId=1&refresh=30s&kiosk&token= HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45398 - "GET /prometheus/graph?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token= HTTP/1.1" 302 Found
+INFO:     172.18.0.1:45422 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:45408 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45426 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45432 - "GET /prometheus/query?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token= HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45440 - "GET /prometheus/assets/index-BvKf2n0L.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45468 - "GET /grafana/api/plugins/grafana-pyroscope-app/settings HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45438 - "GET /prometheus/assets/index-AJC8xPli.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47556 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45480 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:45490 - "GET /grafana/public/plugins/grafana-pyroscope-app/module.js?_cache=2.3.1 HTTP/1.1" 304 Not Modified
+INFO:     172.18.0.1:32948 - "GET /prometheus/api/v1/label/__name__/values HTTP/1.1" 200 OK
+INFO:     172.18.0.1:32960 - "GET /prometheus/api/v1/query?query=time%28%29 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:32972 - "GET /prometheus/api/v1/query_range?query=sum%28rate%28duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D%29%29&step=28&start=1791106237.863&end=1791113437.863 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:32988 - "GET /grafana/public/fonts/inter/Inter-Regular.woff2 HTTP/1.1" 304 Not Modified
+INFO:     172.18.0.1:33002 - "GET /grafana/apis/dashboard.grafana.app/ HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33018 - "GET /grafana/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/duka-overview/dto HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33034 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33042 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33056 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:33092 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33068 - "GET /grafana/d/duka-overview?orgId=1&refresh=30s&kiosk&token= HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33080 - "GET /prometheus/graph?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token= HTTP/1.1" 302 Found
+INFO:     172.18.0.1:33100 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33108 - "GET /prometheus/query?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token= HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33120 - "GET /prometheus/assets/index-BvKf2n0L.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33156 - "GET /grafana/api/plugins/grafana-pyroscope-app/settings HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33142 - "GET /prometheus/assets/index-AJC8xPli.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33172 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33192 - "GET /prometheus/api/v1/label/__name__/values HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33200 - "GET /prometheus/api/v1/query?query=time%28%29 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33214 - "GET /prometheus/api/v1/query_range?query=sum%28rate%28duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D%29%29&step=28&start=1791106239.015&end=1791113439.015 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33220 - "GET /grafana/apis/dashboard.grafana.app/ HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33226 - "GET /grafana/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/duka-overview/dto HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33240 - "GET /grafana/api/folders/fg071lnvrprswd?accesscontrol=true&isLegacyCall=false HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33242 - "GET /grafana/api/prometheus/grafana/api/v1/rules?dashboard_uid=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33250 - "GET /grafana/public/fonts/inter/Inter-Medium.woff2 HTTP/1.1" 304 Not Modified
+INFO:     172.18.0.1:33252 - "GET /grafana/api/annotations?from=1791109839319&to=1791113439319&limit=100&matchAny=false&dashboardUID=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33268 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR100 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:33276 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR101 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:33304 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR102 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:33316 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR103 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:33336 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33372 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33380 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33394 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33404 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:33412 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.13:41230 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33422 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33426 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33454 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52218 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37920 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37922 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37932 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:37946 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37952 - "GET /api/v1/monitoring/embed-token HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37962 - "GET /api/v1/monitoring/embed-token HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37964 - "GET /prometheus/graph?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token=1791114348.7a93798d171f2a81759948dffe5b05ee381b7374a6942e6339f7ef9391ce5573 HTTP/1.1" 302 Found
+INFO:     172.18.0.1:37966 - "GET /grafana/d/duka-overview?orgId=1&refresh=30s&kiosk&token=1791114348.7a93798d171f2a81759948dffe5b05ee381b7374a6942e6339f7ef9391ce5573 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37980 - "GET /prometheus/query?g0.expr=sum(rate(duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D))&g0.tab=0&g0.stacked=1&g0.range_input=2h&token=1791114348.7a93798d171f2a81759948dffe5b05ee381b7374a6942e6339f7ef9391ce5573 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:37996 - "GET /prometheus/assets/index-BvKf2n0L.css HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38000 - "GET /prometheus/assets/index-AJC8xPli.js HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38028 - "GET /grafana/api/plugins/grafana-pyroscope-app/settings HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38036 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38048 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38064 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38080 - "GET /prometheus/api/v1/label/__name__/values HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38088 - "GET /prometheus/api/v1/query?query=time%28%29 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38102 - "GET /prometheus/api/v1/query_range?query=sum%28rate%28duka_http_requests_total%7Bjob%3D%22duka-api%22%7D%5B5m%5D%29%29&step=28&start=1791106249.028&end=1791113449.028 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38104 - "GET /grafana/apis/dashboard.grafana.app/ HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38106 - "GET /grafana/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/duka-overview/dto HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38122 - "GET /grafana/api/folders/fg071lnvrprswd?accesscontrol=true&isLegacyCall=false HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38138 - "GET /grafana/api/prometheus/grafana/api/v1/rules?dashboard_uid=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38140 - "GET /grafana/api/annotations?from=1791109849343&to=1791113449343&limit=100&matchAny=false&dashboardUID=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38166 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR101 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38154 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR100 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38170 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR102 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38182 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR103 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38198 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38210 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38222 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:38224 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38244 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38256 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38258 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44712 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56634 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56640 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56650 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:56652 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56670 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56676 - "POST /grafana/api/frontend-metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.13:52184 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56684 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56690 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56706 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56714 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56724 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56740 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56754 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:56758 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56774 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56778 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:56796 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37560 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60344 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60360 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60364 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:60380 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60382 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60390 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60402 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60414 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60426 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60436 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60432 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60452 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:60464 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60466 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60470 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:60482 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.13:51992 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60488 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60502 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60490 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60518 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60508 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60516 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60542 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60554 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60528 - "GET /grafana/api/annotations?from=1791109876501&to=1791113476501&limit=100&matchAny=false&dashboardUID=duka-overview HTTP/1.1" 200 OK
+INFO:     172.18.0.1:60566 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:60582 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53806 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38024 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR100 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38034 - "GET /grafana/public/build/img/icons/unicons/exclamation-triangle.svg HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38050 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR101 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38054 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR102 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38068 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38062 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38066 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38070 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38072 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38086 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:38098 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38106 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR103 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38110 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR104 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38116 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR105 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38132 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR106 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38140 - "POST /grafana/api/ds/query?ds_type=prometheus&requestId=SQR107 HTTP/1.1" 400 Bad Request
+INFO:     172.18.0.1:38154 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38170 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38186 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38202 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38204 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:38218 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:38222 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56358 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.13:45396 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33858 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33866 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33874 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33884 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33896 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:33902 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33912 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33914 - "GET /api/v1/monitoring/health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33928 - "GET /api/v1/alerts/unread HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33932 - "GET /api/v1/monitoring/urls HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33938 - "GET /api/v1/monitoring/prometheus HTTP/1.1" 500 Internal Server Error
+INFO:     172.18.0.1:33954 - "GET /api/v1/analytics/performance?limit=25 HTTP/1.1" 200 OK
+INFO:     172.18.0.1:33968 - "GET /grafana/api/login/ping HTTP/1.1" 200 OK

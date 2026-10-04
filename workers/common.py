@@ -8,6 +8,7 @@ This module contains common dependencies that all workers use:
 - Proxy management (shared across all workers)
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -25,8 +26,32 @@ from app.common.proxy_manager import ProxyManager, parse_proxy_url
 from app.services.dedup_service import DedupService
 from app.services.link_extraction_service import LinkExtractionService
 from app.services.recursive_crawl_service import extract_and_queue_children
+from app.storage.postgres.client import pg_client
 
 logger = logging.getLogger(__name__)
+
+# How often a paused worker re-checks the job status: short enough that
+# "Resume" feels immediate, long enough not to hammer the database.
+PAUSE_POLL_SECONDS = 2.0
+
+
+async def wait_while_paused(job_id: str) -> None:
+    """Block until a paused job is resumed, then return.
+
+    Called before a message is processed. Skipping the message instead would
+    silently lose that page, so the worker holds it here and resume picks up
+    exactly where it left off.
+
+    A status check that fails (database hiccup) must not stall the pipeline,
+    so this fails open and keeps crawling rather than waiting forever.
+    """
+    try:
+        while await pg_client.is_job_paused(job_id):
+            await asyncio.sleep(PAUSE_POLL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Pause check failed for job %s (continuing): %s", job_id, exc)
 
 # --- Shared proxy pool (all workers share this instance) ---
 _PROXY_RAW: str = os.getenv("PROXY_POOL", settings.proxy_pool)
@@ -186,4 +211,5 @@ __all__ = [
     "owns_message",
     "fail_job_from_message",
     "complete_job_task_from_message",
+    "wait_while_paused",
 ]

@@ -74,7 +74,7 @@ async def _httpx_fetch(
     headers: dict | None = None,
     proxy: str | None = None,
     timeout: int = 30,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str]:
     async with httpx.AsyncClient(
         proxy=proxy,
         headers=headers,
@@ -82,7 +82,7 @@ async def _httpx_fetch(
         timeout=timeout,
     ) as client:
         resp = await client.get(url)
-        return resp.status_code, resp.text, str(resp.url)
+        return resp.status_code, resp.text, str(resp.url), resp.headers.get("content-type", "")
 
 
 async def _scrapy_fetch(
@@ -90,7 +90,7 @@ async def _scrapy_fetch(
     headers: dict | None = None,
     proxy: str | None = None,
     timeout: int = 30,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str]:
     raise RuntimeError("The Scrapy fetch backend is not configured for this worker")
 
 
@@ -100,7 +100,7 @@ async def _perform_fetch(
     headers: dict | None,
     proxy: str | None,
     timeout: int,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str]:
     if fetcher == "httpx":
         return await _httpx_fetch(url, headers=headers, proxy=proxy, timeout=timeout)
     if fetcher == "scrapy":
@@ -123,7 +123,7 @@ async def fetch_with_retry(
     retry_status_codes: set[int] | None = None,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     rotate_agent_callback: Callable[[], Any] | None = None,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str]:
     retry_status_codes = retry_status_codes or RETRY_STATUS_CODES
     attempt = 1
     current_fetcher = fetcher
@@ -131,7 +131,7 @@ async def fetch_with_retry(
 
     while True:
         try:
-            status_code, html, final_url = await _perform_fetch(
+            status_code, html, final_url, content_type = await _perform_fetch(
                 current_fetcher,
                 url,
                 current_headers,
@@ -158,7 +158,7 @@ async def fetch_with_retry(
                 attempt += 1
                 continue
 
-            return status_code, html, final_url
+            return status_code, html, final_url, content_type
 
         except Exception as exc:
             if attempt >= max_attempts:
@@ -197,7 +197,15 @@ async def fetch_with_agent_rotation(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_status_codes: set[int] | None = None,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str]:
+    """Fetch *url*, rotating the agent between attempts.
+
+    Returns ``(status_code, body_text, final_url, content_type)``. The
+    content-type is not decoration: plenty of sites serve a PDF from an
+    extension-less URL (``arxiv.org/pdf/1706.03762``), so a URL-extension-only
+    classifier sends them down the HTML path and the raw bucket ends up holding
+    mojibake instead of the file.
+    """
     agent = get_agent_for_job(job_id)
 
     def _rotate_agent() -> Agent | None:

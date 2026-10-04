@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useState } from "react"
 import {
   Ban,
-  CheckCircle2,
-  KeyRound,
+  ChevronDown,
   Loader2,
-  Mail,
   Power,
   RefreshCcw,
-  RotateCw,
   ShieldCheck,
   Trash2,
   UserPlus,
@@ -15,9 +12,29 @@ import {
 } from "lucide-react"
 import { api, ApiError } from "../api"
 import { useAuth } from "../config"
-import type { AdminUserRow, VerifyEmailResponse } from "../types"
-import { cn, formatDateTime } from "../utils"
-import { EmptyState, ErrorBanner, LoadingBlock, PageHeader } from "../components/ui"
+import type { AdminUserRow } from "../types"
+import { cn, formatDateOnly } from "../utils"
+import {
+  EmptyState,
+  ErrorBanner,
+  LoadingBlock,
+  Msg,
+  PageHeader,
+  useConfirm,
+} from "../components/ui"
+import { useAutoRefresh } from "../useAutoRefresh"
+
+const FORM_OPEN_KEY = "dukascraper.console.users.formOpen.v1"
+
+/** Expanded by default: creating a user is the main job on this page, and the
+ *  25/75 split is what an admin sees on arrival. */
+function getInitialFormOpen(): boolean {
+  try {
+    return localStorage.getItem(FORM_OPEN_KEY) !== "collapsed"
+  } catch {
+    return true
+  }
+}
 
 export default function UsersPage() {
   const { session } = useAuth()
@@ -25,22 +42,18 @@ export default function UsersPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const [step, setStep] = useState<1 | 2 | 3>(1)
-  const [email, setEmail] = useState("")
-  const [password, setPassword] = useState("")
-  const [code, setCode] = useState("")
-  const [verifyInfo, setVerifyInfo] = useState<VerifyEmailResponse | null>(null)
-  const [token, setToken] = useState<string | null>(null)
-
-  const [newUsername, setNewUsername] = useState("")
   const [newFullName, setNewFullName] = useState("")
+  const [newUsername, setNewUsername] = useState("")
+  const [newEmail, setNewEmail] = useState("")
+  const [newPassword, setNewPassword] = useState("")
   const [newRole, setNewRole] = useState<"user" | "admin">("user")
-  const [forceReset, setForceReset] = useState(true)
 
+  const [formOpen, setFormOpen] = useState(getInitialFormOpen)
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [createdMsg, setCreatedMsg] = useState<string | null>(null)
 
+  const { confirm, confirmDialog } = useConfirm()
   const [toggling, setToggling] = useState<string | null>(null)
   const [resetting, setResetting] = useState<string | null>(null)
 
@@ -50,7 +63,7 @@ export default function UsersPage() {
       setUsers(res.users)
       setError(null)
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load users")
+      setError(e instanceof Error ? e.message : "Could not load the user list.")
     } finally {
       setLoading(false)
     }
@@ -60,116 +73,121 @@ export default function UsersPage() {
     void load()
   }, [load])
 
-  const resetFlow = () => {
-    setStep(1)
-    setEmail("")
-    setPassword("")
-    setCode("")
-    setVerifyInfo(null)
-    setToken(null)
+  // Account state changes when an admin edits it, possibly in another tab.
+  useAutoRefresh({ load })
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(FORM_OPEN_KEY, formOpen ? "expanded" : "collapsed")
+    } catch {
+      /* ignore */
+    }
+  }, [formOpen])
+
+  const resetForm = () => {
+    setNewFullName("")
+    setNewUsername("")
+    setNewEmail("")
+    setNewPassword("")
+    setNewRole("user")
     setFormError(null)
-    setForceReset(true)
   }
 
-  const sendCode = async () => {
+  const createAccount = async (e: React.FormEvent) => {
+    e.preventDefault()
     setFormError(null)
-    const normalized = email.trim().toLowerCase()
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) {
+    const fullName = newFullName.trim()
+    const username = newUsername.trim().toLowerCase()
+    const emailAddr = newEmail.trim().toLowerCase()
+    if (fullName.length < 2) {
+      setFormError("Enter the user's full name.")
+      return
+    }
+    if (!/^[a-z0-9][a-z0-9_.\-]{2,31}$/.test(username)) {
+      setFormError("Username: 3 to 32 letters, numbers, dot, dash or underscore.")
+      return
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailAddr)) {
       setFormError("Enter a valid email address.")
       return
     }
-    if (password.length < 8) {
+    if (newPassword.length < 8) {
       setFormError("Password must be at least 8 characters.")
       return
     }
     setBusy(true)
     try {
-      const res = await api.sendVerificationCode(normalized, password)
-      setVerifyInfo(res)
-      setToken(null)
-      setStep(2)
-    } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to send verification code")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const confirmCode = async () => {
-    setFormError(null)
-    if (!/^\d{6}$/.test(code.trim())) {
-      setFormError("Enter the 6-digit verification code.")
-      return
-    }
-    setBusy(true)
-    try {
-      const res = await api.confirmVerificationCode(email.trim().toLowerCase(), code.trim())
-      setToken(res.token)
-      setStep(3)
-    } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to confirm the verification code")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const createAccount = async () => {
-    setFormError(null)
-    if (!token) {
-      setFormError("Email verification is incomplete. Start over.")
-      return
-    }
-    setBusy(true)
-    try {
-      const res = await api.completeUserCreation({
-        email: email.trim().toLowerCase(),
-        username: newUsername.trim(),
-        full_name: newFullName.trim(),
+      await api.createUser({
+        full_name: fullName,
+        username,
+        email: emailAddr,
+        password: newPassword,
         role: newRole,
-        token,
-        must_change_password: forceReset,
       })
-      setCreatedMsg(res.message || `Account "${res.user.username}" created and active.`)
-      resetFlow()
+      setCreatedMsg(`User created. We emailed the login details to ${emailAddr}.`)
+      resetForm()
       await load()
     } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : "Failed to create the account")
+      setFormError(err instanceof ApiError ? err.message : "Could not create the user.")
     } finally {
       setBusy(false)
     }
   }
 
   const remove = async (username: string) => {
-    if (!window.confirm(`Delete user "${username}" and all of their jobs?`)) return
+    const ok = await confirm({
+      title: "Delete this user?",
+      message: `${username} and all of their jobs will be deleted. This cannot be undone.`,
+      confirmLabel: "Delete",
+      tone: "danger",
+    })
+    if (!ok) return
     try {
       await api.deleteUser(username)
       await load()
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to delete user")
+      setError(err instanceof ApiError ? err.message : "Could not delete this user.")
     }
   }
 
   const toggleActive = async (username: string, active: boolean) => {
-    if (!window.confirm(`Are you sure you want to ${active ? "enable" : "disable"} user "${username}"?`)) return
+    const ok = await confirm({
+      title: active ? "Allow this user to sign in?" : "Stop this user signing in?",
+      message: active
+        ? `${username} will be able to sign in again.`
+        : `${username} will not be able to sign in. Their past jobs are kept.`,
+      confirmLabel: active ? "Allow" : "Stop access",
+      tone: active ? "default" : "danger",
+    })
+    if (!ok) return
     setToggling(username)
     try {
       await api.setUserActive(username, active)
       await load()
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : `Failed to ${active ? "enable" : "disable"} user`)
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : `Could not ${active ? "enable" : "disable"} this user.`,
+      )
     } finally {
       setToggling(null)
     }
   }
 
   const forceResetPassword = async (username: string) => {
-    if (!window.confirm(`Force "${username}" to change their password on next login?`)) return
+    const ok = await confirm({
+      title: "Ask for a new password?",
+      message: `${username} will have to choose a new password next time they sign in.`,
+      confirmLabel: "Ask for new password",
+    })
+    if (!ok) return
     setResetting(username)
     try {
       await api.forceResetPassword(username)
       await load()
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to force password reset")
+      setError(err instanceof ApiError ? err.message : "Could not reset this password.")
     } finally {
       setResetting(null)
     }
@@ -179,223 +197,138 @@ export default function UsersPage() {
     <div>
       <PageHeader title="Users" />
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        {/* Create form */}
+      <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-4">
+        {/* Create form - single step: admin fills everything, job ends on submit.
+            Expanded it takes one of four columns (25%), matching the table's 75%.
+            Collapsed it spans the full width as a slim bar so the table below
+            gets the whole page. */}
         <form
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (step === 1) void sendCode()
-            else if (step === 2) void confirmCode()
-            else void createAccount()
-          }}
-          className="card h-fit space-y-4 p-5"
+          onSubmit={(e) => void createAccount(e)}
+          className={cn(
+            "card p-3",
+            formOpen ? "h-fit space-y-3 xl:col-span-1" : "xl:col-span-4",
+          )}
         >
-          <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-100">
-            <UserPlus className="h-4 w-4 text-indigo-500" />
-            Create user
+          <h2>
+            <button
+              type="button"
+              onClick={() => setFormOpen((v) => !v)}
+              aria-expanded={formOpen}
+              aria-controls="create-user-fields"
+              title={formOpen ? "Hide the create user form" : "Show the create user form"}
+              className="flex w-full cursor-pointer items-center gap-2 text-left text-sm font-semibold text-slate-100"
+            >
+              <UserPlus className="h-4 w-4 text-indigo-500" />
+              Create user
+              <ChevronDown
+                className={cn(
+                  "ml-auto h-4 w-4 shrink-0 text-slate-500 transition-transform",
+                  formOpen && "rotate-180",
+                )}
+                aria-hidden
+              />
+            </button>
           </h2>
 
-          {formError && (
-            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-medium break-words text-rose-400">
-              {formError}
-            </p>
-          )}
-          {createdMsg && (
-            <p className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-600">
-              {createdMsg}
-            </p>
-          )}
+          {/* Unmounted rather than hidden, so collapsed leaves no unreachable
+              inputs or a hidden submit button in the tab order. */}
+          {formOpen && (
+            <div id="create-user-fields" className="space-y-2.5">
+            {formError && <Msg tone="error">{formError}</Msg>}
+            {createdMsg && <Msg tone="success">{createdMsg}</Msg>}
 
-          {/* Step 1 - email + password */}
-          {step === 1 && (
-            <div className="space-y-4">
-              <div>
-                <label htmlFor="nu-email" className="label">
-                  Email
-                </label>
-                <input
-                  id="nu-email"
-                  type="email"
-                  className="input font-mono"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="alice@example.com"
-                  autoComplete="off"
-                  required
-                />
-              </div>
-              <div>
-                <label htmlFor="nu-password" className="label">
-                  Password
-                </label>
-                <input
-                  id="nu-password"
-                  type="password"
-                  className="input"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Min 8 characters"
-                  minLength={8}
-                  autoComplete="new-password"
-                  required
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Step 2 - enter the emailed code */}
-          {step === 2 && verifyInfo && (
-            <div className="space-y-4">
-              <div className="rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
-                <p className="flex items-center gap-1.5 text-[11px] font-semibold text-sky-400">
-                  <Mail className="h-3.5 w-3.5" />
-                  Code sent to {verifyInfo.email}
-                </p>
-              </div>
-
-              <div>
-                <label htmlFor="nu-code" className="label">
-                  Verification code
-                </label>
-                <input
-                  id="nu-code"
-                  className="input text-center font-mono text-lg tracking-[0.4em]"
-                  value={code}
-                  onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                  placeholder="••••••"
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  maxLength={6}
-                  pattern="[0-9]{6}"
-                  required
-                />
-              </div>
-
-              <div className="flex items-center justify-between text-xs">
-                <button
-                  type="button"
-                  onClick={() => void sendCode()}
-                  disabled={busy}
-                  className="inline-flex cursor-pointer items-center gap-1 text-sky-500 transition hover:text-sky-400 disabled:opacity-50"
-                >
-                  <RotateCw className="h-3 w-3" />
-                  Resend code
-                </button>
-                <button
-                  type="button"
-                  onClick={resetFlow}
-                  disabled={busy}
-                  className="cursor-pointer text-slate-500 transition hover:text-slate-300 disabled:opacity-50"
-                >
-                  Change email
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Step 3 - username, full name, role */}
-          {step === 3 && (
-            <div className="space-y-4">
-              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
-                <p className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-400">
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  {verifyInfo?.email ?? email} verified
-                </p>
-              </div>
-
-              <div>
-                <label htmlFor="nu-username" className="label">
-                  Username *
-                </label>
-                <input
-                  id="nu-username"
-                  className="input font-mono"
-                  value={newUsername}
-                  onChange={(e) => setNewUsername(e.target.value.toLowerCase())}
-                  placeholder="alice"
-                  pattern="[a-z0-9][a-z0-9_.\-]{2,31}"
-                  title="3-32 chars: lowercase letters, numbers, dot, dash or underscore"
-                  required
-                />
-              </div>
-
-              <div>
-                <label htmlFor="nu-fullname" className="label">
-                  Full name
-                </label>
-                <input
-                  id="nu-fullname"
-                  className="input"
-                  value={newFullName}
-                  onChange={(e) => setNewFullName(e.target.value)}
-                  placeholder="Alice Abebe"
-                />
-              </div>
-
-              <div>
-                <span className="label">Role</span>
-                <div className="grid grid-cols-2 gap-2">
-                  {(["user", "admin"] as const).map((r) => (
-                    <button
-                      key={r}
-                      type="button"
-                      onClick={() => setNewRole(r)}
-                      className={cn(
-                        "cursor-pointer rounded-lg border px-3 py-2 text-xs font-semibold capitalize transition",
-                        newRole === r
-                          ? "border-indigo-600 bg-indigo-600 text-white"
-                          : "border-slate-700 bg-black text-slate-300 hover:border-indigo-500",
-                      )}
-                    >
-                      {r}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-slate-700 bg-slate-950 p-3">
-                <input
-                  type="checkbox"
-                  checked={forceReset}
-                  onChange={(e) => setForceReset(e.target.checked)}
-                  className="mt-0.5 h-4 w-4 cursor-pointer accent-indigo-600"
-                />
-                <span className="text-xs leading-relaxed text-slate-300">
-                  <span className="font-semibold text-slate-100">
-                    Require password change on first login
-                  </span>
-                  <br />
-                  The user can only set a temporary password now; they must choose their own on
-                  first sign-in.
-                </span>
+            <div>
+              <label htmlFor="nu-fullname" className="label">
+                Full name
               </label>
+              <input
+                id="nu-fullname"
+                className="input"
+                value={newFullName}
+                onChange={(e) => setNewFullName(e.target.value)}
+                placeholder="Abebe Kebede"
+                autoComplete="off"
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="nu-username" className="label">
+                Username
+              </label>
+              <input
+                id="nu-username"
+                className="input font-mono"
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value.toLowerCase())}
+                placeholder="abebe123"
+                pattern="[a-z0-9][a-z0-9_.\-]{2,31}"
+                title="3-32 chars: lowercase letters, numbers, dot, dash or underscore"
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="nu-email" className="label">
+                Email
+              </label>
+              <input
+                id="nu-email"
+                type="email"
+                className="input font-mono"
+                value={newEmail}
+                onChange={(e) => setNewEmail(e.target.value)}
+                placeholder="abebe@example.com"
+                autoComplete="off"
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="nu-password" className="label">
+                Password
+              </label>
+              <input
+                id="nu-password"
+                type="text"
+                className="input font-mono"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="password"
+                minLength={8}
+                autoComplete="new-password"
+                required
+              />
+              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
+                We email this to the user. They confirm it, then sign in.
+              </p>
+            </div>
+
+            <div>
+              <span className="label">Role</span>
+              <select
+                id="nu-role"
+                className="input font-mono"
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as "user" | "admin")}
+              >
+                <option value="user">user</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+
+            <button type="submit" className="btn-primary w-full" disabled={busy}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
+              {busy ? "Creating account..." : "Create user"}
+            </button>
             </div>
           )}
-
-          <button type="submit" className="btn-primary w-full" disabled={busy}>
-            {busy ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : step === 1 ? (
-              <Mail className="h-4 w-4" />
-            ) : step === 2 ? (
-              <KeyRound className="h-4 w-4" />
-            ) : (
-              <UserPlus className="h-4 w-4" />
-            )}
-            {busy
-              ? "Please wait..."
-              : step === 1
-                ? "Send verification code"
-                : step === 2
-                  ? "Confirm email"
-                  : "Create account"}
-          </button>
         </form>
 
         {/* Users table */}
-        <div className="card overflow-hidden lg:col-span-2">
+        <div className={cn("card overflow-hidden", formOpen ? "xl:col-span-3" : "xl:col-span-4")}>
           {error && (
-            <div className="p-5">
+            <div className="p-4">
               <ErrorBanner message={error} onRetry={() => void load()} />
             </div>
           )}
@@ -404,41 +337,45 @@ export default function UsersPage() {
           ) : !users || users.length === 0 ? (
             <EmptyState icon={<Users className="h-8 w-8" />} title="No users found" />
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[680px]">
+            <div className="table-scroll">
+              <table className="w-full">
                 <thead className="border-b border-slate-800 bg-slate-950">
                   <tr>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
                       User
                     </th>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
                       User ID
                     </th>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
                       Role
                     </th>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
                       Status
                     </th>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
-                      Enable / Disable
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                      Access
                     </th>
-                    <th className="px-5 py-3 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    <th className="px-2.5 py-2 text-left text-xs font-semibold tracking-wider text-slate-500 uppercase">
                       Created
                     </th>
-                    <th className="w-14 px-5 py-3" />
+                    <th className="w-10 px-1.5 py-2" />
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/70">
                   {users.map((u) => (
                     <tr key={u.user_id} className="transition hover:bg-slate-800/40">
-                      <td className="px-5 py-3.5">
-                        <p className="text-sm font-medium text-slate-100">{u.full_name}</p>
-                        <p className="font-mono text-xs text-slate-500">@{u.username}</p>
-                        <p className="mt-0.5 font-mono text-[10px] text-slate-600">{u.email}</p>
+                      <td data-label="User" className="max-w-[150px] px-2.5 py-2">
+                        <p className="truncate text-[13px] leading-tight font-medium text-slate-100" title={u.full_name}>
+                          {u.full_name}
+                        </p>
+                        <p className="truncate font-mono text-[11px] leading-tight text-slate-500">@{u.username}</p>
+                        <p className="mt-0.5 truncate font-mono text-[10px] leading-tight text-slate-600" title={u.email}>
+                          {u.email}
+                        </p>
                       </td>
-                      <td className="px-5 py-3.5 font-mono text-xs text-slate-400">{u.user_id}</td>
-                      <td className="px-5 py-3.5">
+                      <td data-label="User ID" className="px-2.5 py-2 font-mono text-[11px] whitespace-nowrap text-slate-400">{u.user_id}</td>
+                      <td data-label="Role" className="px-2.5 py-2 whitespace-nowrap">
                         <span
                           className={cn(
                             "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium",
@@ -451,7 +388,7 @@ export default function UsersPage() {
                           {u.role}
                         </span>
                       </td>
-                      <td className="px-5 py-3.5">
+                      <td data-label="Status" className="px-2.5 py-2 whitespace-nowrap">
                         <div className="flex items-center gap-1.5">
                           <span
                             className={cn(
@@ -469,18 +406,16 @@ export default function UsersPage() {
                             />
                             {u.is_email_verified ? "verified" : "pending"}
                           </span>
-                          {u.must_change_password && (
-                            <span
+                          {u.must_change_password && (                                <span
                               title="Must change password on next login"
                               className="inline-flex items-center gap-1 rounded-full border border-rose-500/40 bg-rose-500/10 px-2.5 py-0.5 text-xs font-medium text-rose-500"
                             >
-                              <KeyRound className="h-3 w-3" />
                               reset
                             </span>
                           )}
                         </div>
                       </td>
-                      <td className="px-5 py-3.5">
+                      <td data-label="Access" className="px-2.5 py-2 whitespace-nowrap">
                         {u.username === "admin" ? (
                           <span className="text-xs text-slate-600">—</span>
                         ) : (
@@ -508,10 +443,10 @@ export default function UsersPage() {
                           </button>
                         )}
                       </td>
-                      <td className="px-5 py-3.5 text-xs whitespace-nowrap text-slate-500">
-                        {formatDateTime(u.created_at)}
+                      <td data-label="Created" className="px-2.5 py-2 text-xs whitespace-nowrap text-slate-500">
+                        {formatDateOnly(u.created_at)}
                       </td>
-                      <td className="px-5 py-3.5">
+                      <td className="px-2.5 py-2 whitespace-nowrap">
                         <div className="flex items-center justify-end gap-1">
                           {u.username !== "admin" && u.username !== session?.user.username && (
                             <>
@@ -550,6 +485,7 @@ export default function UsersPage() {
           )}
         </div>
       </div>
+      {confirmDialog}
     </div>
   )
 }

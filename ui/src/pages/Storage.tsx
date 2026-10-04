@@ -13,6 +13,8 @@ import {
   Square,
 } from "lucide-react"
 import { api, ApiError } from "../api"
+import { SelectFilter } from "../components/SelectFilter"
+import { useAutoRefresh } from "../useAutoRefresh"
 import { useAuth } from "../config"
 import type { BucketOverviewResponse, BucketItemsResponse, JobSummary } from "../types"
 import { cn, formatBytes, formatDateTime, formatNumber } from "../utils"
@@ -22,6 +24,7 @@ import {
   ErrorBanner,
   LoadingBlock,
   Modal,
+  Msg,
   PageHeader,
 } from "../components/ui"
 
@@ -62,7 +65,17 @@ function saveBlob(blob: Blob, filename: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-const PAGE_SIZES = [25, 50, 100, 200]
+/**
+ * Rows per page. Larger pages than the old 25/50/100/200 because the request is
+ * now paged server-side, so a bigger page costs one round trip rather than the
+ * user clicking through more pages.
+ */
+const PAGE_SIZES = [200, 500, 1000]
+
+/** Truncate a site label for the dropdown without hiding which one it is. */
+function siteLabel(site: string): string {
+  return site.length > 28 ? `${site.slice(0, 27)}…` : site
+}
 
 export default function Storage() {
   const location = useLocation()
@@ -89,8 +102,14 @@ export default function Storage() {
   const [batchError, setBatchError] = useState<string | null>(null)
   const [jobs, setJobs] = useState<JobSummary[]>([])
   const [jobFilter, setJobFilter] = useState<string>("all")
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
+  const [siteFilter, setSiteFilter] = useState<string>("")
+  /**
+   * Cursors for the pages already visited. `cursorStack[i]` is the `after` value
+   * for page i, so Previous is a pop rather than a backwards offset - and an
+   * offset request would make the server walk and discard every skipped key.
+   */
+  const [cursorStack, setCursorStack] = useState<string[]>([])
+  const [pageSize, setPageSize] = useState(200)
   const selectAllRef = useRef<HTMLInputElement>(null)
 
   const canConvert = tab !== "exports"
@@ -101,26 +120,28 @@ export default function Storage() {
     setBatchError(null)
   }, [tab])
 
+  // The page *is* the result set now - filtering and slicing happen on the
+  // server, so there is nothing to slice here.
   const items = data?.items ?? []
+  const pagedItems = items
 
-  // Client-side job filter (object names embed the producing job id).
-  const filteredItems = useMemo(
-    () => (jobFilter === "all" ? items : items.filter((i) => i.object_name.includes(jobFilter))),
-    [items, jobFilter],
-  )
-  const filteredTotal = filteredItems.length
-  const totalPages = Math.max(1, Math.ceil(filteredTotal / pageSize))
-  const safePage = Math.min(page, totalPages)
-  const pageStart = (safePage - 1) * pageSize
-  const pagedItems = useMemo(
-    () => filteredItems.slice(pageStart, pageStart + pageSize),
-    [filteredItems, pageStart, pageSize],
+  /** Site labels present on the current page, for the filter dropdown. */
+  const sites = useMemo(() => {
+    const seen = new Set<string>()
+    for (const item of items) if (item.site) seen.add(item.site)
+    return [...seen].sort()
+  }, [items])
+
+  const totalBytes = useMemo(
+    () => items.reduce((sum, item) => sum + (item.size_bytes ?? 0), 0),
+    [items],
   )
 
-  // Reset to the first page whenever the view changes.
+  // Any change to what is being listed invalidates the cursor history: the
+  // cursors are keys within the *previous* result set.
   useEffect(() => {
-    setPage(1)
-  }, [tab, prefix, jobFilter, pageSize])
+    setCursorStack([])
+  }, [tab, prefix, jobFilter, siteFilter, pageSize])
 
   // Jobs for the filter dropdown (same scoping as the Jobs page).
   useEffect(() => {
@@ -219,24 +240,43 @@ export default function Storage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await api.listBucketItems(tab, prefix)
+      const res = await api.listBucketItems(tab, prefix, {
+        limit: pageSize,
+        after: cursorStack[cursorStack.length - 1] ?? "",
+        job_id: jobFilter === "all" ? "" : jobFilter,
+        site: siteFilter,
+      })
       setData(res)
       setError(null)
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) {
-        setError(`Unknown bucket "${tab}". Valid keys are raw, parsed, exports.`)
+        setError("That list is not available.")
       } else {
-        setError(e instanceof Error ? e.message : "Failed to list storage objects")
+        setError(e instanceof Error ? e.message : "Could not load this list.")
       }
       setData(null)
     } finally {
       setLoading(false)
     }
-  }, [tab, prefix])
+  }, [tab, prefix, pageSize, cursorStack, jobFilter, siteFilter])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  // Keep the listing current without a manual refresh button. Storage was the
+  // worst page for this: every tick used to re-download the whole bucket.
+  useAutoRefresh({ load })
+
+  /** Advance one page, remembering the cursor we came from. */
+  const nextPage = () => {
+    const cursor = data?.next_cursor
+    if (!cursor) return
+    setCursorStack((stack) => [...stack, cursor])
+  }
+
+  /** Go back one page by dropping the cursor that produced the current one. */
+  const prevPage = () => setCursorStack((stack) => stack.slice(0, -1))
 
   // Drop selections that are no longer visible (filter changed / page reloaded).
   useEffect(() => {
@@ -260,8 +300,6 @@ export default function Storage() {
       .catch(() => setOverview(null))
   }, [])
 
-  const totalBytes =
-    filteredItems.reduce((sum, item) => sum + (item.size_bytes ?? 0), 0)
 
   return (
     <div>
@@ -319,6 +357,21 @@ export default function Storage() {
             ))}
           </select>
         </div>
+
+        {/* Site filter. Object names are laid out as SiteName/JobID/ItemID, so
+            the site is the first path segment and the server can list just that
+            prefix instead of us filtering an already-downloaded page. */}
+        <SelectFilter
+          label="Site"
+          value={siteFilter}
+          onChange={setSiteFilter}
+          className="w-52"
+          allLabel="All sites"
+          options={[
+            { value: "", label: "All sites" },
+            ...sites.map((site) => ({ value: site, label: siteLabel(site) })),
+          ]}
+        />
       </div>
 
       {error && (
@@ -337,13 +390,16 @@ export default function Storage() {
               <span className="font-mono">{data.bucket}</span>
             </h2>
             <p className="text-xs text-slate-500">
-              {formatNumber(filteredTotal)} object{filteredTotal === 1 ? "" : "s"}
-              {jobFilter !== "all" && ` of ${formatNumber(data.total)}`}
+              {/* `total` is null while more pages remain, so this reports the
+                  window on screen rather than claiming an exact count. */}
+              {data.total === null
+                ? `Showing ${formatNumber(items.length)}+ objects`
+                : `${formatNumber(data.total)} object${data.total === 1 ? "" : "s"}`}
               {totalBytes > 0 && <> · {formatBytes(totalBytes)}</>}
             </p>
           </div>
 
-          {filteredItems.length === 0 ? (
+          {items.length === 0 ? (
             <EmptyState
               title={
                 jobFilter !== "all"
@@ -410,11 +466,11 @@ export default function Storage() {
                 </div>
               </div>
               {batchError && (
-                <div className="border-b border-rose-500/20 bg-rose-500/10 px-5 py-2 text-xs text-rose-200">
-                  {batchError}
+                <div className="border-b border-rose-500/20 px-5 py-2">
+                  <Msg tone="error">{batchError}</Msg>
                 </div>
               )}
-              <div className="overflow-x-auto">
+              <div className="table-scroll">
                 <table className="w-full min-w-[720px]">
                   <thead className="bg-slate-900/40">
                     <tr>
@@ -451,7 +507,7 @@ export default function Storage() {
                             className="h-4 w-4 accent-sky-500"
                           />
                         </td>
-                        <td className="max-w-md px-5 py-3">
+                        <td data-label="Object" className="max-w-md px-5 py-3">
                           <p
                             className="truncate font-mono text-xs text-slate-300"
                             title={item.object_name}
@@ -459,10 +515,10 @@ export default function Storage() {
                             {item.object_name}
                           </p>
                         </td>
-                        <td className="px-5 py-3 text-xs whitespace-nowrap text-slate-400">
+                        <td data-label="Size" className="px-5 py-3 text-xs whitespace-nowrap text-slate-400">
                           {formatBytes(item.size_bytes)}
                         </td>
-                        <td className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">
+                        <td data-label="Last modified" className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">
                           {formatDateTime(item.last_modified)}
                         </td>
                         <td className="px-5 py-3">
@@ -489,9 +545,10 @@ export default function Storage() {
               </div>
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/70 bg-slate-950/40 px-5 py-3">
                 <span className="text-xs text-slate-500">
-                  {filteredTotal === 0
+                  {items.length === 0
                     ? "No objects"
-                    : `Showing ${formatNumber(pageStart + 1)}–${formatNumber(Math.min(pageStart + pageSize, filteredTotal))} of ${formatNumber(filteredTotal)}`}
+                    : `Page ${cursorStack.length + 1} · ${formatNumber(items.length)} rows`}
+                  {data.has_more && " · more available"}
                 </span>
                 <div className="flex items-center gap-2">
                   <select
@@ -508,21 +565,23 @@ export default function Storage() {
                   </select>
                   <button
                     type="button"
-                    onClick={() => setPage((p) => Math.max(1, p - 1))}
-                    disabled={safePage <= 1}
+                    onClick={prevPage}
+                    disabled={cursorStack.length === 0}
                     aria-label="Previous page"
+                    title="Previous page"
                     className="inline-flex cursor-pointer items-center rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/40 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     <ChevronLeft className="h-3.5 w-3.5" />
                   </button>
                   <span className="font-mono text-xs whitespace-nowrap text-slate-400">
-                    {safePage} / {totalPages}
+                    {cursorStack.length + 1}
                   </span>
                   <button
                     type="button"
-                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                    disabled={safePage >= totalPages}
+                    onClick={nextPage}
+                    disabled={!data.next_cursor}
                     aria-label="Next page"
+                    title="Next page"
                     className="inline-flex cursor-pointer items-center rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/40 hover:text-sky-400 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     <ChevronRight className="h-3.5 w-3.5" />

@@ -10,11 +10,14 @@ import JobArticles from "./pages/JobArticles"
 import Search from "./pages/Search"
 import Storage from "./pages/Storage"
 import Analytics from "./pages/Analytics"
+import Alerts from "./pages/Alerts"
 import LoginPage from "./pages/LoginPage"
+import VerifyOtpPage from "./pages/VerifyOtpPage"
 import ForgotPasswordPage from "./pages/ForgotPasswordPage"
 import ChangePasswordPage from "./pages/ChangePasswordPage"
 import Monitoring from "./pages/Monitoring"
 import UsersPage from "./pages/UsersPage"
+import VerifyEmailPage from "./pages/VerifyEmailPage"
 
 function AuthenticatedRoutes() {
   const { session } = useAuth()
@@ -36,6 +39,7 @@ function AuthenticatedRoutes() {
             <Route path="/search" element={<Search />} />
             <Route path="/storage" element={<Storage />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/alerts" element={<Alerts />} />
             {isAdmin && <Route path="/monitoring" element={<Monitoring />} />}
             {isAdmin && <Route path="/users" element={<UsersPage />} />}
             <Route path="*" element={<Navigate to="/" replace />} />
@@ -43,6 +47,8 @@ function AuthenticatedRoutes() {
         )
       ) : (
         <>
+          <Route path="/verify-otp" element={<VerifyOtpPage />} />
+          <Route path="/verify-email" element={<VerifyEmailPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
           <Route path="*" element={<LoginPage />} />
         </>

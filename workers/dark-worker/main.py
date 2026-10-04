@@ -32,7 +32,6 @@ import sys
 import time
 
 import httpx
-from httpx_socks import AsyncProxyTransport
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from minio import Minio
 from pydantic import ValidationError
@@ -54,14 +53,18 @@ from app.common.logger.logger import setup_logging as _setup_worker_logging
 from app.common.utils.url_utils import is_onion_url, is_valid_http_url
 from app.pipeline.schemas import CrawlRequest, CrawlResult
 from app.services.dead_letter_service import publish_crawl_dead_letter
+from app.services.content_ingestion_service import ContentIngestionService, ContentKind
 from app.services.page_validation_service import PageValidationService
 from app.services.politeness_service import PolitenessService
+from app.services.raw_object_store import RawObjectStore
 from app.services.recursive_crawl_service import extract_and_queue_children
+from app.services.tor_http_client import build_tor_http_client
 from app.storage.clickhouse.client import ch_client
 from app.storage.postgres.client import pg_client
 from workers.common import (
     complete_job_task_from_message,
     fail_job_from_message,
+    wait_while_paused as _wait_while_paused,
 )
 from workers.health import HealthServer
 from workers.metrics import WorkerMetrics
@@ -103,6 +106,7 @@ KAFKA_BOOTSTRAP_SERVERS: str = settings.KAFKA_BOOTSTRAP_SERVERS
 CONSUME_TOPIC: str = settings.crawl_request_topic
 PRODUCE_TOPIC: str = settings.crawl_raw_topic
 WORKER_TYPE: str = "dark"
+RAW_STORE = RawObjectStore()
 
 # ---------------------------------------------------------------------------
 # Tor proxy
@@ -146,36 +150,21 @@ DEFAULT_HEADERS: dict[str, str] = settings.DARK_DEFAULT_HEADERS
 def _build_tor_http_client() -> httpx.AsyncClient:
     """Create a long-lived ``httpx.AsyncClient`` routed through Tor.
 
-    The client is meant to be reused across all requests so that SOCKS5
-    connections and Tor circuits are kept alive.  A *new* client must be
-    created if the Tor proxy restarts.
+    Thin wrapper over the shared ``build_tor_http_client`` so the dark crawl
+    worker and dark-network topic discovery use one implementation. The client
+    is meant to be reused across all requests so that SOCKS5 connections and
+    Tor circuits are kept alive.  A *new* client must be created if the Tor
+    proxy restarts.
     """
-    timeout = httpx.Timeout(
-        connect=CONNECT_TIMEOUT,
-        read=READ_TIMEOUT,
-        write=WRITE_TIMEOUT,
-        pool=POOL_TIMEOUT,
-    )
-    limits = httpx.Limits(
+    return build_tor_http_client(
+        proxy_url=TOR_PROXY_URL,
         max_connections=MAX_CONCURRENT_TASKS,
-        max_keepalive_connections=MAX_CONCURRENT_TASKS,
-        keepalive_expiry=30.0,
-    )
-    # python-socks doesn't support the "socks5h" scheme directly;
-    # use "socks5" + rdns=True to resolve DNS through Tor.
-    socks_url = TOR_PROXY_URL.replace("socks5h://", "socks5://")
-    transport = AsyncProxyTransport.from_url(
-        socks_url,
-        verify=False,          # Tor exit nodes may present untrusted certs
-        rdns=True,             # Resolve DNS through the Tor proxy (like socks5h)
-    )
-    return httpx.AsyncClient(
-        transport=transport,
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=READ_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT,
+        pool_timeout=POOL_TIMEOUT,
         headers=DEFAULT_HEADERS,
-        follow_redirects=True,
-        timeout=timeout,
-        trust_env=False,       # Do not pick up system proxy settings
-        limits=limits,
+        verify=False,  # Tor exit nodes may present untrusted certs
     )
 
 
@@ -412,6 +401,10 @@ async def process_request(
                      request.job_id, request.worker_type, WORKER_TYPE)
         return
 
+    # --- Pause gate ---
+    # Wait rather than skip: discarding the message would lose this page.
+    await _wait_while_paused(request.job_id)
+
     # --- Dedup: skip jobs already completed (prevents re-processing on worker restart)
     try:
         existing_job = await pg_client.get_job(request.job_id)
@@ -456,6 +449,16 @@ async def process_request(
         await politeness.wait_for_turn(request.url)
     finally:
         await politeness.close()
+
+    # --- Multi-format content: PDF / DOCX / audio are not HTML ---
+    # Uses the same shared classification and the same persistent Tor client as
+    # the HTML path, so dark behaves identically to surface/deep.
+    content_kind = ContentIngestionService.classify_url(request.url)
+    if content_kind is not ContentKind.HTML:
+        await _process_non_html_content(
+            producer, request, item_id, content_kind, http_client=http_client
+        )
+        return
 
     # --- Fetch through Tor ---
     await publish_job_stage(
@@ -628,6 +631,121 @@ async def process_request(
         len(extracted_links),
         queued_count,
         skipped_count,
+    )
+
+
+# =========================================================================
+# Non-HTML content (PDF / DOCX / audio)
+# =========================================================================
+
+async def _process_non_html_content(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    item_id: str,
+    kind: ContentKind,
+    *,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Handle PDF/DOCX/audio through Tor, bypassing the HTML path entirely.
+
+    PDF/DOCX are fetched and converted by the shared ContentIngestionService
+    using the persistent Tor client; audio is handed off to the transcribe-
+    worker so it never blocks the dark crawl loop.
+    """
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="fetching", state="active",
+        detail=f"non_html:{kind.value}",
+    )
+
+    if kind is ContentKind.AUDIO:
+        handed_off = await ContentIngestionService.hand_off_audio(
+            producer,
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            language=request.language,
+            worker_type=WORKER_TYPE,
+            network="dark",
+        )
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            "audio_handoff", "passed" if handed_off else "failed", request.retry_count,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="passed" if handed_off else "failed",
+            detail="audio handed off for transcription",
+        )
+        return
+
+    try:
+        ingestion = await ContentIngestionService.fetch_and_extract(
+            http_client,
+            request.url,
+            headers=ContentIngestionService.ingestion_headers(),
+        )
+    except Exception as exc:
+        logger.warning("[%s] Non-HTML ingestion failed for %s: %s", request.job_id, request.url, exc)
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            f"ingest_{kind.value}_failed", "failed", request.retry_count,
+            details=str(exc)[:300],
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished", state="failed",
+            detail=f"{kind.value} ingestion failed",
+        )
+        return
+
+    # Archive the ORIGINAL bytes while they are still in memory. On the dark
+    # network this matters more than anywhere else: the origin may be gone (or
+    # slow) by the time anyone wants the file again.
+    raw_ref = await RAW_STORE.store(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        payload=ingestion.raw_bytes,
+        content_type=ingestion.content_type,
+    )
+
+    result = CrawlResult(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        language=request.language,
+        html=ingestion.text,
+        status_code=ingestion.status_code,
+        network="dark",
+        depth=request.depth,
+        content_kind=ingestion.kind.value,
+        content_type=ingestion.content_type,
+        raw_object_path=raw_ref.path if raw_ref else None,
+        raw_content_type=raw_ref.content_type if raw_ref else None,
+        raw_size_bytes=raw_ref.size_bytes if raw_ref else None,
+        raw_sha256=raw_ref.sha256 if raw_ref else None,
+    )
+    await producer.send_and_wait(
+        PRODUCE_TOPIC,
+        value=result.model_dump_json().encode("utf-8"),
+        key=request.job_id.encode("utf-8"),
+    )
+    await pg_client.record_crawl_log(
+        request.job_id, item_id, ingestion.final_url, WORKER_TYPE,
+        f"{ingestion.kind.value}_extracted", "completed", request.retry_count,
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="parsing", state="passed",
+        detail=f"{ingestion.kind.value} extracted ({ingestion.payload_size_bytes} bytes)",
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="site_finished", state="passed",
+        detail=f"{ingestion.kind.value} extracted",
+    )
+    logger.info(
+        "[%s] Extracted %s for %s (%d chars)",
+        request.job_id, ingestion.kind.value, request.url, len(ingestion.text),
     )
 
 

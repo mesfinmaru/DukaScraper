@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS duka_scraper.intelligence_analytics (
     entities Array(String),
     summary String,
     language LowCardinality(String),
+    -- Provenance of the row. 'llm' = a model produced these labels; 'fallback' =
+    -- the rule-based heuristic did (no model reachable); 'unavailable' = nothing
+    -- could analyze the payload. Reporting and human-evaluation accuracy must
+    -- separate these, or a broken LLM silently scores as a working model.
+    analysis_source LowCardinality(String) DEFAULT 'llm',
     llm_model String,
     llm_score Float32,
     created_at DateTime DEFAULT now()

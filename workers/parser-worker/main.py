@@ -33,7 +33,20 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.common.logger.logger import setup_logging as _setup_worker_logging
-from app.common.utils.minio_naming import parsed_name, raw_name
+from app.common.utils.minio_naming import parsed_name, raw_name, site_from_url
+from app.services.raw_object_store import (
+    RawObjectRef,
+    RawObjectStore,
+    record_raw_metadata,
+    split_path,
+)
+
+RAW_STORE = RawObjectStore()
+
+
+def _object_name_from_path(path: str) -> str:
+    parts = split_path(path)
+    return parts[1] if parts else path
 from app.pipeline.schemas import CrawlResult, ParsedItem
 from app.services.content_fingerprint_service import generate_fingerprint
 from app.services.link_extraction_service import LinkExtractionService
@@ -105,9 +118,17 @@ def extract_sections(raw_html: str, language: str) -> list[dict[str, Any]]:
     return sections
 
 
-def clean_and_extract_text(raw_html_or_text: str, language: str) -> str:
-    """Compatibility wrapper around the shared Amharic-aware cleaner."""
-    return clean_amharic_text(raw_html_or_text, language)
+def clean_and_extract_text(raw_html_or_text: str, language: str, **kwargs) -> str:
+    """Compatibility wrapper around the shared Amharic-aware cleaner.
+
+    ``**kwargs`` is forwarded (not spelled out) on purpose: a fixed two-arg
+    signature silently shadowed the shared cleaner, so every call site that
+    passed ``preserve_amharic=False`` for the language-detection pass died with
+    ``TypeError: clean_and_extract_text() got an unexpected keyword argument
+    'preserve_amharic'`` — which failed every parsed item routed through this
+    worker (all surface/dark/audio crawls).
+    """
+    return clean_amharic_text(raw_html_or_text, language, **kwargs)
 
 
 def detect_language_from_text(text: str, fallback: str = "en") -> str:
@@ -266,7 +287,13 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
     source_html = crawl_result.html or ""
     start_time = asyncio.get_running_loop().time()
     requested_language = (crawl_result.language or "unknown").lower()
-    extracted_text = await asyncio.to_thread(clean_and_extract_text, source_html, requested_language)
+    # Non-HTML payloads (pdf/docx text, audio transcripts) arrive as plain prose,
+    # not markup. The HTML cleaner's minimum-paragraph-length filter throws away
+    # short transcripts wholesale, so bypass it for those kinds.
+    is_plain_text = (crawl_result.content_kind or "html").lower() != "html"
+    extracted_text = await asyncio.to_thread(
+        clean_and_extract_text, source_html, requested_language, plain_text=is_plain_text
+    )
     detection_text = extracted_text
     if not detection_text:
         detection_text = await asyncio.to_thread(
@@ -274,6 +301,7 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
             source_html,
             "other",
             preserve_amharic=False,
+            plain_text=is_plain_text,
         )
     detected_language = detect_language_from_text(detection_text, "unknown")
     doc_lang = document_language(source_html)
@@ -360,7 +388,15 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
         "publish_date": publish_date,
         "detected_language": detected_language,
         "fetch_duration": crawl_result.fetch_duration,
-        "payload_size_bytes": len(source_html.encode("utf-8")),
+        # The size of the ORIGINAL payload when a crawler archived it (a 2.1 MB
+        # PDF), not the size of the text derived from it. Reporting the text
+        # size under a field called payload_size made every document look tiny.
+        "payload_size_bytes": (
+            crawl_result.raw_size_bytes or len(source_html.encode("utf-8"))
+        ),
+        # Never leave this at the schema default: a PDF/DOCX/transcript item
+        # recorded as "html" is how these ended up rendered as markup downstream.
+        "content_kind": (crawl_result.content_kind or "html").lower(),
         "proxy_ip": None,
         "retry_count": None,
         "sections": sections,
@@ -414,18 +450,40 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
         except Exception as fp_err:
             logger.debug("Fingerprint storage failed (non-fatal): %s", fp_err)
 
-    raw_object_name = raw_name(crawl_result.worker, crawl_result.job_id, item_id)
-    parsed_object_name = parsed_name(crawl_result.worker, crawl_result.job_id, item_id)
-    raw_html_path = f"s3://{MINIO_RAW_BUCKET}/{raw_object_name}"
+    # Folder layout: <site>/<JobID>_<ItemID>.<ext>.
+    #
+    # Two different things can be "the raw object" and they must not be confused:
+    #   - a crawler that already archived the ORIGINAL payload (a .pdf, a .flac)
+    #     says so on the message; that object is the archival copy and is left
+    #     strictly alone — overwriting it with the text we just derived would
+    #     destroy the only copy of the file;
+    #   - plain HTML has no such upstream copy, so the parser stores the markup
+    #     it was given, exactly as before.
+    site = site_from_url(crawl_result.url)
+    parsed_object_name = parsed_name(crawl_result.worker, crawl_result.job_id, item_id, site)
     parsed_json_path = f"s3://{MINIO_PARSED_BUCKET}/{parsed_object_name}"
 
-    raw_payload_bytes = (source_html or "").encode("utf-8")
-    await save_to_minio(
-        MINIO_RAW_BUCKET,
-        raw_object_name,
-        raw_payload_bytes,
-        content_type="text/html; charset=utf-8",
-    )
+    raw_object_name: str | None = None
+    raw_html_path = crawl_result.raw_object_path
+    if not raw_html_path:
+        raw_object_name = raw_name(crawl_result.worker, crawl_result.job_id, item_id, site)
+        raw_html_path = f"s3://{MINIO_RAW_BUCKET}/{raw_object_name}"
+        raw_payload_bytes = (source_html or "").encode("utf-8")
+        await save_to_minio(
+            MINIO_RAW_BUCKET,
+            raw_object_name,
+            raw_payload_bytes,
+            content_type="text/html; charset=utf-8",
+        )
+        await record_raw_metadata(item_id, RAW_STORE.build_ref(
+            job_id=crawl_result.job_id,
+            item_id=item_id,
+            url=crawl_result.url,
+            worker=crawl_result.worker,
+            payload=raw_payload_bytes,
+            content_type="text/html; charset=utf-8",
+            site=site,
+        ))
 
     await pg_client.system_pool.execute(
         "UPDATE parsed_items SET raw_html_path = $1, parsed_json_path = $2 WHERE item_id = $3",
@@ -433,6 +491,14 @@ async def parse_message(crawl_result: CrawlResult) -> tuple[str, dict[str, Any]]
         parsed_json_path,
         item_id,
     )
+    if crawl_result.raw_object_path:
+        await record_raw_metadata(item_id, RawObjectRef(
+            bucket=RAW_STORE.bucket,
+            object_name=_object_name_from_path(crawl_result.raw_object_path),
+            content_type=crawl_result.raw_content_type or "application/octet-stream",
+            size_bytes=crawl_result.raw_size_bytes or 0,
+            sha256=crawl_result.raw_sha256 or "",
+        ))
 
     parsed_item = ParsedItem(
         job_id=crawl_result.job_id,
@@ -505,7 +571,18 @@ async def consume_and_parse():
                 output_payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
                 # 1. Always retain parsed evidence in MinIO.
-                parsed_object_name = parsed_name(crawl_result.worker, crawl_result.job_id, item_id)
+                #    The `site` argument is not optional in practice: without it
+                #    parsed_name() falls back to the legacy flat form
+                #    ("surface_parsed_JOB..._ITEM....json"), which wrote a second,
+                #    unreferenced copy of every item while parsed_items.
+                #    parsed_json_path recorded the site-scoped key. That orphaned
+                #    the object and broke raw/parsed naming parity.
+                parsed_object_name = parsed_name(
+                    crawl_result.worker,
+                    crawl_result.job_id,
+                    item_id,
+                    site_from_url(crawl_result.url),
+                )
                 await save_to_minio(MINIO_PARSED_BUCKET, parsed_object_name, output_payload_bytes)
 
                 # 2. Publish all non-failed items to crawl.parsed so they reach

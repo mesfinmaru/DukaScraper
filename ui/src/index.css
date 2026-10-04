@@ -482,15 +482,415 @@ html.light .btn-secondary:hover:not(:disabled) {
   box-shadow: 0 0 14px rgba(42, 168, 98, 0.18);
 }
 
-/* HealthPill: in light mode the neutral pill surface must stay subtle, and
-   the degraded/down tint + label need dark text for contrast. */
-html.light .health-pill-neutral {
-  border-color: rgba(75, 120, 90, 0.35);
-  background-color: rgba(42, 168, 98, 0.08);
-}
+/* HealthPill: the dot and labels are coloured by Tailwind utilities, but the
+   degraded/down text needs a darker tint in light mode to stay readable.
+   (The old `.health-pill-neutral` rule went with the pill itself — the
+   indicator is dot-only now.) */
 html.light .health-label-down {
   color: #b01e1e;
 }
 html.light .health-label-degraded {
   color: #8a5a06;
+}
+
+/* ================= Email verification page ================= */
+/* Served on the unauthenticated route, outside the app shell, so it styles
+   itself. Colors come from the theme tokens so the dark/light toggle keeps
+   working, and the surface matches .card's visual language. */
+
+.verify-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.verify-card {
+  width: 100%;
+  max-width: 440px;
+  padding: 28px 24px;
+  border-radius: 14px;
+  text-align: center;
+  border: 1px solid var(--color-slate-800);
+  background-color: var(--color-slate-950);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+}
+
+.verify-card h2 {
+  margin: 0 0 8px;
+  font-size: 1.0625rem;
+}
+
+.verify-card p {
+  margin: 0 0 16px;
+  font-size: 0.875rem;
+  color: var(--color-slate-400);
+}
+
+.verify-error {
+  margin: 0 0 16px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #e07070;
+}
+
+.verify-button {
+  width: 100%;
+  padding: 11px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+  background-color: #1f9d57;
+  transition: filter 0.15s ease;
+}
+
+.verify-button:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.verify-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.verify-countdown {
+  margin: 12px 0 16px;
+  font-size: 0.8125rem;
+  color: var(--color-slate-500);
+}
+
+.verify-sub {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--color-slate-500);
+}
+
+.verify-link {
+  font-weight: 600;
+  color: var(--color-indigo-400);
+}
+
+.verify-link:hover {
+  text-decoration: underline;
+}
+
+/* ================= Health status dot ================= */
+/* The dot blinks and throws an expanding ring so a change in platform state
+   (healthy -> degraded -> down) is impossible to miss at a glance. Severity is
+   carried entirely by [data-state]: it picks the colour, the blink period and
+   how often the ring fires. HealthPill.tsx only decides *which* state, never the
+   styling, so the animation can be tuned here without touching React. */
+.health-dot {
+  position: relative;
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  background-color: var(--health-color);
+  animation: health-blink 3s ease-in-out infinite;
+}
+
+.health-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-color: var(--health-color);
+  animation: health-ring 2.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes health-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  70% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+@keyframes health-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+}
+
+/* Severity drives colour, blink period and ring cadence. */
+.health-dot[data-state="ready"] {
+  --health-color: #10b981;
+}
+
+.health-dot[data-state="loading"],
+.health-dot[data-state="degraded"] {
+  --health-color: #f59e0b;
+}
+
+.health-dot[data-state="down"] {
+  --health-color: #f43f5e;
+}
+
+/* Slow and calm while healthy, urgent once something is broken. The animation
+   is how loud the warning is, so severity speeds it up instead of only picking a
+   different colour. */
+.health-dot[data-state="loading"],
+.health-dot[data-state="degraded"] {
+  animation-duration: 1.2s;
+}
+
+.health-dot[data-state="degraded"]::after {
+  animation-duration: 1.3s;
+}
+
+.health-dot[data-state="down"] {
+  animation-duration: 0.7s;
+}
+
+.health-dot[data-state="down"]::after {
+  animation-duration: 0.9s;
+}
+
+/* The bright ring washes out against the light theme's pale surfaces. */
+html.light .health-dot[data-state="ready"] {
+  --health-color: #1f8f52;
+}
+
+html.light .health-dot[data-state="loading"],
+html.light .health-dot[data-state="degraded"] {
+  --health-color: #b45309;
+}
+
+html.light .health-dot[data-state="down"] {
+  --health-color: #b91c1c;
+}
+
+/* Respect the OS setting: a pulsing dot is exactly the kind of thing that
+   triggers vestibular discomfort, so it goes static rather than just slower. */
+@media (prefers-reduced-motion: reduce) {
+
+  .health-dot,
+  .health-dot::after {
+    animation: none !important;
+  }
+}
+
+/* ================= Messages ================= */
+/* Every banner, inline warning and form error uses these three classes instead
+   of ad-hoc `text-rose-400` / `text-emerald-600` utilities. The old approach
+   picked a different Tailwind stop on every page, and the rose scale is
+   remapped per theme - `text-rose-200` resolves to #4d1010 (near black) on the
+   dark canvas and #ffd6d6 (near white) on the light one, i.e. invisible in both.
+   Fixing it per-page is whack-a-mole, so the colours live here once, written as
+   literal hex per theme because no stop in either scale is reliably readable. */
+
+.msg {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  border-radius: 0.5rem;
+  border-width: 1px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+
+.msg-error {
+  color: #ffb4b4;
+  background-color: rgba(244, 63, 94, 0.12);
+  border-color: rgba(244, 63, 94, 0.45);
+}
+
+.msg-success {
+  color: #7ef0a8;
+  background-color: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.45);
+}
+
+.msg-warn {
+  color: #ffd98a;
+  background-color: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+/* Icon tint follows the message text so it never drifts from the copy. */
+.msg-error svg {
+  color: #ff8f8f;
+}
+.msg-success svg {
+  color: #4ade9c;
+}
+.msg-warn svg {
+  color: #fbbf5a;
+}
+
+html.light .msg-error {
+  color: #a01818;
+  background-color: #fdeaea;
+  border-color: #e9a3a3;
+}
+
+html.light .msg-success {
+  color: #0f6b3c;
+  background-color: #e4f8ec;
+  border-color: #93d3b0;
+}
+
+html.light .msg-warn {
+  color: #7a4f06;
+  background-color: #fdf3dd;
+  border-color: #e2bd77;
+}
+
+html.light .msg-error svg {
+  color: #c22525;
+}
+html.light .msg-success svg {
+  color: #177244;
+}
+html.light .msg-warn svg {
+  color: #a86f10;
+}
+
+/* Destructive action button, used by the confirm dialog. Separate from
+   .btn-primary so "Delete" never inherits the green success styling. */
+.btn-danger {
+  @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-50;
+  background-color: #dc2626;
+  box-shadow:
+    0 0 0 1px rgba(244, 63, 94, 0.4),
+    0 0 16px rgba(244, 63, 94, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: #ef4444;
+  box-shadow:
+    0 0 0 1px rgba(244, 63, 94, 0.6),
+    0 0 24px rgba(244, 63, 94, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+html.light .btn-danger {
+  background-color: #b91c1c;
+  box-shadow:
+    0 0 0 1px rgba(185, 28, 28, 0.3),
+    0 0 16px rgba(185, 28, 28, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+html.light .btn-danger:hover:not(:disabled) {
+  background-color: #991b1b;
+}
+
+/* ================= Scrollable data tables ================= */
+/* Long lists scroll inside their own card instead of stretching the page: the
+   wrapper caps its height on both axes and the header row pins to the top so the
+   columns stay identifiable while you scroll. Every table that needs horizontal
+   scrolling uses this class, so the height cap and the pinned header stay in step
+   across pages. */
+.table-scroll {
+  max-height: var(--table-scroll-max, 62vh);
+  overflow: auto;
+
+  /* Stop the wheel chaining to the page once the table hits its end. */
+  overscroll-behavior: contain;
+}
+
+.table-scroll > table > thead > tr > th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+
+  /* Header backgrounds vary per page (slate-950, slate-900/40, or none) and two
+     of them are translucent, so rows would show through a pinned header. One
+     opaque surface for all of them - the value most pages already used. */
+  background-color: var(--color-slate-950);
+
+  /* border-collapse: collapse drops the header's own border, so re-draw the
+     hairline as an inset shadow that travels with the sticky cell. */
+  box-shadow: inset 0 -1px 0 var(--color-slate-800);
+}
+
+/* ==========================================================================
+   Responsive tables
+   --------------------------------------------------------------------------
+   Wide tables become stacked cards below the `sm` breakpoint (640px). Each
+   cell carries a `data-label` with its column heading, which the stylesheet
+   renders as the row's label - so every field stays visible instead of being
+   hidden behind horizontal scrolling.
+
+   The `min-w-[...]` floors the tables declare are neutralised at the same
+   width, because they are what makes the *page* overflow, not just the wrapper.
+   ====================================================================== */
+
+@media (max-width: 639px) {
+  .table-scroll table {
+    min-width: 0 !important;
+    width: 100%;
+  }
+
+  .table-scroll thead {
+    /* Replaced by the per-cell labels below. */
+    display: none;
+  }
+
+  .table-scroll tbody tr {
+    display: block;
+    border-bottom: 1px solid var(--color-slate-800);
+    padding: 0.25rem 0;
+  }
+
+  .table-scroll tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .table-scroll tbody td {
+    /* Label on the left, value on the right. `flex-start` keeps a long value
+       from being orphaned on the far edge of a wide screen. */
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.375rem 0.875rem;
+    border: 0;
+    text-align: right;
+    min-width: 0;
+  }
+
+  .table-scroll tbody td::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--color-slate-500);
+    text-align: left;
+  }
+
+  /* A cell with no heading (an actions column, say) should not show a blank
+     label gutter, so drop the gap and let the content align left. */
+  .table-scroll tbody td:not([data-label]) {
+    justify-content: flex-start;
+    text-align: left;
+  }
+
+  /* Values are the payload here: let them wrap instead of forcing a width. */
+  .table-scroll tbody td > * {
+    min-width: 0;
+  }
 }

@@ -177,9 +177,9 @@ export default function Search() {
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 503 && mode === "semantic") {
-        setError("Semantic search is unavailable - the embedding service or vector DB is down. Try keyword search.")
+        setError("Smart search is unavailable. Try a normal word search.")
       } else {
-        setError(err instanceof Error ? err.message : "Search failed")
+        setError(err instanceof Error ? err.message : "Search failed.")
       }
     } finally {
       setLoading(false)

@@ -11,14 +11,38 @@ import json
 import os
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.common.logger.logger import logger
+from app.security.auth import ensure_owner_or_admin, get_current_user
+from app.security.scope import visible_job_ids
 from app.storage.elasticsearch.client import es_client
 from app.storage.minio.client import minio_client
 from app.storage.postgres.client import pg_client
 
 router = APIRouter()
+
+#: How much extracted text the single-item endpoint returns as a preview. Enough
+#: to judge whether the extraction worked, small enough that expanding one row
+#: does not ship a whole article.
+SAMPLE_CHARS = 1200
+# The summary endpoint embeds full parsed text plus raw HTML per item, so it is
+# paged. These bounds keep a single response to a sane size no matter how large
+# the job is.
+SUMMARY_PAGE_SIZE = 10
+SUMMARY_MAX_PAGE_SIZE = 50
+
+
+async def _require_job_access(job_id: str, user) -> None:
+    """403 unless `user` owns `job_id` (admins pass).
+
+    Raises 404 for a job that does not exist so this cannot be used to probe
+    which job IDs are real.
+    """
+    job = await pg_client.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
 
 ES_INDEX = "duka_articles"
 
@@ -59,8 +83,14 @@ def _read_object(bucket: str, name: str) -> bytes | None:
         return None
 
 
-async def _fetch_parsed_content(item: dict) -> None:
-    """Attach parsed JSON + raw HTML (and object names) to a summary item."""
+async def _fetch_parsed_content(item: dict, *, include_raw: bool = True) -> None:
+    """Attach parsed JSON + raw HTML (and object names) to a summary item.
+
+    ``include_raw=False`` still records ``raw_object`` (the key) but skips
+    reading and embedding the raw body. The raw HTML is ~97% of the payload on
+    a typical page (10.1MB vs 294KB of parsed content for 25 items), and the UI
+    only needs the key to stream the file on demand.
+    """
     item["parsed_content"] = None
     item["raw_html"] = None
     item["parsed_object"] = None
@@ -78,7 +108,27 @@ async def _fetch_parsed_content(item: dict) -> None:
         parsed_blob = await asyncio.to_thread(_read_object, parsed_bucket, parsed_obj)
     if raw_bucket and raw_obj:
         item["raw_object"] = raw_obj
-        raw_blob = await asyncio.to_thread(_read_object, raw_bucket, raw_obj)
+        if include_raw:
+            raw_blob = await asyncio.to_thread(_read_object, raw_bucket, raw_obj)
+
+    # Normalise the parsed object for callers. On disk it is an envelope with
+    # the real payload nested under "data" (and, for a few older writers, some
+    # envelope keys copied inside it too). Every consumer wants the flat shape -
+    # `parsed_content.content_quality_score`, `parsed_content.extracted_text` -
+    # so flatten once here instead of making each reader remember the nesting.
+    # Reading the wrong level is what made quality render as "NaN%".
+    if parsed_blob:
+        try:
+            envelope = json.loads(parsed_blob.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            envelope = None
+        if isinstance(envelope, dict):
+            inner = envelope.get("data")
+            inner = inner if isinstance(inner, dict) else {}
+            merged = {k: v for k, v in envelope.items() if k != "data"}
+            merged.update(inner)
+            item["parsed_content"] = merged
+            return
 
     if parsed_blob:
         try:
@@ -93,6 +143,7 @@ async def _fetch_parsed_content(item: dict) -> None:
 async def search_articles(
     q: str = Query(..., description="Full-text search query"),
     size: int = 20,
+    user: dict = Depends(get_current_user),
 ):
     """Full-text search over scraped/parsed articles in Elasticsearch.
 
@@ -104,6 +155,16 @@ async def search_articles(
         # Forgiving search: fuzzy full-text match plus a URL wildcard fallback.
         # The standard analyzer indexes hostnames like "scrapingcourse.com" as a
         # single token, so an exact "scrapingcourse" query would otherwise miss.
+        # A regular user may only match documents from their own jobs. The
+        # index holds every account's articles, so without this filter the
+        # search returned other people's scraped content.
+        job_ids = await visible_job_ids(user)
+        owner_filter = (
+            []
+            if job_ids is None
+            else [{"terms": {"job_id": sorted(job_ids)}}]
+        )
+
         query: dict = {
             "bool": {
                 "should": [
@@ -121,6 +182,7 @@ async def search_articles(
                     },
                 ],
                 "minimum_should_match": 1,
+                "filter": owner_filter,
             }
         }
 
@@ -143,6 +205,7 @@ async def search_articles(
 @router.get("/search/semantic")
 async def semantic_search_articles(
     q: str = Query(..., description="Free-text query embedded and matched against stored article vectors"),
+    user: dict = Depends(get_current_user),
     size: int = 20,
 ):
     """Nearest-neighbor search over stored article embeddings (Qdrant).
@@ -167,23 +230,36 @@ async def semantic_search_articles(
             if emb_resp.status_code != 200:
                 raise HTTPException(
                     status_code=503,
-                    detail="Embedding service unavailable - semantic search disabled",
+                    detail="Smart search is unavailable right now.",
                 )
             vectors = emb_resp.json().get("embeddings", [])
             if not vectors:
                 raise HTTPException(
                     status_code=503,
-                    detail="Embedding service returned no vector - semantic search disabled",
+                    detail="Smart search is unavailable right now.",
                 )
+
+            # Restrict to the caller's own jobs before the vector search runs,
+            # so another account's articles can never be returned.
+            job_ids = await visible_job_ids(user)
+            search_body: dict = {
+                "vector": vectors[0],
+                "limit": limit,
+                "with_payload": True,
+            }
+            if job_ids is not None:
+                search_body["filter"] = {
+                    "must": [{"key": "job_id", "match": {"any": sorted(job_ids)}}]
+                }
 
             search_resp = await client.post(
                 f"{SEMANTIC_VECTOR_DB_URL}/collections/{SEMANTIC_VECTOR_COLLECTION}/points/search",
-                json={"vector": vectors[0], "limit": limit, "with_payload": True},
+                json=search_body,
             )
             if search_resp.status_code != 200:
                 raise HTTPException(
                     status_code=503,
-                    detail="Vector database unavailable - semantic search disabled",
+                    detail="Smart search is unavailable right now.",
                 )
             hits = search_resp.json().get("result", [])
         except HTTPException:
@@ -192,7 +268,7 @@ async def semantic_search_articles(
             logger.warning(f"Semantic search failed: {e}")
             raise HTTPException(
                 status_code=503,
-                detail="Semantic search unavailable (embedding service or vector DB unreachable)",
+                detail="Smart search is unavailable right now.",
             ) from e
 
     results = []
@@ -215,14 +291,19 @@ async def semantic_search_articles(
 
 
 @router.get("/job/{job_id}")
-async def get_articles_for_job(job_id: str):
+async def get_articles_for_job(
+    job_id: str,
+    user: dict = Depends(get_current_user),
+):
     """
     Get parsed item metadata for a job from PostgreSQL (duka_system.parsed_items).
     Returns metadata + MinIO path references (NOT the full text - see /search for that).
     """
+    await _require_job_access(job_id, user)
+
     items = await pg_client.get_parsed_items_by_job(job_id)
     if not items:
-        raise HTTPException(status_code=404, detail="No parsed items found for this job")
+        raise HTTPException(status_code=404, detail="This job has no results yet.")
 
     return {
         "job_id": job_id,
@@ -248,14 +329,44 @@ async def get_articles_for_job(job_id: str):
 
 
 @router.get("/{item_id}")
-async def get_article(item_id: str):
+async def get_article(
+    item_id: str,
+    user: dict = Depends(get_current_user),
+):
     """Get a single parsed item's metadata by item_id (e.g. 'ITEM00000001')."""
     item = await pg_client.get_parsed_item(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
+    # asyncpg returns an immutable Record; _fetch_parsed_content enriches the row
+    # in place, so it needs a real dict. Without this the endpoint raised
+    # "TypeError: 'asyncpg.protocol.record.Record' object does not support item
+    # assignment" and every "show me the text I captured" click rendered
+    # "An unexpected error occurred".
+    item = dict(item)
+
+    # Ownership is checked after the lookup because parsed_items has no owner
+    # column of its own - it inherits the owner of the job it came from.
+    await _require_job_access(item["job_id"], user)
+
+    # Pull the parsed object so the caller can show a sample of the extracted
+    # text. The UI previously listed only metadata (URL, dates), which meant
+    # expanding a row told you nothing about what had actually been captured.
+    # Bounded below, and a missing/unreadable object degrades to no sample
+    # rather than failing the request - metadata is still worth returning.
+    await _fetch_parsed_content(item, include_raw=False)
+    content = item.get("parsed_content") or {}
+    # The parsed object nests the extraction under "data"; older/hand-built
+    # objects put it at the top level. Reading only the top level silently
+    # produced an empty sample for every real item.
+    extracted = content.get("extracted_text") or (content.get("data") or {}).get("extracted_text") or ""
+    text_sample = extracted[:SAMPLE_CHARS].strip() if isinstance(extracted, str) else ""
 
     return {
         "item_id": item["item_id"],
+        # First slice of the extracted text, so expanding a row shows what was
+        # actually scraped instead of only its metadata.
+        "text_sample": text_sample,
+        "text_sample_truncated": bool(extracted) and len(extracted) > SAMPLE_CHARS,
         "job_id": item["job_id"],
         "source_url": item["source_url"],
         "language": item["language"],
@@ -272,23 +383,40 @@ async def get_article(item_id: str):
 
 
 @router.get("/job/{job_id}/summary")
-async def get_article_summary(job_id: str):
+async def get_article_summary(
+    job_id: str,
+    limit: int = Query(default=SUMMARY_PAGE_SIZE, ge=1, le=SUMMARY_MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
+    include_raw: bool = Query(
+        default=False,
+        description="Embed the raw HTML body as well as its object name. Off by "
+        "default: it dominates the response size and is only needed when the "
+        "caller actually wants to display it.",
+    ),
+    user: dict = Depends(get_current_user),
+):
     """Full-content summary for the article detail page.
 
     Returns each parsed item's metadata plus its parsed JSON payload and raw
     HTML (both streamed from MinIO) so the UI can render full-text previews.
     Missing objects degrade gracefully to null instead of failing the request.
     """
-    job = await pg_client.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    await _require_job_access(job_id, user)
 
     items = await pg_client.get_parsed_items_by_job(job_id)
     if not items:
-        raise HTTPException(status_code=404, detail="No parsed items found for this job")
+        raise HTTPException(status_code=404, detail="This job has no results yet.")
+
+    # Paginate BEFORE fetching any MinIO content. This endpoint streams the
+    # full parsed text *and* raw HTML for every item, so an unpaginated call
+    # returned 17MB for a 79-item job (and gigabytes for the large legacy
+    # jobs), which is what left the UI showing a single item or nothing at
+    # all. `total` still reports every item so the client can page through.
+    total_items = len(items)
+    page = items[offset : offset + limit]
 
     rows = []
-    for item in items:
+    for item in page:
         rows.append({
             "item_id": item["item_id"],
             "source_url": item["source_url"],
@@ -304,10 +432,15 @@ async def get_article_summary(job_id: str):
             "raw_html_path": item["raw_html_path"],
         })
 
-    await asyncio.gather(*(_fetch_parsed_content(row) for row in rows))
+    await asyncio.gather(
+        *(_fetch_parsed_content(row, include_raw=include_raw) for row in rows)
+    )
 
     return {
         "job_id": job_id,
-        "total": len(rows),
+        "total": total_items,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(rows) < total_items,
         "items": rows,
     }

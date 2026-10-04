@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
   Activity,
   ArrowLeft,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleX,
   Clock3,
   FileText,
   Globe,
   Loader2,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  Zap,
 } from "lucide-react"
 import { api, ApiError, getJobStatusSocketUrl } from "../api"
 import { useRealtimeSocket } from "../useRealtime"
@@ -27,6 +32,7 @@ import {
   ErrorBanner,
   InfoRow,
   LoadingBlock,
+  Msg,
   StatusBadge,
 } from "../components/ui"
 
@@ -77,6 +83,7 @@ const STAGE_ORDER = [
   "login",
   "signup",
   "verification",
+  "transcribing",
   "parsing",
 ]
 
@@ -89,12 +96,227 @@ const STAGE_LABELS: Record<string, string> = {
   login: "Login",
   signup: "Signup",
   verification: "Email verification",
+  transcribing: "Transcribing audio",
   parsing: "Parsing",
   completed: "Completed",
 }
 
+/**
+ * Topic-discovery jobs use a synthetic ``search://<network>/<query>`` seed URL
+ * instead of a real target. Parse it so the header can show the query/network
+ * rather than an unclickable pseudo-URL.
+ */
+function parseDiscoveryUrl(url: string): { network: string; query: string } | null {
+  if (!url.startsWith("search://")) return null
+  const rest = url.slice("search://".length)
+  const slash = rest.indexOf("/")
+  if (slash === -1) return { network: rest, query: "" }
+  return { network: rest.slice(0, slash), query: decodeURIComponent(rest.slice(slash + 1)) }
+}
+
 function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] ?? stage.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+// ── Overall job lifecycle ────────────────────────────────────────────────────
+type LifecyclePhase = "started" | "working" | "retrying" | "finished"
+
+function deriveLifecycle(
+  job: JobDetailType,
+  stages: Record<string, StageEvent>,
+): LifecyclePhase {
+  if (TERMINAL_STATUSES.has(job.status)) return "finished"
+  if (stages["camoufox_fallback"]) return "retrying"
+  if (
+    stages["fetching"] ||
+    stages["challenge"] ||
+    stages["transcribing"] ||
+    stages["parsing"]
+  )
+    return "working"
+  return "started"
+}
+
+const LIFECYCLE_STEPS: { key: LifecyclePhase; label: string; icon: React.ReactNode }[] = [
+  { key: "started",  label: "Started",  icon: <Zap className="h-3.5 w-3.5" /> },
+  { key: "working",  label: "Working",  icon: <Globe className="h-3.5 w-3.5" /> },
+  { key: "retrying", label: "Retrying", icon: <RefreshCw className="h-3.5 w-3.5" /> },
+  { key: "finished", label: "Finished", icon: <Check className="h-3.5 w-3.5" /> },
+]
+
+const PHASE_ORDER: LifecyclePhase[] = ["started", "working", "retrying", "finished"]
+
+function OverallProgressCard({
+  job,
+  stages,
+}: {
+  job: JobDetailType
+  stages: Record<string, StageEvent>
+}) {
+  const phase = deriveLifecycle(job, stages)
+  const phaseIdx = PHASE_ORDER.indexOf(phase)
+  const failed = job.status === "failed"
+
+  /**
+   * Steps up to and including the current one. Later phases are not rendered
+   * yet: showing "Retrying" and "Finished" greyed out before a job has reached
+   * them read as a claim about the job rather than as its current state. They
+   * appear as the crawl actually gets to them.
+   */
+  const visibleSteps = LIFECYCLE_STEPS.filter(
+    (s) => PHASE_ORDER.indexOf(s.key) <= phaseIdx,
+  )
+
+  // Elapsed clock
+  const [, setTick] = useState(0)
+  const isActive = !TERMINAL_STATUSES.has(job.status)
+  useEffect(() => {
+    if (!isActive) return
+    const t = window.setInterval(() => setTick((v) => v + 1), 1000)
+    return () => window.clearInterval(t)
+  }, [isActive])
+
+  const elapsed = formatDuration(job.created_at, job.completed_at ?? new Date().toISOString())
+
+  // Current activity label
+  const activityLabel = (() => {
+    if (failed) return "Job failed"
+    if (job.status === "completed") return "All done — content extracted"
+    if (job.status === "skipped") return "Skipped"
+    if (stages["camoufox_fallback"]) {
+      const ev = stages["camoufox_fallback"]
+      return ev.detail ?? "Stealth browser bypass in progress…"
+    }
+    if (stages["transcribing"]?.state === "active") return "Transcribing audio…"
+    if (stages["parsing"]?.state === "active") return "Parsing extracted content…"
+    if (stages["challenge"]?.state === "active") return "Solving anti-bot challenge…"
+    if (stages["challenge_detected"]) return "Challenge detected — attempting bypass…"
+    if (stages["fetching"]?.state === "active") return "Fetching page content…"
+    if (stages["login"]?.state === "active") return "Logging in…"
+    if (stages["signup"]?.state === "active") return "Signing up…"
+    if (stages["verification"]?.state === "active") return "Verifying email…"
+    return "Job queued — waiting for worker…"
+  })()
+
+  return (
+    <div className="card p-5">
+      {/* Header row */}
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+          <Activity className="h-4 w-4 text-indigo-400" />
+          Overall progress
+        </h2>
+        {elapsed && (
+          <span className="flex items-center gap-1 text-xs text-slate-500">
+            <Clock3 className="h-3 w-3" />
+            {elapsed}
+          </span>
+        )}
+      </div>
+
+      {/* Lifecycle stepper */}
+      <div className="mb-5 flex items-center gap-0">
+        {visibleSteps.map((step, i) => {
+          const stepIdx = PHASE_ORDER.indexOf(step.key)
+          // Once the job reaches a terminal state the "finished" step is
+          // complete, not in progress. Left as "current" it kept rendering the
+          // animate-spin loader forever on completed jobs.
+          const terminalStep =
+            phase === "finished" && step.key === "finished"
+          const isDone = stepIdx < phaseIdx || terminalStep
+          const isCurrent = stepIdx === phaseIdx && !terminalStep
+          // Skip "retrying" step if it was never reached and job is finished
+          if (step.key === "retrying" && phase === "finished" && !stages["camoufox_fallback"]) {
+            return null
+          }
+          const dotStyle = cn(
+            "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-all duration-300",
+            isDone
+              ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-400"
+              : isCurrent && failed
+                ? "border-rose-500/50 bg-rose-500/15 text-rose-400"
+                : isCurrent
+                  ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-300 animate-pulse"
+                  : "border-slate-800 bg-slate-900/50 text-slate-700",
+          )
+          return (
+            <div key={step.key} className="flex flex-1 items-center">
+              <div className="flex flex-col items-center gap-1">
+                <div className={dotStyle}>
+                  {isCurrent && !failed ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : isCurrent && failed ? (
+                    <CircleX className="h-3.5 w-3.5" />
+                  ) : isDone ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : (
+                    step.icon
+                  )}
+                </div>
+                <span
+                  className={cn(
+                    "text-[10px] font-medium whitespace-nowrap",
+                    isDone
+                      ? "text-emerald-400"
+                      : isCurrent && failed
+                        ? "text-rose-400"
+                        : isCurrent
+                          ? "text-indigo-300"
+                          : "text-slate-500",
+                  )}
+                >
+                  {step.label}
+                </span>
+              </div>
+              {i < visibleSteps.length - 1 && (
+                <div
+                  className={cn(
+                    "mx-2 mb-4 h-px flex-1 transition-all duration-500",
+                    isDone ? "bg-emerald-500/40" : "bg-slate-800",
+                  )}
+                />
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Current activity */}
+      <div
+        className={cn(
+          "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
+          failed
+            ? "border-rose-500/40 bg-rose-500/10 text-rose-300"
+            : job.status === "completed"
+              ? "border-emerald-500/30 bg-emerald-500/8 text-emerald-300"
+              : "border-indigo-500/20 bg-indigo-500/8 text-indigo-200",
+        )}
+      >
+        {failed ? (
+          <CircleX className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+        ) : job.status === "completed" ? (
+          <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+        ) : (
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-indigo-400" />
+        )}
+        <span>{activityLabel}</span>
+      </div>
+
+      {/* Failure reason */}
+      {job.failure_reason && (
+        <div className="mt-3">
+          <Msg tone="error">
+            <span>
+              <span className="block text-[11px] font-semibold tracking-wider uppercase opacity-80">
+                Why it failed
+              </span>
+              {friendlyNavError(job.failure_reason)}
+            </span>
+          </Msg>
+        </div>
+      )}
+    </div>
+  )
 }
 
 /**
@@ -123,110 +345,111 @@ function friendlyNavError(raw: string | null | undefined): string {
   return firstLine.replace(/^(Page\.goto|Page\.evaluate)?:?\s*/i, "").trim() || text
 }
 
-function StageTimeline({
-  job,
-  stages,
+// Stage icon map for site-level events
+function stageIcon(
+  stage: string,
+  state: StageEvent["state"],
+  jobTerminal = false,
+): React.ReactNode {
+  if (state === "passed") return <Check className="h-3 w-3" />
+  if (state === "failed") return <CircleX className="h-3 w-3" />
+  if (state === "active") {
+    // A stage can be left "active" when a worker dies or never publishes a
+    // terminal update. Once the job itself has finished, that leftover spinner
+    // must stop - otherwise the site timeline shows work "in progress" forever
+    // on a job that already completed.
+    if (jobTerminal) return <Check className="h-3 w-3 text-emerald-400" />
+    return <Loader2 className="h-3 w-3 animate-spin" />
+  }
+  // Pending icons by stage type
+  const icons: Record<string, React.ReactNode> = {
+    queued: <Clock3 className="h-3 w-3" />,
+    fetching: <Globe className="h-3 w-3" />,
+    challenge_detected: <ShieldAlert className="h-3 w-3" />,
+    challenge: <ShieldAlert className="h-3 w-3" />,
+    camoufox_fallback: <RefreshCw className="h-3 w-3" />,
+    login: <Zap className="h-3 w-3" />,
+    signup: <Zap className="h-3 w-3" />,
+    verification: <Check className="h-3 w-3" />,
+    transcribing: <FileText className="h-3 w-3" />,
+    parsing: <FileText className="h-3 w-3" />,
+  }
+  return icons[stage] ?? <Clock3 className="h-3 w-3" />
+}
+
+function SiteEventFeed({
+  site,
+  resolve,
+  jobTerminal,
 }: {
-  job: JobDetailType
-  stages: Record<string, StageEvent>
+  site: SiteProgress
+  resolve: (ev: StageEvent) => StageEvent
+  jobTerminal: boolean
 }) {
-  const failed = job.status === "failed"
-  const jobTerminal = TERMINAL_STATUSES.has(job.status)
-
-  // When the job has reached a terminal state, no stage may keep spinning:
-  // resolve any lingering "active" stage from the final job status. Derived
-  // at render time so it also applies to WebSocket replays.
-  const effectiveState = (state: StageEvent["state"]): StageEvent["state"] => {
-    if (state !== "active" || !jobTerminal) return state
-    return failed ? "failed" : "passed"
-  }
-
-  // Build the ordered list of stages to show: fixed prefixes plus any dynamic
-  // stages that actually arrived, in canonical order.
-  const present = STAGE_ORDER.filter((s) => stages[s])
-  const nodes: { key: string; label: string; ev: StageEvent }[] = [
-    { key: "queued", label: stageLabel("queued"), ev: stages.queued ?? { stage: "queued", state: "passed" } },
-    ...present
-      .filter((s) => s !== "queued")
-      .map((s) => ({ key: s, label: stageLabel(s), ev: { ...stages[s], state: effectiveState(stages[s].state) } })),
-  ]
-  if (TERMINAL_STATUSES.has(job.status)) {
-    nodes.push({
-      key: "completed",
-      label: failed ? "Failed" : job.status === "skipped" ? "Skipped" : "Completed",
-      ev: { stage: "completed", state: failed ? "failed" : "passed" },
-    })
-  }
-
-  const stateStyle = (state: StageEvent["state"], isLast: boolean) => {
-    if (state === "passed") return "border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-    if (state === "failed") return "border-rose-500/50 bg-rose-500/10 text-rose-400"
-    if (state === "active") return "border-sky-500/50 bg-sky-500/10 text-sky-300"
-    return isLast
-      ? "border-indigo-500/40 bg-indigo-500/10 text-indigo-300"
-      : "border-slate-800 bg-slate-900 text-slate-600"
+  const present = STAGE_ORDER.filter((s) => site.stages[s])
+  if (present.length === 0) {
+    return <p className="text-xs text-slate-600">No stage activity recorded yet.</p>
   }
 
   return (
-    <div className="flex flex-wrap items-start gap-y-3">
-      {nodes.map((node, i) => {
-        const isLast = i === nodes.length - 1
-        const spinner = node.ev.state === "active"
+    <div className="space-y-1.5">
+      {present.map((s) => {
+        const ev = resolve(site.stages[s])
+        const dotStyle = cn(
+          "flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-all duration-300",
+          ev.state === "passed"
+            ? "border-emerald-500/40 bg-emerald-500/12 text-emerald-400"
+            : ev.state === "failed"
+              ? "border-rose-500/40 bg-rose-500/12 text-rose-400"
+              : ev.state === "active"
+                ? "border-indigo-500/50 bg-indigo-500/12 text-indigo-300"
+                : "border-slate-800 bg-slate-900/50 text-slate-600",
+        )
+        const labelStyle = cn(
+          "text-xs font-medium",
+          ev.state === "passed"
+            ? "text-emerald-300"
+            : ev.state === "failed"
+              ? "text-rose-300"
+              : ev.state === "active"
+                ? "text-indigo-200"
+                : "text-slate-500",
+        )
+        const detailText = ev.state === "failed"
+          ? friendlyNavError(ev.detail)
+          : ev.detail
+
         return (
-          <div key={node.key} className="flex items-start">
-            <div className="flex min-w-[64px] flex-col items-center gap-1">
-              <div
-                className={cn(
-                  "flex h-6 w-6 items-center justify-center rounded-full border",
-                  stateStyle(node.ev.state, isLast),
-                  node.ev.state === "active" && "animate-pulse",
+          <div key={s} className="flex items-start gap-2.5">
+            <div className="mt-0.5 flex flex-col items-center">
+              <div className={dotStyle}>
+                {stageIcon(s, ev.state, jobTerminal)}
+              </div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className={labelStyle}>{stageLabel(s)}</span>
+                {ev.state === "active" && (
+                  <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-1.5 py-px text-[9px] font-semibold uppercase tracking-wider text-indigo-300">
+                    live
+                  </span>
                 )}
-                title={node.ev.detail ?? node.label}
-              >
-                {node.ev.state === "failed" ? (
-                  <CircleX className="h-3 w-3" />
-                ) : node.ev.state === "passed" ? (
-                  <Check className="h-3 w-3" />
-                ) : spinner ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Clock3 className="h-3 w-3" />
+                {ev.state === "passed" && s === "challenge" && (
+                  <span className="flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-px text-[9px] font-semibold text-emerald-400">
+                    <ShieldCheck className="h-2.5 w-2.5" /> bypassed
+                  </span>
                 )}
               </div>
-              <span
-                className={cn(
-                  "max-w-[80px] text-center text-[10px] font-medium leading-tight",
-                  node.ev.state === "passed"
-                    ? "text-slate-300"
-                    : node.ev.state === "failed"
-                      ? "text-rose-300"
-                      : node.ev.state === "active"
-                        ? "text-sky-300"
-                        : "text-slate-500",
-                )}
-              >
-                {node.label}
-              </span>
-              {node.ev.detail && (
-                <span
-                  className="max-w-[88px] truncate text-center text-[9px] leading-tight text-slate-600"
-                  title={node.ev.state === "failed" ? friendlyNavError(node.ev.detail) : node.ev.detail}
-                >
-                  {node.ev.state === "failed" ? friendlyNavError(node.ev.detail) : node.ev.detail}
-                </span>
+              {detailText && (
+                <p className="mt-0.5 break-words text-[11px] leading-snug text-slate-500">
+                  {detailText}
+                </p>
               )}
             </div>
-            {i < nodes.length - 1 && (
-              <div
-                className={cn(
-                  "mx-1.5 mt-3 h-px w-6",
-                  node.ev.state === "passed"
-                    ? "bg-emerald-500/40"
-                    : node.ev.state === "failed"
-                      ? "bg-rose-500/40"
-                      : "bg-slate-800",
-                )}
-              />
+            {ev.ts && (
+              <span className="shrink-0 text-[10px] text-slate-700">
+                {new Date(ev.ts).toLocaleTimeString()}
+              </span>
             )}
           </div>
         )
@@ -250,10 +473,7 @@ function SitesPanel({
     if (b.state === "active" && a.state !== "active") return 1
     return (a.startedTs ?? "").localeCompare(b.startedTs ?? "")
   })
-  // Stall guard: a site whose worker stopped sending updates (crash without
-  // cleanup, lost Kafka message) must not spin forever. After STALL_AFTER_MS
-  // with no stage event it is shown as "stalled" instead of "active". The
-  // backend watchdog still owns the real settlement — this is display only.
+
   const STALL_AFTER_MS = 10 * 60 * 1000
   const lastActivityTs = (site: SiteProgress): number | null => {
     const raw = site.lastTs ?? site.startedTs
@@ -276,22 +496,13 @@ function SitesPanel({
     if (site.state !== "active" || !jobTerminal) return site.state
     return jobFailed ? "failed" : "passed"
   }
-  const activeSite = list.find((s) => displayState(s) === "active")
-  const done = list.filter((s) => displayState(s) === "passed").length
-  const failedCount = list.filter((s) => displayState(s) === "failed" && !stalled(s)).length
-  const stalledCount = list.filter((s) => stalled(s)).length
 
-  // When the job reached a terminal state, resolve lingering "active" stages
-  // so no spinner keeps spinning on a finished job.
   const resolve = (ev: StageEvent): StageEvent => {
     if (ev.state !== "active" || !jobTerminal) return ev
     return { ...ev, state: jobFailed ? "failed" : "passed" }
   }
 
-  // Live elapsed clock — only ticks while something is still running.
   const [, setTick] = useState(0)
-  // Keep the clock ticking while any site is raw-active so stalled badges
-  // and their "no updates for X min" labels keep updating too.
   const hasActive = list.some((s) => s.state === "active")
   useEffect(() => {
     if (!hasActive) return
@@ -299,193 +510,181 @@ function SitesPanel({
     return () => window.clearInterval(t)
   }, [hasActive])
 
-  const activeStageOf = (site: SiteProgress): StageEvent | null => {
-    const present = STAGE_ORDER.filter((s) => site.stages[s])
-    for (let i = present.length - 1; i >= 0; i--) {
-      const ev = resolve(site.stages[present[i]])
-      if (ev.state === "active") return ev
-    }
-    return null
-  }
-
   const elapsedLabel = (site: SiteProgress): string => {
     const start = site.startedTs ? new Date(site.startedTs).getTime() : null
     if (start === null || Number.isNaN(start)) return "-"
-    // Stalled sites freeze the clock at their last update instead of ticking.
     const stalledEnd = stalled(site) ? lastActivityTs(site) : null
     const end = site.finishedTs
       ? new Date(site.finishedTs).getTime()
       : stalledEnd ?? (site.state === "active" ? Date.now() : null)
     if (end === null) return "-"
     const sec = Math.max(0, (end - start) / 1000)
-    if (sec < 60) return `${sec.toFixed(0)} s`
+    if (sec < 60) return `${sec.toFixed(0)}s`
     return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`
   }
 
-  const badgeStyle = (state: SiteProgress["state"]) =>
-    state === "active"
-      ? "border-sky-500/50 bg-sky-500/10 text-sky-300"
-      : state === "failed"
-        ? "border-rose-500/50 bg-rose-500/10 text-rose-300"
-        : "border-emerald-500/40 bg-emerald-500/10 text-emerald-600"
+  const done = list.filter((s) => displayState(s) === "passed").length
+  const failedCount = list.filter((s) => displayState(s) === "failed" && !stalled(s)).length
+  const stalledCount = list.filter((s) => stalled(s)).length
+  const activeCount = list.filter((s) => displayState(s) === "active").length
+
+  // Latest stage label for a site
+  const latestStageOf = (site: SiteProgress): string => {
+    const present = STAGE_ORDER.filter((s) => site.stages[s])
+    if (present.length === 0) return ""
+    const last = present[present.length - 1]
+    const ev = resolve(site.stages[last])
+    return stageLabel(last) + (ev.detail ? ` — ${ev.detail}` : "")
+  }
 
   return (
     <div className="card mb-6 overflow-hidden">
-      <div className="flex flex-col gap-2 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+      {/* Header */}
+      <div className="flex flex-col gap-2 px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-200">
           <Globe className="h-4 w-4 text-emerald-400" />
           Site progress
           <span className="font-normal text-slate-500">({list.length})</span>
         </h2>
-        <span className="text-xs text-slate-500">
-          {done} done{failedCount > 0 ? ` · ${failedCount} failed` : ""}
-          {stalledCount > 0 ? ` · ${stalledCount} stalled` : ""} ·{" "}
-          {activeSite ? 1 : 0} active · {list.length} discovered
-        </span>
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          {activeCount > 0 && (
+            <span className="flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-indigo-300">
+              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+              {activeCount} active
+            </span>
+          )}
+          {done > 0 && (
+            <span className="flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-emerald-400">
+              <Check className="h-2.5 w-2.5" />
+              {done} done
+            </span>
+          )}
+          {failedCount > 0 && (
+            <span className="flex items-center gap-1 rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-rose-400">
+              <CircleX className="h-2.5 w-2.5" />
+              {failedCount} failed
+            </span>
+          )}
+          {stalledCount > 0 && (
+            <span className="flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-400">
+              <Clock3 className="h-2.5 w-2.5" />
+              {stalledCount} stalled
+            </span>
+          )}
+        </div>
       </div>
 
-      <div className="divide-y divide-slate-800/60 border-t border-slate-800/70">
+      {/* Site rows */}
+      <div className="divide-y divide-slate-800/50 border-t border-slate-800/70">
         {list.map((site) => {
           const isOpen = expanded === site.url
           const visibleState = displayState(site)
           const isStalled = stalled(site)
           const present = STAGE_ORDER.filter((s) => site.stages[s])
-          const activeSt = visibleState === "active" ? activeStageOf(site) : null
+          const latestStage = latestStageOf(site)
+
+          // State-based row accent
+          const rowAccent = isStalled
+            ? "border-l-2 border-l-amber-500/50"
+            : visibleState === "active"
+              ? "border-l-2 border-l-indigo-500/60"
+              : visibleState === "failed"
+                ? "border-l-2 border-l-rose-500/50"
+                : "border-l-2 border-l-emerald-500/40"
+
           return (
-            <div key={site.url}>
+            <div key={site.url} className={rowAccent}>
               <button
                 onClick={() => setExpanded(isOpen ? null : site.url)}
-                className="flex w-full items-center gap-3 px-5 py-3 text-left transition hover:bg-slate-800/30"
-                title={isOpen ? "Collapse details" : "Expand site timeline"}
+                className="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-slate-800/25"
               >
-                <ChevronRight
-                  className={cn(
-                    "h-4 w-4 shrink-0 text-slate-600 transition-transform",
-                    isOpen && "rotate-90",
+                {/* State icon */}
+                <div className="shrink-0">
+                  {isStalled ? (
+                    <Clock3 className="h-4 w-4 text-amber-400" />
+                  ) : visibleState === "active" ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
+                  ) : visibleState === "failed" ? (
+                    <CircleX className="h-4 w-4 text-rose-400" />
+                  ) : (
+                    <Check className="h-4 w-4 text-emerald-400" />
                   )}
-                />
-                {isStalled ? (
-                  <Clock3 className="h-4 w-4 shrink-0 text-amber-400" />
-                ) : visibleState === "active" ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-sky-400" />
-                ) : visibleState === "failed" ? (
-                  <CircleX className="h-4 w-4 shrink-0 text-rose-400" />
-                ) : (
-                  <Check className="h-4 w-4 shrink-0 text-emerald-500" />
-                )}
-                <span className="min-w-0 flex-1 break-all text-left font-mono text-xs text-slate-200">
-                  {site.url}
-                </span>
-                {activeSt && (
-                  <span className="hidden max-w-[280px] truncate text-xs text-sky-300 sm:block">
-                    {stageLabel(activeSt.stage)}
-                    {activeSt.detail ? ` — ${activeSt.detail}` : ""}
+                </div>
+
+                {/* URL + latest stage */}
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-mono text-xs text-slate-200">{site.url}</p>
+                  {latestStage && (
+                    <p
+                      className={cn(
+                        "mt-0.5 truncate text-[11px]",
+                        isStalled
+                          ? "text-amber-400"
+                          : visibleState === "active"
+                            ? "text-indigo-300"
+                            : visibleState === "failed"
+                              ? "text-rose-400"
+                              : "text-emerald-400",
+                      )}
+                    >
+                      {isStalled
+                        ? `No updates for ${stallMinutes(site)} min`
+                        : latestStage}
+                    </p>
+                  )}
+                </div>
+
+                {/* Stage count pills */}
+                {present.length > 0 && (
+                  <span className="hidden shrink-0 text-[10px] text-slate-600 sm:block">
+                    {present.length} stage{present.length !== 1 ? "s" : ""}
                   </span>
                 )}
-                {visibleState === "failed" && !isStalled && (
-                  <span className="hidden max-w-[420px] truncate text-xs font-medium text-rose-600 sm:block">
-                    {friendlyNavError(site.stages["site_finished"]?.detail || site.stages["fetching"]?.detail) || "Site failed"}
-                  </span>
-                )}
-                {isStalled && (
-                  <span className="hidden max-w-[280px] truncate text-xs text-amber-300 sm:block">
-                    No worker updates for {stallMinutes(site)} min
-                  </span>
-                )}
+
+                {/* Elapsed */}
                 <span className="shrink-0 text-[11px] text-slate-500">
                   {elapsedLabel(site)}
                 </span>
+
+                {/* Status badge */}
                 <span
                   className={cn(
-                    "shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium capitalize",
+                    "shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold capitalize",
                     isStalled
-                      ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
-                      : badgeStyle(visibleState),
+                      ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                      : visibleState === "active"
+                        ? "border-indigo-500/40 bg-indigo-500/10 text-indigo-300"
+                        : visibleState === "failed"
+                          ? "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                          : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400",
                   )}
                 >
-                  {isStalled ? "stalled" : visibleState}
+                  {isStalled ? "stalled" : visibleState === "passed" ? "done" : visibleState}
                 </span>
+
+                {/* Expand chevron */}
+                <ChevronDown
+                  className={cn(
+                    "h-3.5 w-3.5 shrink-0 text-slate-600 transition-transform duration-200",
+                    isOpen && "rotate-180",
+                  )}
+                />
               </button>
+
+              {/* Expanded event feed */}
               {isOpen && (
-                <div className="border-t border-slate-800/40 bg-slate-950/60 px-5 py-3">
-                  {present.length === 0 ? (
-                    <p className="text-xs text-slate-600">
-                      No stage activity recorded for this site yet.
-                    </p>
-                  ) : (
-                    <div className="flex flex-wrap items-start gap-y-2">
-                      {present.map((s, i) => {
-                        const ev = resolve(site.stages[s])
-                        return (
-                          <div key={s} className="flex items-start">
-                            <div className="flex min-w-[64px] flex-col items-center gap-1">
-                              <div
-                                className={cn(
-                                  "flex h-5 w-5 items-center justify-center rounded-full border",
-                                  ev.state === "passed"
-                                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-                                    : ev.state === "failed"
-                                      ? "border-rose-500/50 bg-rose-500/10 text-rose-400"
-                                      : ev.state === "active"
-                                        ? "border-sky-500/50 bg-sky-500/10 text-sky-300"
-                                        : "border-slate-800 bg-slate-900 text-slate-600",
-                                  ev.state === "active" && "animate-pulse",
-                                )}
-                                title={ev.detail ?? stageLabel(s)}
-                              >
-                                {ev.state === "failed" ? (
-                                  <CircleX className="h-3 w-3" />
-                                ) : ev.state === "passed" ? (
-                                  <Check className="h-3 w-3" />
-                                ) : ev.state === "active" ? (
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                ) : (
-                                  <Clock3 className="h-3 w-3" />
-                                )}
-                              </div>
-                              <span
-                                className={cn(
-                                  "max-w-[80px] text-center text-[9px] font-medium leading-tight",
-                                  ev.state === "passed"
-                                    ? "text-slate-300"
-                                    : ev.state === "failed"
-                                      ? "text-rose-300"
-                                      : ev.state === "active"
-                                        ? "text-sky-300"
-                                        : "text-slate-500",
-                                )}
-                              >
-                                {stageLabel(s)}
-                              </span>
-                              {ev.detail && (
-                                <span
-                                  className="max-w-[88px] truncate text-center text-[9px] leading-tight text-slate-600"
-                                  title={ev.detail}
-                                >
-                                  {ev.detail}
-                                </span>
-                              )}
-                            </div>
-                            {i < present.length - 1 && (
-                              <div
-                                className={cn(
-                                  "mx-1.5 mt-2.5 h-px w-6",
-                                  ev.state === "passed"
-                                    ? "bg-emerald-500/40"
-                                    : ev.state === "failed"
-                                      ? "bg-rose-500/40"
-                                      : "bg-slate-800",
-                                )}
-                              />
-                            )}
-                          </div>
-                        )
-                      })}
+                <div className="border-t border-slate-800/40 bg-slate-950/50 px-5 py-4">
+                  <SiteEventFeed site={site} resolve={resolve} jobTerminal={jobTerminal} />
+                  {visibleState === "failed" && (
+                    <div className="mt-3">
+                      <Msg tone="error">
+                        {friendlyNavError(
+                          site.stages["site_finished"]?.detail ||
+                          site.stages["fetching"]?.detail,
+                        ) || "This site could not be processed."}
+                      </Msg>
                     </div>
                   )}
-                  <p className="mt-3 break-all font-mono text-[10px] text-slate-600">
-                    {site.url}
-                  </p>
                 </div>
               )}
             </div>
@@ -494,6 +693,14 @@ function SitesPanel({
       </div>
     </div>
   )
+}
+
+/** Text preview for one expanded row, fetched at most once per item. */
+interface ItemSample {
+  loading: boolean
+  text: string
+  truncated: boolean
+  error: string | null
 }
 
 function ItemRow({
@@ -505,6 +712,46 @@ function ItemRow({
   expanded: boolean
   onToggle: () => void
 }) {
+  // Fetched lazily on first expand. Shipping a preview for every row would mean
+  // a 500-row job sending 600 kB of text to render a list.
+  const [sample, setSample] = useState<ItemSample>({
+    loading: false,
+    text: "",
+    truncated: false,
+    error: null,
+  })
+
+  useEffect(() => {
+    if (!expanded || sample.text || sample.error || sample.loading) return
+    let cancelled = false
+    setSample((prev) => ({ ...prev, loading: true }))
+    api
+      .getItem(item.item_id)
+      .then((detail) => {
+        if (cancelled) return
+        setSample({
+          loading: false,
+          text: detail.text_sample ?? "",
+          truncated: detail.text_sample_truncated ?? false,
+          error: null,
+        })
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return
+        setSample({
+          loading: false,
+          text: "",
+          truncated: false,
+          error: e instanceof Error ? e.message : "Could not load the text.",
+        })
+      })
+    return () => {
+      cancelled = true
+    }
+    // `sample` is intentionally not a dependency: it changes as a result of this
+    // effect, and depending on it would re-run the fetch on every state change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, item.item_id])
   return (
     <>
       <tr
@@ -517,19 +764,19 @@ function ItemRow({
             className={cn("h-4 w-4 text-slate-600 transition-transform", expanded && "rotate-90")}
           />
         </td>
-        <td className="px-5 py-3 font-mono text-xs text-sky-600">{item.item_id}</td>
-        <td className="max-w-xs px-5 py-3">
+        <td data-label="Item ID" className="px-5 py-3 font-mono text-xs text-sky-600">{item.item_id}</td>
+        <td data-label="Title / URL" className="max-w-xs px-5 py-3">
           <p className="truncate text-sm text-slate-200">{item.title ?? "(untitled)"}</p>
           <p className="truncate text-[11px] text-slate-500">{item.source_url}</p>
         </td>
-        <td className="px-5 py-3 text-xs text-slate-400">{languageLabel(item.language)}</td>
-        <td className="px-5 py-3 text-xs text-slate-400">
+        <td data-label="Lang" className="px-5 py-3 text-xs text-slate-400">{languageLabel(item.language)}</td>
+        <td data-label="Words" className="px-5 py-3 text-xs text-slate-400">
           {formatNumber(item.word_count)}
         </td>
-        <td className="px-5 py-3 text-xs text-slate-400">
+        <td data-label="Chars" className="px-5 py-3 text-xs text-slate-400">
           {formatNumber(item.character_count)}
         </td>
-        <td className="px-5 py-3">
+        <td data-label="Flags" className="px-5 py-3">
           <div className="flex gap-1.5">
             {item.is_exported && (
               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600">
@@ -543,7 +790,7 @@ function ItemRow({
             )}
           </div>
         </td>
-        <td className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">
+        <td data-label="Parsed" className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">
           {relativeTime(item.parsed_at)}
         </td>
       </tr>
@@ -551,20 +798,45 @@ function ItemRow({
         <tr className="border-t border-slate-800/40 bg-slate-950/60">
           <td />
           <td colSpan={7} className="px-5 py-4">
-            <dl className="grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
-              <InfoRow label="Source URL">
-                <a
-                  href={item.source_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="break-all text-indigo-400 hover:text-indigo-300 hover:underline"
-                >
-                  {item.source_url}
-                </a>
-              </InfoRow>
-              <InfoRow label="Publish date">{formatDateTime(item.publish_date)}</InfoRow>
-              <InfoRow label="Parsed at">{formatDateTime(item.parsed_at)}</InfoRow>
-            </dl>
+            {/* Sample of what was actually extracted. The source URL, publish
+                date and parsed-at are deliberately not repeated here: the URL is
+                already the row's title link, and the dates describe the crawl
+                rather than the content. */}
+            <div>
+              <p className="mb-1.5 text-[11px] tracking-wider text-slate-500 uppercase">
+                Sample of extracted text
+              </p>
+              {sample.loading ? (
+                <p className="text-xs text-slate-500">Loading text...</p>
+              ) : sample.error ? (
+                <p className="text-xs text-amber-400">{sample.error}</p>
+              ) : sample.text ? (
+                <>
+                  {/* Pre-wrap rather than truncate: the point is to read what
+                      was captured, and collapsing it would defeat that. */}
+                  <pre className="max-h-72 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs leading-relaxed whitespace-pre-wrap text-slate-300">
+                    {sample.text}
+                    {sample.truncated && (
+                      <span className="text-slate-500">{" ..."}</span>
+                    )}
+                  </pre>
+                  <div className="mt-2 flex items-center gap-3">
+                    <a
+                      href={item.source_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
+                    >
+                      Open original page
+                    </a>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  No text was extracted from this page.
+                </p>
+              )}
+            </div>
           </td>
         </tr>
       )}
@@ -811,6 +1083,8 @@ export default function JobDetail() {
     return <LoadingBlock label={`Loading ${jobId}...`} />
   }
 
+  const discovery = parseDiscoveryUrl(job.url)
+
   return (
     <div>
       <Link
@@ -830,38 +1104,40 @@ export default function JobDetail() {
       </div>
 
       <div className="mb-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="card p-6 lg:col-span-2">
-          <StageTimeline job={job} stages={stages} />
-          {job.failure_reason && (
-            <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3">
-              <p className="text-xs font-semibold text-rose-600">Failure reason</p>
-              <p className="mt-1 break-words text-sm text-rose-500">{friendlyNavError(job.failure_reason)}</p>
-            </div>
-          )}
+        <div className="lg:col-span-2">
+          <OverallProgressCard job={job} stages={stages} />
         </div>
         <div className="card p-6">
           <dl className="space-y-4">
-            <InfoRow label="Target URL">
-              <a
-                href={job.url}
-                target="_blank"
-                rel="noreferrer"
-                className="break-all text-indigo-400 hover:text-indigo-300 hover:underline"
-              >
-                {job.url}
-              </a>
+            <InfoRow label={discovery ? "Topic discovery" : "Target URL"}>
+              {discovery ? (
+                <span className="flex flex-wrap items-center gap-2 break-all text-slate-200">
+                  <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
+                    {discovery.network}
+                  </span>
+                  <span className="font-mono text-xs">{discovery.query || job.url}</span>
+                </span>
+              ) : (
+                <a
+                  href={job.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="break-all text-indigo-400 hover:text-indigo-300 hover:underline"
+                >
+                  {job.url}
+                </a>
+              )}
             </InfoRow>
             <div className="grid grid-cols-2 gap-4">
               <InfoRow label="Language">{languageLabel(job.language)}</InfoRow>
-              <InfoRow label="User ID">
-                <span className="font-mono text-xs">{job.user_id}</span>
-              </InfoRow>
               <InfoRow label="Created">{formatDateTime(job.created_at)}</InfoRow>
               <InfoRow label="Completed">{formatDateTime(job.completed_at)}</InfoRow>
+              {/* Duration sits next to Completed: the two answer "when did it
+                  end, and how long did it take" as a pair. */}
+              <InfoRow label="Duration">
+                {formatDuration(job.created_at, job.completed_at)}
+              </InfoRow>
             </div>
-            <InfoRow label="Duration">
-              {formatDuration(job.created_at, job.completed_at)}
-            </InfoRow>
           </dl>
         </div>
       </div>
@@ -963,7 +1239,7 @@ export default function JobDetail() {
             icon={<FileText className="h-8 w-8" />}
           />
         ) : (
-          <div className="overflow-x-auto border-t border-slate-800/70">
+          <div className="table-scroll border-t border-slate-800/70">
             <table className="w-full min-w-[820px]">
               <thead className="bg-slate-900/40">
                 <tr>

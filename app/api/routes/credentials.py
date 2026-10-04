@@ -13,14 +13,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.security.auth import require_admin
 from app.services.credential_service import credential_service
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# Credentials are a shared operator-level pool (email/password pairs and IMAP
+# app passwords) with no per-user owner, so they are admin-only rather than
+# scoped per account. Applied at the router so every current and future
+# endpoint in this module is covered.
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 
 # ---------------------------------------------------------------------------

@@ -144,8 +144,14 @@ def normalize_content(text: str) -> str:
 
     # Remove very short segments (likely navigation crumbs)
     # Split on common delimiters, filter, rejoin
-    segments = re.split(r"[|•–—/\\]", text)
-    segments = [s.strip() for s in segments if len(s.strip()) > 3]
+    raw_segments = [s.strip() for s in re.split(r"[|•–—/\\]", text)]
+    segments = [s for s in raw_segments if len(s) > 3]
+    if not segments:
+        # Every segment fell below the crumb threshold, so the content really is
+        # that short (e.g. a one-word audio transcript). Normalizing it away would
+        # hash it identically to an empty body and make every such item an exact
+        # duplicate of every other one, so keep the short text instead.
+        segments = [s for s in raw_segments if s]
     text = " ".join(segments)
 
     # Remove special characters, keep alphanumeric + spaces

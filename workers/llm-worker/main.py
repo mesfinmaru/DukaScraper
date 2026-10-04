@@ -36,12 +36,78 @@ import os
 import re
 import signal
 import sys
+import time
 from datetime import datetime
 from typing import Optional
 
 import clickhouse_connect
 import httpx
 from aiokafka import AIOKafkaConsumer
+from prometheus_client import Counter
+
+# Provenance counters. A crawl can "succeed" while every item fell back to the
+# rule-based heuristic, which is invisible in the item counts but fatal to
+# classification quality - these make it observable in Prometheus.
+llm_fallback_items = Counter(
+    "duka_llm_fallback_items_total",
+    "Parsed items classified without a real LLM response.",
+    ["source"],
+)
+llm_request_errors = Counter(
+    "duka_llm_request_errors_total",
+    "LLM provider requests that failed, by reason.",
+    ["reason"],
+)
+
+# Failures that retrying cannot fix. An invalid/expired key or a revoked
+# account keeps returning the same answer for every item, so it is reported as
+# an operator problem rather than as routine per-item noise.
+_PERMANENT_LLM_ERRORS = frozenset({"auth", "permission"})
+_PERMANENT_LLM_ERROR_LOG_INTERVAL = 300.0  # seconds
+_last_permanent_llm_error_at = 0.0
+
+
+def _looks_transient(exc: Exception) -> bool:
+    """Heuristic: retry LLM calls on transient/network-style failures."""
+    if isinstance(exc, LLMResponseTruncated):
+        # A truncated answer is a budget problem, not a dead provider; the retry
+        # runs with a larger completion limit and usually succeeds.
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "timeout", "timed out", "connection", "temporarily", "rate limit",
+        "429", "502", "503", "504", "unavailable", "reset",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _classify_llm_error(exc: Exception) -> str:
+    """Bucket a provider exception into a short, actionable reason label.
+
+    Used for metrics and to decide whether the fault is worth escalating, so it
+    deliberately keys off the status code the SDK surfaces rather than message
+    text, which providers reword freely.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if isinstance(exc, LLMResponseTruncated):
+        return "truncated"
+    if status in (401, 403):
+        return "auth"
+    if status == 404:
+        return "model_not_found"
+    if status == 429:
+        return "rate_limited"
+    if status is not None and 500 <= int(status) < 600:
+        return "provider_error"
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    name = type(exc).__name__.lower()
+    if "connection" in name:
+        return "connection"
+    return "other"
 
 try:
     from groq import Groq
@@ -69,8 +135,16 @@ from app.common.constants.intelligence_categories import (
     get_category_anchor_texts,
 )
 from app.common.constants.source_types import ALL_SOURCE_TYPES, DEFAULT_SOURCE_TYPE
+from app.common.utils.minio_naming import site_from_url
 from app.pipeline.schemas import IntelligenceAnalytics, ParsedItem
+from app.services.alert_service import record_alert
+from app.services.groq_batch import GroqBatchClient, GroqBatchError
+from app.services.llm_analysis_queue import LLMAnalysisQueue
 from app.storage.postgres.client import pg_client
+
+#: Durable queue for LLM work. A module-level instance keeps it importable by
+#: tests; the pool is attached in main() once pg_client has connected.
+analysis_queue = LLMAnalysisQueue(None)
 from workers.common import build_unique_crawl_object_name as _shared_build_unique_crawl_object_name
 
 # The llm-worker directory name contains a dash, so it cannot be imported as
@@ -110,6 +184,13 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2:8b")
 HOSTED_LLM_URL = os.getenv("HOSTED_LLM_URL", "")
 HOSTED_LLM_API_KEY = os.getenv("HOSTED_LLM_API_KEY", "")
 HOSTED_LLM_MODEL = os.getenv("HOSTED_LLM_MODEL", "google-gemini-flash")
+#: Resolved once so the Batch API path can check the provider without
+#: re-deriving it (and without instantiating a client just to ask).
+LLM_PROVIDER_NAME = (
+    "groq" if "groq.com" in HOSTED_LLM_URL.lower()
+    else "google" if "googleapis.com" in HOSTED_LLM_URL.lower()
+    else "generic"
+) if LLM_PROVIDER == "hosted" else "ollama"
 FALLBACK_ONLY = os.getenv("FALLBACK_ONLY", "false").strip().lower() in ("1", "true", "yes")
 MAX_CONCURRENT_TASKS = 4
 
@@ -133,6 +214,49 @@ RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.35"))
 # Minimum cosine similarity for a category anchor hint to be included.
 ANCHOR_MIN_SIMILARITY = float(os.getenv("RAG_ANCHOR_MIN_SIMILARITY", "0.5"))
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
+# --- Durable queue + batching configuration ---
+# Items are enqueued on consume and drained by run_analysis_batches(). These
+# knobs decide how much work is in flight at once and how often the queue is
+# polled, which is what actually bounds the rate the LLM provider is hit at.
+QUEUE_ENABLED = os.getenv("LLM_QUEUE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Items claimed per batch. Larger batches amortise the prompt preamble and the
+# RAG round-trip across more documents; too large and a single rate-limit
+# response stalls the whole batch.
+LLM_BATCH_SIZE = max(1, int(os.getenv("LLM_BATCH_SIZE", str(MAX_CONCURRENT_TASKS))))
+# How long to wait when the queue came back empty. Long enough not to spin, short
+# enough that an idle pipeline reacts to a new job promptly.
+LLM_BATCH_POLL_SECONDS = float(os.getenv("LLM_BATCH_POLL_SECONDS", "2"))
+# A claimed item whose worker dies is reclaimed after this long. Must exceed the
+# worst-case single analysis (LLM timeout + retries + RAG), or healthy slow work
+# gets handed to a second worker while the first is still running.
+LLM_QUEUE_LEASE_SECONDS = float(os.getenv("LLM_QUEUE_LEASE_SECONDS", "600"))
+LLM_QUEUE_MAX_ATTEMPTS = max(1, int(os.getenv("LLM_QUEUE_MAX_ATTEMPTS", "5")))
+LLM_QUEUE_RETRY_BASE_SECONDS = float(os.getenv("LLM_QUEUE_RETRY_BASE_SECONDS", "30"))
+WORKER_INSTANCE_ID = os.getenv("WORKER_INSTANCE_ID", f"{WORKER_TYPE}-{os.getpid()}")
+
+# --- Groq Batch API (half-price bulk analysis) ---
+# Two paths share one queue. The synchronous batch loop above is the default:
+# results land in seconds. When the backlog is large enough that latency no
+# longer matters — a bulk backfill, a wide discovery fan-out — items can instead
+# be handed to Groq's Batch API for 50% of the price and no rate-limit impact,
+# at the cost of a 24h-7d completion window.
+BATCH_API_ENABLED = os.getenv("GROQ_BATCH_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+# Only hand work to the Batch API once the backlog is this deep. Below it, the
+# synchronous path is both faster and no more expensive in aggregate.
+BATCH_BACKLOG_THRESHOLD = max(1, int(os.getenv("GROQ_BATCH_MIN_BACKLOG", "200")))
+# How many requests go into one batch file. Groq allows 50,000 lines; a few
+# thousand keeps a single rejected payload from invalidating days of work.
+BATCH_MAX_REQUESTS = max(1, int(os.getenv("GROQ_BATCH_MAX_REQUESTS", "2000")))
+BATCH_COMPLETION_WINDOW = os.getenv("GROQ_BATCH_WINDOW", "24h")
+BATCH_POLL_SECONDS = float(os.getenv("GROQ_BATCH_POLL_SECONDS", "900"))
+
+#: Outcomes of analysing one queued item.
+ANALYSIS_DONE = "done"        # analysed, or already analysed — drop from the queue
+ANALYSIS_RETRY = "retry"      # transient — put back with backoff
+ANALYSIS_FAILED = "failed"    # permanent — park it, stop retrying
 
 # --- Prompt audit snapshots (MinIO) ---
 PROMPT_AUDIT_ENABLED = os.getenv("PROMPT_AUDIT_ENABLED", "true").strip().lower() in (
@@ -361,6 +485,7 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             "entities": list(dict.fromkeys([e for e in entities if e])),
             "summary": summary if summary else "No summary available",
             "llm_score": 0.1,
+            "analysis_source": "fallback",
         }
 
     @staticmethod
@@ -436,7 +561,35 @@ Please respond ONLY with a valid JSON object (no markdown, no explanation) conta
             "entities": [],
             "summary": "Unable to analyze",
             "llm_score": 0.0,
+            "analysis_source": "unavailable",
         }
+
+
+# Groq SDK bounds. The SDK defaults (600s timeout, silent retries) are sized for
+# healthy networks; when the network stalls these turn a single chat completion
+# into a multi-minute hang. See extract_intelligence: the call also runs in a
+# worker thread so the event loop (health server + Kafka consumer) never freezes.
+GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "60"))
+GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+# Token budget per completion. gpt-oss models are *reasoning* models: they emit a
+# `reasoning` block that is billed as completion tokens. At 1024 tokens a real
+# article prompt spent the entire budget reasoning and returned
+# finish_reason="length" with content="" — which this code used to treat as
+# "the model answered but we could not read it", i.e. a heuristic fallback. The
+# whole corpus was being classified without the model while looking successful.
+GROQ_MAX_COMPLETION_TOKENS = int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "4096"))
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low")
+# Escalated budget used on the retry that follows a truncated answer.
+GROQ_TRUNCATED_RETRY_TOKENS = int(os.getenv("GROQ_TRUNCATED_RETRY_TOKENS", "8192"))
+
+
+class LLMResponseTruncated(RuntimeError):
+    """The model ran out of tokens before it produced an answer.
+
+    Transient by nature: the same request with a larger budget usually
+    succeeds, so the queue retries it rather than accepting the heuristic
+    fallback as a final answer.
+    """
 
 
 class HostedLLMClient:
@@ -452,9 +605,48 @@ class HostedLLMClient:
         self.model = model
         self.provider = self._detect_provider(self.base_url)
         self.client = httpx.AsyncClient(timeout=120)
+        # Raised after a truncated answer so the retry gets a bigger budget.
+        self._max_completion_tokens = GROQ_MAX_COMPLETION_TOKENS
         self.groq_client = None
         if self.provider == "groq" and api_key and Groq is not None:
-            self.groq_client = Groq(api_key=api_key)
+            self.groq_client = Groq(
+                api_key=api_key,
+                timeout=GROQ_TIMEOUT_SECONDS,
+                max_retries=GROQ_MAX_RETRIES,
+            )
+
+    def _raise_if_truncated(self, data: dict) -> None:
+        """Turn a token-truncated answer into a retryable error.
+
+        Without this, a reasoning model that spent its whole budget thinking
+        returns ``content=""`` with ``finish_reason="length"``. That used to
+        fall through to the "model answered, JSON unreadable" branch and be
+        recorded as a heuristic classification — indistinguishable, downstream,
+        from a real one.
+        """
+        choices = (data or {}).get("choices") or []
+        if not choices:
+            return
+        choice = choices[0] or {}
+        finish_reason = choice.get("finish_reason")
+        message = choice.get("message") or {}
+        content = (message.get("content") or "").strip()
+        if finish_reason != "length" and content:
+            return
+        if finish_reason == "length" and not content:
+            bigger = GROQ_TRUNCATED_RETRY_TOKENS
+            self._max_completion_tokens = max(self._max_completion_tokens, bigger)
+            raise LLMResponseTruncated(
+                f"model hit the {self._max_completion_tokens}-token completion limit "
+                f"without producing an answer (reasoning model); retrying with a "
+                f"larger budget"
+            )
+        if not content:
+            reasoning = (message.get("reasoning") or "").strip()
+            raise LLMResponseTruncated(
+                "model returned an empty answer"
+                + (f" (only {len(reasoning)} chars of reasoning)" if reasoning else "")
+            )
 
     @staticmethod
     def _detect_provider(base_url: str) -> str:
@@ -536,7 +728,7 @@ class HostedLLMClient:
     async def extract_intelligence(
         self, parsed_text: str, url: str, rag_context: str = "", category_hints: str = ""
     ) -> dict:
-        if not parsed_text or len(parsed_text.strip()) < 50:
+        if not parsed_text or len(parsed_text.strip()) < MIN_ANALYSIS_CHARS:
             return {
                 "source_type": DEFAULT_SOURCE_TYPE,
                 "category": DEFAULT_INTELLIGENCE_CATEGORY,
@@ -544,56 +736,14 @@ class HostedLLMClient:
                 "entities": [],
                 "summary": "Unable to analyze reliably; fallback inference used.",
                 "llm_score": 0.0,
+                "analysis_source": "unavailable",
             }
 
         if not self.api_key and FALLBACK_ONLY:
             logger.warning("No hosted API key available; using fallback analyzer in fallback-only mode.")
             return OllamaLLMClient._fallback_analyze(parsed_text=parsed_text, url=url)
 
-        category_list_str = "\n".join(
-            f'  - "{cat}": {desc}' for cat, desc in CATEGORY_DESCRIPTIONS.items()
-        )
-        source_type_values = "news, forum, blog, social, government, academic, ecommerce, other"
-        content_language = HostedLLMClient._detect_content_language(parsed_text)
-        summary_language = "Amharic" if content_language == "am" else "English"
-        rag_block = f"\n{rag_context.strip()}\n" if rag_context else ""
-        hints_block = f"\n{category_hints.strip()}\n" if category_hints else ""
-        max_analysis_chars = 2500
-        if len(parsed_text) <= max_analysis_chars:
-            full_content = parsed_text
-        else:
-            half = max_analysis_chars // 2
-            full_content = f"{parsed_text[:half]}\n\n[...middle omitted for provider limit...]\n\n{parsed_text[-half:]}"
-        prompt = f"""You are a careful content analyst. Read the full content below, not just the headline or first paragraph.
-
-Source URL: {url}
-
-Goal:
-- Summarize the main idea, key facts, and why the content matters.
-- This is not limited to intelligence-related content; summarize any meaningful article, post, forum discussion, announcement, report, or public update.
-- If the content is primarily Amharic, write the summary in Amharic. Otherwise write the summary in English.
-- Do not invent facts. Use only what is present in the content.
-- Ignore boilerplate, ads, tracking links, and repeated site navigation noise.
-
-Content language: {summary_language}
-
-Content:
-{full_content}
-{rag_block}{hints_block}
-Classify into exactly ONE intelligence category:
-{category_list_str}
-
-Also classify the source type as one of: {source_type_values}
-
-Return ONLY valid JSON with this exact structure:
-{{
-  "source_type": one of [{source_type_values}],
-  "category": one of {sorted(ALL_INTELLIGENCE_CATEGORIES)},
-  "threat_severity": integer from 1-5 (1=low, 5=critical),
-  "entities": list of extracted entities (names, emails, IPs, domains, sensitive info, locations),
-  "summary": a concise 2-4 sentence summary in {summary_language} of the main idea, most important facts, and why it matters,
-  "confidence": a float between 0 and 1 reflecting your certainty in the category classification
-}}"""
+        prompt = build_analysis_prompt(parsed_text, url, rag_context, category_hints)
 
         headers = {}
         body = None
@@ -622,18 +772,26 @@ Return ONLY valid JSON with this exact structure:
 
         try:
             if self.provider == "groq" and self.groq_client is not None:
-                completion = self.groq_client.chat.completions.create(
+                # The groq SDK is synchronous: calling it directly would block the
+                # event loop for the whole timeout (health server, metrics and the
+                # Kafka consumer all freeze with it). to_thread keeps the loop live.
+                completion = await asyncio.to_thread(
+                    self.groq_client.chat.completions.create,
                     model=self.model or "openai/gpt-oss-120b",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.2,
-                    max_completion_tokens=1024,
+                    max_completion_tokens=self._max_completion_tokens,
                     top_p=1,
-                    reasoning_effort="medium",
+                    reasoning_effort=GROQ_REASONING_EFFORT,
                     stream=False,
                     stop=None,
                 )
                 data = completion.model_dump() if hasattr(completion, "model_dump") else completion
+                self._raise_if_truncated(data)
                 response_text = self._extract_text_from_payload(data)
+                # A completed answer resets the escalated budget, so one hard
+                # document does not permanently double everyone's token spend.
+                self._max_completion_tokens = GROQ_MAX_COMPLETION_TOKENS
             else:
                 resp = await self.client.post(self.base_url, json=body, headers=headers, timeout=120)
                 text = resp.text or ""
@@ -651,6 +809,7 @@ Return ONLY valid JSON with this exact structure:
                 intelligence = OllamaLLMClient._parse_intelligence_response(response_text)
                 intelligence = OllamaLLMClient._validate_intelligence(intelligence)
                 intelligence["llm_score"] = intelligence["confidence"]
+                intelligence["analysis_source"] = "llm"
             except Exception:
                 intelligence = {
                     "source_type": DEFAULT_SOURCE_TYPE,
@@ -659,11 +818,42 @@ Return ONLY valid JSON with this exact structure:
                     "entities": [],
                     "summary": response_text if response_text else "Unable to analyze reliably; fallback inference used.",
                     "llm_score": 0.0,
+                    # A model answered but its JSON could not be read, so the
+                    # labels below are defaults rather than the model's own.
+                    "analysis_source": "partial",
                 }
 
             return intelligence
         except Exception as e:
-            logger.warning(f"Hosted LLM request failed: {e}")
+            # A rejected key is permanent: retrying it for every item burns the
+            # budget and hides an operator-actionable fault behind a wall of
+            # identical warnings. Name it explicitly and rate-limit the log so
+            # the cause stays visible instead of scrolling past as noise.
+            reason = _classify_llm_error(e)
+            llm_request_errors.labels(reason=reason).inc()
+
+            # Transient faults must NOT become a stored heuristic label. A daily
+            # quota (429 "try again in 12m") or a truncated completion will both
+            # clear on their own, and falling back here marks the item analysed
+            # forever - the model never gets to see it again, and a whole quota
+            # window's worth of corpus silently becomes rule-based output.
+            # Let the error propagate so the queue retries with backoff.
+            if isinstance(e, LLMResponseTruncated) or _looks_transient(e):
+                raise
+
+            if reason in _PERMANENT_LLM_ERRORS:
+                global _last_permanent_llm_error_at
+                now = time.monotonic()
+                if now - _last_permanent_llm_error_at > _PERMANENT_LLM_ERROR_LOG_INTERVAL:
+                    _last_permanent_llm_error_at = now
+                    logger.error(
+                        "Hosted LLM is PERMANENTLY UNAVAILABLE (%s): %s. Every item is "
+                        "being classified by the rule-based fallback instead of the model. "
+                        "Fix HOSTED_LLM_API_KEY (or the account) - classifications and "
+                        "extracted entities are NOT real model output until then.",
+                        reason, e,
+                    )
+            logger.warning("Hosted LLM request failed (%s): %s", reason, e)
             return OllamaLLMClient._fallback_analyze(parsed_text=parsed_text, url=url)
 
 
@@ -703,6 +893,76 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+MAX_ANALYSIS_CHARS = 2500
+#: Below this, an item is not worth a model call at all — the response is
+#: dominated by "unable to analyze".
+MIN_ANALYSIS_CHARS = 50
+
+SOURCE_TYPE_VALUES = (
+    "news, forum, blog, social, government, academic, ecommerce, other"
+)
+
+
+def build_analysis_prompt(
+    parsed_text: str,
+    url: str,
+    rag_context: str = "",
+    category_hints: str = "",
+) -> str:
+    """The single analysis prompt, shared by the synchronous and batch paths.
+
+    Extracted deliberately: the Groq Batch API submits *pre-rendered* requests,
+    so if the batch path assembled its own prompt the two paths would drift and
+    a batched item would be classified under different rules than a synchronous
+    one — with no way to tell afterwards, because the prompt is not stored.
+    """
+    category_list_str = "\n".join(
+        f'  - "{cat}": {desc}' for cat, desc in CATEGORY_DESCRIPTIONS.items()
+    )
+    content_language = HostedLLMClient._detect_content_language(parsed_text)
+    summary_language = "Amharic" if content_language == "am" else "English"
+    rag_block = f"\n{rag_context.strip()}\n" if rag_context else ""
+    hints_block = f"\n{category_hints.strip()}\n" if category_hints else ""
+    if len(parsed_text) <= MAX_ANALYSIS_CHARS:
+        full_content = parsed_text
+    else:
+        half = MAX_ANALYSIS_CHARS // 2
+        full_content = (
+            f"{parsed_text[:half]}\n\n[...middle omitted for provider limit...]\n\n"
+            f"{parsed_text[-half:]}"
+        )
+    return f"""You are a careful content analyst. Read the full content below, not just the headline or first paragraph.
+
+Source URL: {url}
+
+Goal:
+- Summarize the main idea, key facts, and why the content matters.
+- This is not limited to intelligence-related content; summarize any meaningful article, post, forum discussion, announcement, report, or public update.
+- If the content is primarily Amharic, write the summary in Amharic. Otherwise write the summary in English.
+- Do not invent facts. Use only what is present in the content.
+- Ignore boilerplate, ads, tracking links, and repeated site navigation noise.
+
+Content language: {summary_language}
+
+Content:
+{full_content}
+{rag_block}{hints_block}
+Classify into exactly ONE intelligence category:
+{category_list_str}
+
+Also classify the source type as one of: {SOURCE_TYPE_VALUES}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "source_type": one of [{SOURCE_TYPE_VALUES}],
+  "category": one of {sorted(ALL_INTELLIGENCE_CATEGORIES)},
+  "threat_severity": integer from 1-5 (1=low, 5=critical),
+  "entities": list of extracted entities (names, emails, IPs, domains, sensitive info, locations),
+  "summary": a concise 2-4 sentence summary in {summary_language} of the main idea, most important facts, and why it matters,
+  "confidence": a float between 0 and 1 reflecting your certainty in the category classification
+}}"""
 
 
 async def _precompute_category_anchors() -> None:
@@ -928,7 +1188,9 @@ async def store_prompt_snapshot(
                 "confidence": intelligence.get("confidence"),
             },
         }
-        object_name = f"{job_id}/{item_id}_llm_context.json"
+        # Same site-folder layout as the raw/parsed objects, so one item's raw
+        # HTML, parsed JSON and audit snapshot sit side by side in the browser.
+        object_name = f"{site_from_url(url)}/{item_id}_llm_context.json"
         payload = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
         from io import BytesIO
 
@@ -994,13 +1256,15 @@ async def ingest_intelligence_to_clickhouse(
                         intelligence.entities,
                         intelligence.summary,
                         intelligence.language,
+                        intelligence.analysis_source,
                         intelligence.llm_model,
                         intelligence.llm_score,
                         intelligence.created_at,
                     ]],
                     column_names=[
                         "job_id", "item_id", "url", "source_type", "category", "threat_severity",
-                        "entities", "summary", "language", "llm_model", "llm_score", "created_at",
+                        "entities", "summary", "language", "analysis_source",
+                        "llm_model", "llm_score", "created_at",
                     ],
                 )
 
@@ -1072,16 +1336,6 @@ async def is_intelligence_processed(item_id: str) -> bool:
     return False
 
 
-def _looks_transient(exc: Exception) -> bool:
-    """Heuristic: retry LLM calls on transient/network-style failures."""
-    text = f"{type(exc).__name__}: {exc}".lower()
-    markers = (
-        "timeout", "timed out", "connection", "temporarily", "rate limit",
-        "429", "502", "503", "504", "unavailable", "reset",
-    )
-    return any(marker in text for marker in markers)
-
-
 async def _analyze_with_retry(parsed_text: str, url: str, rag_context: str, category_hints: str) -> dict:
     """LLM analysis with exponential backoff on transient failures.
 
@@ -1123,15 +1377,45 @@ async def process_parsed_item(message_value: bytes):
         message_value: Raw Kafka message value (JSON)
     """
     try:
-        data = json.loads(message_value)
-        parsed_item = ParsedItem(**data)
+        parsed_item = _parse_item_message(message_value)
+        if parsed_item is None:
+            return
+        await analyze_parsed_item(parsed_item)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON message: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error processing parsed item: {e}", exc_info=True)
 
-        logger.info(f"Processing parsed item: job={parsed_item.job_id} item={parsed_item.item_id} url={parsed_item.url}")
 
-        # Skip items the pipeline already flagged as failures — they are not
-        # worth an LLM call (language-rejected content is handled upstream too).
-        if parsed_item.status == "failed":
-            logger.info(f"Skipping failed item {parsed_item.item_id}")
+def _parse_item_message(message_value: bytes) -> "ParsedItem | None":
+    """Decode a crawl.parsed message. None when it must not be analysed."""
+    data = json.loads(message_value)
+    parsed_item = ParsedItem(**data)
+
+    logger.info(
+        f"Processing parsed item: job={parsed_item.job_id} item={parsed_item.item_id} url={parsed_item.url}"
+    )
+
+    # Skip items the pipeline already flagged as failures — they are not
+    # worth an LLM call (language-rejected content is handled upstream too).
+    if parsed_item.status == "failed":
+        logger.info(f"Skipping failed item {parsed_item.item_id}")
+        return None
+    return parsed_item
+
+
+async def enqueue_parsed_item(message_value: bytes) -> None:
+    """Consume-time work: decode the message and put it on the durable queue.
+
+    Deliberately does nothing expensive. The Kafka offset is committed as soon
+    as this returns, so the queue — not the consumer's in-memory state — is what
+    survives a restart. Everything slow (RAG retrieval, the LLM call, the
+    ClickHouse write) happens in :func:`analyze_parsed_item`, driven by
+    :func:`run_analysis_batches`.
+    """
+    try:
+        parsed_item = _parse_item_message(message_value)
+        if parsed_item is None:
             return
 
         # Idempotency pre-check: re-delivery after a crash must not re-analyze
@@ -1139,6 +1423,34 @@ async def process_parsed_item(message_value: bytes):
         if await is_intelligence_processed(parsed_item.item_id):
             logger.info(f"Item {parsed_item.item_id} already intelligence_processed — skipping")
             return
+
+        queued = await analysis_queue.enqueue(
+            item_id=parsed_item.item_id,
+            job_id=parsed_item.job_id,
+            payload=json.loads(message_value),
+        )
+        if queued:
+            logger.debug(f"Queued {parsed_item.item_id} for LLM analysis")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON message: {e}")
+    except Exception as e:
+        logger.error(f"Failed to queue parsed item: {e}", exc_info=True)
+
+
+async def analyze_parsed_item(parsed_item) -> str:
+    """Run the LLM analysis for one item and persist everything it produces.
+
+    Returns one of the three ``ANALYSIS_*`` outcomes. The distinction matters:
+    the old inline path swallowed every failure, so a rate-limited provider
+    looked identical to a successful run until you noticed nothing was being
+    written anywhere.
+    """
+    try:
+        # Idempotency re-check: a redelivered queue row, or a retry after a
+        # partial failure, must not produce a second ClickHouse row.
+        if await is_intelligence_processed(parsed_item.item_id):
+            logger.info(f"Item {parsed_item.item_id} already intelligence_processed — skipping")
+            return ANALYSIS_DONE
 
         # Extract text from parsed data
         if isinstance(parsed_item.data, dict):
@@ -1168,9 +1480,79 @@ async def process_parsed_item(message_value: bytes):
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return  # permanently failed: stays intelligence_processed=false
+        except Exception as exc:
+            # Not settled: the queue retries with backoff, and the item keeps
+            # intelligence_processed=false until an analysis really lands.
+            return ANALYSIS_RETRY if _looks_transient(exc) else ANALYSIS_FAILED
 
+        await _persist_analysis(
+            parsed_item,
+            intelligence_data,
+            rag_context=rag_context,
+            category_hints=category_hints,
+            rag_embedding=rag_embedding,
+            extracted_text=extracted_text,
+        )
+        return ANALYSIS_DONE
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON message: {e}")
+        return ANALYSIS_FAILED
+    except Exception as e:
+        logger.error(f"Unexpected error analysing parsed item: {e}", exc_info=True)
+        return ANALYSIS_RETRY
+
+
+async def _maybe_raise_alert(parsed_item, intelligence) -> None:
+    """Mirror a high-severity finding into the alert feed and email the owner.
+
+    Never raises: alerting is downstream of the analysis, and a mail server
+    outage must not turn a successfully-analysed item into a retried one. The
+    worst case of swallowing the error here is a missed notification, which is
+    strictly better than an infinite re-analysis loop burning LLM quota.
+    """
+    try:
+        alert_id = await record_alert(
+            job_id=parsed_item.job_id,
+            item_id=parsed_item.item_id,
+            url=parsed_item.url,
+            title=getattr(parsed_item, "title", "") or "",
+            category=intelligence.category,
+            severity=intelligence.threat_severity,
+            language=parsed_item.language or "",
+            summary=intelligence.summary,
+            entities=list(intelligence.entities or []),
+            analysis_source=intelligence.analysis_source,
+            llm_model=intelligence.llm_model,
+        )
+    except Exception:
+        logger.exception("Could not raise alert for item %s", parsed_item.item_id)
+        return
+    if not alert_id:
+        return
+    try:
+        await notify_alert_email(parsed_item.job_id, alert_id)
+    except Exception:
+        logger.exception("Alert email delivery failed for %s", alert_id)
+
+
+async def _persist_analysis(
+    parsed_item,
+    intelligence_data: dict,
+    *,
+    rag_context: str = "",
+    category_hints: str = "",
+    rag_embedding=None,
+    extracted_text: str = "",
+) -> None:
+    """Write one analysis result everywhere it is needed.
+
+    Shared by the synchronous path and the Groq Batch path so a batched item is
+    stored identically — same ClickHouse rows, same Postgres flag, same Qdrant
+    embedding. Anything that differed here would make batched results silently
+    invisible to parts of the product.
+    """
+    if True:
         llm_model = HOSTED_LLM_MODEL if LLM_PROVIDER != "ollama" else OLLAMA_MODEL
 
         # Clamp severity at the call site: the LLM path can yield values the
@@ -1200,9 +1582,27 @@ async def process_parsed_item(message_value: bytes):
             entities=intelligence_data.get("entities", []),
             summary=intelligence_data.get("summary", ""),
             language=parsed_item.language,
+            analysis_source=str(intelligence_data.get("analysis_source") or "llm"),
             llm_model=llm_model,
             llm_score=confidence,
         )
+
+        # A row the heuristic produced must never be counted as model output.
+        # Both the reporting endpoints and the human-evaluation accuracy metric
+        # read this column, so a dead LLM shows up as "0 analyzed" instead of
+        # silently scoring as a healthy classifier.
+        if intelligence.analysis_source != "llm":
+            logger.warning(
+                "[%s] Item %s analyzed WITHOUT an LLM (source=%s, model=%s) - "
+                "classification is heuristic, not model output",
+                parsed_item.job_id, parsed_item.item_id,
+                intelligence.analysis_source, llm_model,
+            )
+            # The label is mandatory on a labelled Counter. Calling inc() bare
+            # raised ValueError here, which aborted the item *before* the
+            # ClickHouse write below — so every fallback analysis was silently
+            # discarded and retried until its attempts ran out.
+            llm_fallback_items.labels(source=intelligence.analysis_source).inc()
 
         # Typed entities for the intelligence_entities table: emails, IPs,
         # domains, everything else. Best-effort — regex only, never fails.
@@ -1210,6 +1610,11 @@ async def process_parsed_item(message_value: bytes):
 
         # Ingest to ClickHouse (analytics + flattened entity rows)
         await ingest_intelligence_to_clickhouse(intelligence, entities_by_type)
+
+        # High-severity alerting. Inside _persist_analysis so both the sync and
+        # the Groq Batch path raise alerts identically - a batched item that
+        # scored 5 must not be the one item nobody is paged for.
+        await _maybe_raise_alert(parsed_item, intelligence)
 
         # Audit snapshot: exact RAG context + hints used for this classification.
         await store_prompt_snapshot(
@@ -1240,11 +1645,6 @@ async def process_parsed_item(message_value: bytes):
         await _pg_call(pg_client.mark_item_intelligence_processed, parsed_item.item_id)
         logger.debug(f"Updated PostgreSQL: item {parsed_item.item_id} marked as intelligence_processed")
 
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode JSON message: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error processing parsed item: {e}", exc_info=True)
-
 
 def _typed_entities(entities: list[str]) -> dict[str, list[str]]:
     """Best-effort entity typing (email/ip/domain/other) for the entity table."""
@@ -1264,9 +1664,262 @@ def _typed_entities(entities: list[str]) -> dict[str, list[str]]:
     return {k: v for k, v in typed.items() if v}
 
 
+def _parse_batch_analysis(content: str) -> dict:
+    """Turn a batched model's raw text into the intelligence dict.
+
+    Reuses the same tolerant parsing as the synchronous path: models wrap JSON
+    in prose or fences often enough that a strict ``json.loads`` would throw
+    away a perfectly good, already-paid-for result.
+    """
+    parsed = OllamaLLMClient._parse_intelligence_response(content)
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError("batch result did not contain a JSON object")
+    return parsed
+
+
+def _item_text_and_url(payload: dict) -> tuple[str, str]:
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data.get("extracted_text") or "", payload.get("url") or ""
+    return "", payload.get("url") or ""
+
+
+def _batch_client() -> "GroqBatchClient | None":
+    """A Groq Batch client, or None when the provider isn't Groq/unconfigured."""
+    if LLM_PROVIDER != "hosted" or LLM_PROVIDER_NAME != "groq":
+        return None
+    key = os.getenv("HOSTED_LLM_API_KEY", "")
+    if not key:
+        logger.info("Groq Batch API unavailable: no HOSTED_LLM_API_KEY")
+        return None
+    return GroqBatchClient(
+        key,
+        completion_window=BATCH_COMPLETION_WINDOW,
+    )
+
+
+async def submit_pending_batch() -> str | None:
+    """Move a deep backlog into Groq's Batch API. Returns the batch id.
+
+    Only runs when the backlog is past ``BATCH_BACKLOG_THRESHOLD``: below that
+    depth the synchronous path is both faster and no dearer overall, and handing
+    a handful of items to a job with a 24-hour window would be actively wrong.
+    """
+    client = _batch_client()
+    if client is None:
+        return None
+
+    depth = await analysis_queue.depth()
+    pending = depth.get("pending", 0)
+    if pending < BATCH_BACKLOG_THRESHOLD:
+        logger.debug(
+            "Batch API idle: backlog %d < threshold %d", pending, BATCH_BACKLOG_THRESHOLD
+        )
+        return None
+
+    claimed = await analysis_queue.claim(BATCH_MAX_REQUESTS, worker_id=WORKER_INSTANCE_ID)
+    if not claimed:
+        return None
+
+    requests: list[tuple[str, str, str]] = []
+    batchable: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for item in claimed:
+        text, url = _item_text_and_url(item.payload)
+        if not text or len(text.strip()) < MIN_ANALYSIS_CHARS:
+            skipped.append(item.item_id)
+            continue
+        requests.append((item.item_id, "", build_analysis_prompt(text, url)))
+        batchable.append((item.item_id, WORKER_INSTANCE_ID))
+
+    # Short and empty items never reach the model: settle them synchronously
+    # rather than paying Groq to tell us what we already know.
+    await analysis_queue.settle_success(skipped)
+
+    if not requests:
+        return None
+
+    from app.services.groq_batch import build_batch_lines
+
+    try:
+        submission = await client.submit(
+            build_batch_lines(requests), model=HOSTED_LLM_MODEL
+        )
+    except GroqBatchError as exc:
+        # Put everything back: the batch never went out, so nothing was paid for.
+        for item_id, _ in batchable:
+            await analysis_queue.fail(
+                item_id, f"batch submission failed: {exc}", retry_in_seconds=30
+            )
+        logger.error("Groq batch submission failed; %d item(s) returned to the queue",
+                     len(batchable))
+        return None
+
+    moved = await analysis_queue.mark_batched(batchable, batch_id=submission.batch_id)
+    logger.info(
+        "Handed %d item(s) to Groq batch %s (%d settled locally as too short)",
+        moved, submission.batch_id, len(skipped),
+    )
+    if moved < len(batchable):
+        logger.warning(
+            "Only %d of %d claimed items moved to batched state; the rest stay "
+            "claimable and will be analysed synchronously",
+            moved, len(batchable),
+        )
+    return submission.batch_id
+
+
+async def collect_batch_results(batch_id: str) -> int:
+    """Poll one batch and write whatever has come back. Returns items settled."""
+    client = _batch_client()
+    if client is None:
+        return 0
+
+    results = await client.collect(batch_id)
+    if not results:
+        return 0
+
+    settled: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for custom_id, (content, error) in results.items():
+        if error or not content:
+            failed.append((custom_id, error or "empty result"))
+            continue
+        rows = await analysis_queue.rows_for_batch([custom_id])
+        for row in rows:
+            try:
+                parsed_item = ParsedItem(**row["payload"])
+                intelligence_data = _parse_batch_analysis(content)
+                # Route through the same persistence path as a synchronous item so
+                # a batched result is indistinguishable downstream.
+                await _persist_analysis(parsed_item, intelligence_data)
+                settled.append(custom_id)
+            except Exception as exc:
+                logger.error(
+                    "Could not persist batched result for %s: %s", custom_id, exc, exc_info=True
+                )
+                failed.append((custom_id, str(exc)))
+
+    await analysis_queue.settle_success(settled)
+    for item_id, reason in failed:
+        await analysis_queue.fail(item_id, f"batch result unusable: {reason}",
+                                  retry_in_seconds=None)
+    logger.info(
+        "Batch %s: %d result(s) written, %d unusable", batch_id, len(settled), len(failed)
+    )
+    return len(settled)
+
+
 async def process_message_safely(message_value: bytes):
     async with llm_semaphore:
         await process_parsed_item(message_value)
+
+
+async def _process_queued_item(item) -> str:
+    """Analyse one claimed queue row and settle it. Never raises."""
+    try:
+        parsed_item = ParsedItem(**item.payload)
+    except Exception as exc:
+        # A payload that no longer matches the schema will never parse; retrying
+        # it forever would block the queue head for no gain.
+        logger.error("Queue row %s has an unparseable payload: %s", item.item_id, exc)
+        return ANALYSIS_FAILED
+
+    try:
+        return await analyze_parsed_item(parsed_item)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Queued analysis crashed for %s: %s", item.item_id, exc, exc_info=True)
+        return ANALYSIS_RETRY
+
+
+async def _settle_queued_item(item) -> tuple[str, str]:
+    """Analyse one claimed row and record the outcome. Returns (item_id, outcome)."""
+    async with llm_semaphore:
+        outcome = await _process_queued_item(item)
+
+    if outcome == ANALYSIS_RETRY and item.attempts >= LLM_QUEUE_MAX_ATTEMPTS:
+        logger.error(
+            "Giving up on %s after %d attempt(s); it stays unanalysed and "
+            "visible in the queue rather than looping forever",
+            item.item_id, item.attempts,
+        )
+        await analysis_queue.fail(
+            item.item_id, f"exceeded {LLM_QUEUE_MAX_ATTEMPTS} attempts", retry_in_seconds=None
+        )
+        return item.item_id, ANALYSIS_FAILED
+
+    if outcome == ANALYSIS_RETRY:
+        # Exponential backoff per item: a provider-wide 429 should not see every
+        # item in the batch retry in lockstep.
+        delay = LLM_QUEUE_RETRY_BASE_SECONDS * (2 ** (item.attempts - 1))
+        await analysis_queue.fail(
+            item.item_id, "transient analysis failure", retry_in_seconds=delay
+        )
+    elif outcome == ANALYSIS_FAILED:
+        await analysis_queue.fail(
+            item.item_id, "permanent analysis failure", retry_in_seconds=None
+        )
+    return item.item_id, outcome
+
+
+async def run_analysis_batches() -> None:
+    """Drain the durable queue in bounded batches until cancelled.
+
+    Claims up to ``LLM_BATCH_SIZE`` items and analyses the whole batch
+    concurrently (each task still holds ``llm_semaphore``, so the number of
+    simultaneous provider calls stays at ``MAX_CONCURRENT_TASKS`` no matter how
+    many batches are claimed). Returns nothing; runs forever.
+    """
+    loop = asyncio.get_running_loop()
+    last_reclaim = 0.0
+
+    while True:
+        try:
+            now = loop.time()
+            if now - last_reclaim >= LLM_QUEUE_LEASE_SECONDS:
+                last_reclaim = now
+                reclaimed = await analysis_queue.reclaim_stalled(
+                    lease_seconds=LLM_QUEUE_LEASE_SECONDS
+                )
+                if reclaimed:
+                    logger.warning(
+                        "Reclaimed %d LLM queue item(s) whose worker lease expired",
+                        reclaimed,
+                    )
+
+            claimed = await analysis_queue.claim(
+                LLM_BATCH_SIZE, worker_id=WORKER_INSTANCE_ID
+            )
+            if not claimed:
+                await asyncio.sleep(LLM_BATCH_POLL_SECONDS)
+                continue
+
+            logger.info(
+                "Analysing %d queued item(s): %s",
+                len(claimed), ", ".join(item.item_id for item in claimed[:8]),
+            )
+            results = await asyncio.gather(
+                *(_settle_queued_item(item) for item in claimed),
+                return_exceptions=True,
+            )
+            settled = [
+                item_id
+                for item_id, outcome in (
+                    (r[0], r[1]) if isinstance(r, tuple) else ("", "") for r in results
+                )
+                if outcome == ANALYSIS_DONE
+            ]
+            await analysis_queue.settle_success(settled)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The loop must outlive any single failure, or one bad batch stops
+            # LLM analysis for the lifetime of the process.
+            logger.error("LLM batch loop error (continuing): %s: %s", type(exc).__name__, exc)
+            await asyncio.sleep(LLM_BATCH_POLL_SECONDS)
 
 
 async def main():
@@ -1319,6 +1972,11 @@ async def main():
 
     await pg_client.connect()
 
+    # The queue needs a pool of its own view of the same database; reuse the one
+    # pg_client already opened rather than doubling the connection count.
+    analysis_queue._pool = pg_client.system_pool
+    await analysis_queue.ensure_schema()
+
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -1358,32 +2016,53 @@ async def main():
         except Exception as exc:
             logger.warning("Offset commit failed (will retry after next message): %s", exc)
 
+    batch_task: asyncio.Task | None = None
     try:
-        # Inline processing: one message at a time under the concurrency
-        # semaphore. Combined with manual commits this gives at-least-once
-        # semantics with no data-loss window between poll and commit.
+        # Consume = decode + enqueue, nothing more. The offset is committed as
+        # soon as the row exists, so the durable queue owns the work from that
+        # moment on: a crash here loses nothing that was not already persisted.
+        if QUEUE_ENABLED:
+            batch_task = asyncio.create_task(run_analysis_batches())
+            logger.info(
+                "LLM analysis running from the durable queue (batch=%d, "
+                "max_concurrent=%d, poll=%.1fs)",
+                LLM_BATCH_SIZE, MAX_CONCURRENT_TASKS, LLM_BATCH_POLL_SECONDS,
+            )
+
         async for msg in consumer:
             metrics.record_consumed()
-            async with llm_semaphore:
-                try:
-                    await process_parsed_item(msg.value)
+            try:
+                if QUEUE_ENABLED:
+                    await enqueue_parsed_item(msg.value)
                     metrics.record_processed("success")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Permanent failure after retries: log + continue so one
-                    # poison item cannot stall the pipeline. The item keeps
-                    # intelligence_processed=false and can be re-analyzed later.
-                    metrics.record_error("processing_error")
-                    metrics.record_processed("error")
-                    logger.error("Message processing failed after retries: %s", exc, exc_info=True)
-                # Commit regardless of processing outcome: forward progress is
-                # preserved and unprocessable items are not redelivered forever.
-                await _commit(consumer)
+                else:
+                    # Escape hatch: the original inline behaviour, for when the
+                    # database is unavailable and only Kafka is durable.
+                    async with llm_semaphore:
+                        await process_parsed_item(msg.value)
+                    metrics.record_processed("success")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Forward progress is preserved and unprocessable items are not
+                # redelivered forever.
+                metrics.record_error("processing_error")
+                metrics.record_processed("error")
+                logger.error("Message processing failed: %s", exc, exc_info=True)
+            # Commit regardless of processing outcome.
+            await _commit(consumer)
     except asyncio.CancelledError:
         logger.info("LLM worker cancellation requested.")
     finally:
         logger.info("Shutting down LLM worker gracefully...")
+        if batch_task is not None:
+            batch_task.cancel()
+            try:
+                await batch_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("LLM batch loop ended with %s", exc)
         await consumer.stop()
         await pg_client.close()
         await llm_client.close()

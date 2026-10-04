@@ -1,10 +1,11 @@
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
 from app.common.logger.logger import logger
-from app.pipeline.main import submit_crawl_job
+from app.common.utils.minio_naming import site_from_url
+from app.pipeline.main import submit_crawl_job, submit_discovery_job
 from app.security.auth import ensure_owner_or_admin, get_current_user, require_admin
 from app.storage.postgres.client import pg_client
 
@@ -34,8 +35,8 @@ class ScrapeRequest(BaseModel):
         ),
     )
     language: str = Field(
-        "am",
-        description="Language of the content to be scraped ('am', 'en').",
+        "en",
+        description="Language of the content to be scraped ('en', 'am', or 'all' for any language).",
     )
     worker_override: str | None = Field(
         None,
@@ -61,10 +62,57 @@ class ScrapeRequest(BaseModel):
     )
 
 
+class DiscoverRequest(BaseModel):
+    """Topic-based discovery request: a query instead of a starting URL.
+
+    ``network`` selects which search-engine list is queried (surface, deep, or
+    dark). It is NOT a worker choice — the discovered seed URLs are routed by
+    the normal WorkerAssignmentEngine, exactly like hand-entered URLs, and are
+    emitted as ordinary CrawlRequests on crawl.requests.
+    """
+
+    query: str = Field(..., min_length=1, description="Topic / search query to discover seed URLs for.")
+    network: Literal["surface", "deep", "dark", "all"] = Field(
+        "surface",
+        description=(
+            "Which engine list to query: 'surface', 'deep', 'dark', or 'all' to "
+            "search every network and merge the results. 'all' keeps each "
+            "network's own transport (dark goes through Tor) and caps the merged "
+            "result at max_results, not each network separately."
+        ),
+    )
+    datatype: Literal["all", "html", "pdf", "document", "audio"] = Field(
+        "all",
+        description=(
+            "Advisory hint for the kind of content sought. Advisory because the "
+            "worker still fetches whatever a URL actually returns - a page that "
+            "redirects to a PDF is captured either way."
+        ),
+    )
+    user_id: str | None = Field(
+        None,
+        description=(
+            "Submit on behalf of this user (ADMIN ONLY - ignored for regular "
+            "users, whose authenticated identity from the JWT is used)."
+        ),
+    )
+    language: str = Field("en", description="Language: 'en', 'am', or 'all'.")
+    max_results: int = Field(
+        10, ge=1, le=100, description="Maximum seed URLs to fan out as crawl jobs."
+    )
+    engines: list[str] | None = Field(
+        None,
+        description="Optional engine-name allowlist; None uses every enabled engine for the network.",
+    )
+    max_depth: int = Field(5, description="Recursion depth applied to each discovered seed.")
+    recursive_config: dict[str, Any] = Field(default_factory=dict)
+    job_params: dict[str, Any] = Field(default_factory=dict)
+
+
 class BatchScrapeRequest(BaseModel):
     urls: list[HttpUrl] = Field(..., min_length=1, max_length=500)
     user_id: str
-    language: str = "am"
+    language: str = "en"
     worker_override: str | None = None
     max_depth: int = 5
     recursive_config: dict[str, Any] = Field(default_factory=dict)
@@ -78,6 +126,27 @@ class BatchScrapeRequest(BaseModel):
 # ========================================================================
 # STATIC / NON-WILDCARD ROUTES FIRST
 # ========================================================================
+
+
+def _job_summary(row) -> dict:
+    """Normalize one jobs row for the list endpoints.
+
+    ``site_name`` is derived from the URL rather than stored: it is purely a
+    function of the host, and a stored copy would go stale the moment a job's
+    URL is rewritten. It is what the UI filters on, because a person
+    recognises "bbc.com" and not "JOB1791014365721".
+    """
+    url = row["url"] if not isinstance(row, dict) else row.get("url", "")
+    keys = row.keys() if not isinstance(row, dict) else row.keys()
+    return {
+        "job_id": row["job_id"],
+        "url": url,
+        "site_name": site_from_url(url),
+        "status": row["status"],
+        "user_id": row["user_id"] if "user_id" in keys else None,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "assignment_reason": row["assignment_reason"] if "assignment_reason" in keys else None,
+    }
 
 
 @router.post("/trigger", status_code=202, response_model=dict)
@@ -117,9 +186,55 @@ async def trigger_scrape_job(
         )
         return result
 
+    except HTTPException:
+        # Already a deliberate, user-facing status (e.g. 503 Kafka
+        # unavailable, 400 bad input). Re-raising keeps the message the UI
+        # needs instead of flattening it into a generic 500.
+        raise
     except Exception as e:
         logger.error(f"Failed to submit scrape job: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal Pipeline Error")
+        raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")
+
+
+@router.post("/discover", status_code=202, response_model=dict)
+async def trigger_discovery_job(
+    request: DiscoverRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Start a crawl from a topic/query instead of a URL.
+
+    Requires authentication. The job is attributed to the authenticated user;
+    only admins may submit on behalf of another user via the optional body
+    ``user_id``. The discovery-worker resolves the query into seed URLs and
+    publishes them as ordinary CrawlRequests, so surface/deep/dark workers
+    consume them with no special handling.
+    """
+    effective_user_id = user["user_id"]
+    if request.user_id and user["role"] == "admin":
+        effective_user_id = request.user_id
+    try:
+        result = await submit_discovery_job(
+            user_id=effective_user_id,
+            query=request.query,
+            network=request.network,
+            language=request.language,
+            max_results=request.max_results,
+            max_depth=request.max_depth,
+            recursive_config=request.recursive_config,
+            engines=request.engines,
+            job_params=request.job_params,
+        )
+        logger.info(
+            "Triggered discovery job %s for query %r -> network %s",
+            result["job_id"], request.query, request.network,
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to submit discovery job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")
 
 
 @router.post("/batch", status_code=202, response_model=dict)
@@ -177,16 +292,7 @@ async def get_user_jobs(user_id: str, user: dict = Depends(get_current_user)):
     return {
         "user_id": user_id,
         "total": len(jobs),
-        "jobs": [
-            {
-                "job_id": job["job_id"],
-                "url": job["url"],
-                "status": job["status"],
-                "created_at": job["created_at"].isoformat() if job["created_at"] else None,
-                "assignment_reason": job["assignment_reason"] if "assignment_reason" in job.keys() else None,
-            }
-            for job in jobs
-        ],
+        "jobs": [_job_summary(job) for job in jobs],
     }
 
 
@@ -198,17 +304,7 @@ async def get_all_jobs(_: object = Depends(require_admin)):
     return {
         "user_id": "all",
         "total": len(rows),
-        "jobs": [
-            {
-                "job_id": row["job_id"],
-                "url": row["url"],
-                "status": row["status"],
-                "user_id": row["user_id"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "assignment_reason": row["assignment_reason"] if "assignment_reason" in row.keys() else None,
-            }
-            for row in rows
-        ],
+        "jobs": [_job_summary(row) for row in rows],
     }
 
 
@@ -506,12 +602,61 @@ async def get_job_status(job_id: str, user: dict = Depends(get_current_user)):
         "job_id": job["job_id"],
         "user_id": job["user_id"],
         "url": job["url"],
+        "site_name": site_from_url(job["url"]),
         "language": job["language"],
         "status": job["status"],
         "assignment_reason": job.get("assignment_reason"),
         "failure_reason": failure_reason or None,
         "created_at": job["created_at"].isoformat() if job["created_at"] else None,
         "completed_at": job["completed_at"].isoformat() if job["completed_at"] else None,
+    }
+
+
+@router.post("/{job_id}/pause", response_model=dict)
+async def pause_job(job_id: str, user: dict = Depends(get_current_user)):
+    """Pause a job so it stops fetching new pages.
+
+    Work already in flight is not cancelled: the page a worker is fetching right
+    now finishes and is kept. The job stops after that and resumes from the same
+    point later.
+    """
+    job = await pg_client.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
+
+    if job["status"] in ("completed", "failed", "skipped"):
+        raise HTTPException(
+            status_code=409, detail="This job has already finished."
+        )
+
+    status = await pg_client.pause_job(job_id)
+    if status != "paused":
+        raise HTTPException(status_code=409, detail="This job cannot be paused.")
+
+    return {
+        "job_id": job_id,
+        "status": status,
+        "message": "Paused. Pages already being fetched will finish.",
+    }
+
+
+@router.post("/{job_id}/resume", response_model=dict)
+async def resume_job(job_id: str, user: dict = Depends(get_current_user)):
+    """Resume a paused job, continuing from where it stopped."""
+    job = await pg_client.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ensure_owner_or_admin(owner_id=job["user_id"], user=user)
+
+    if job["status"] != "paused":
+        raise HTTPException(status_code=409, detail="This job is not paused.")
+
+    status = await pg_client.resume_job(job_id)
+    return {
+        "job_id": job_id,
+        "status": status,
+        "message": "Resumed where it left off.",
     }
 
 

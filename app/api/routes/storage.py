@@ -71,38 +71,21 @@ def _job_id_from_object(name: str) -> str | None:
     return match.group(0).upper() if match else None
 
 
-async def _filter_objects_for_user(
-    bucket_key: str,
-    items: list[dict[str, Any]],
-    user: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Drop objects whose owning job belongs to another user.
+async def _allowed_job_ids(user: dict[str, Any]) -> set[str] | None:
+    """The job ids a caller may see, or ``None`` for "no restriction" (admin).
 
-    Admins see everything. Ownership is resolved through the job id embedded in
-    the object name (jobs.user_id); objects whose job cannot be resolved are
-    hidden from non-admins (fail closed).
+    Fetched once per request instead of per object: the previous code called
+    ``get_job_owners`` with up to 16k ids and then filtered the fully built
+    list. Resolving the caller's own jobs up front turns that into one indexed
+    query and lets the walk skip foreign objects without materialising them.
     """
     if user.get("role") == "admin":
-        return items
+        return None
     user_id = user.get("user_id")
     if not user_id:
-        return []
-
-    job_ids = {
-        jid
-        for item in items
-        if (jid := _job_id_from_object(str(item.get("object_name", ""))))
-    }
-    owners: dict[str, str | None] = {}
-    if job_ids:
-        owners = await pg_client.get_job_owners(list(job_ids))
-
-    allowed = []
-    for item in items:
-        jid = _job_id_from_object(str(item.get("object_name", "")))
-        if jid and owners.get(jid) == user_id:
-            allowed.append(item)
-    return allowed
+        return set()
+    rows = await pg_client.get_job_ids_for_user(user_id)
+    return {str(row["job_id"]) for row in rows}
 
 
 async def _ensure_object_access(object_name: str, user: dict[str, Any]) -> None:
@@ -118,35 +101,118 @@ async def _ensure_object_access(object_name: str, user: dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="Access denied")
 
 
+def _site_from_object(name: str) -> str:
+    """Best-effort site label for an object.
+
+    Folder-style objects (``raw/example.com/JOB.../ITEM....json``) carry the
+    site as their first path segment. Legacy flat objects
+    (``deep_raw_JOB..._ITEM....html``) have no folder, so the label is derived
+    from the owning job's URL instead - the Storage page displays the folder
+    segment when there is one and the URL otherwise.
+    """
+    if "/" in name:
+        return name.split("/", 1)[0].lower()
+    return ""
+
+
 @router.get("/{bucket_key}")
 async def list_storage_items(
     bucket_key: str,
     user: Annotated[dict, Depends(get_current_user_flexible)] = None,
     prefix: str = "",
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    after: str = "",
+    job_id: str = "",
+    site: str = "",
 ):
     """
-    List objects in a bucket (scoped to the current user's jobs; admins see all).
-    bucket_key: one of 'raw', 'parsed', 'exports'
+    List one page of objects in a bucket (scoped to the caller's own jobs).
+
+    ``bucket_key`` is one of 'raw', 'parsed', 'exports'. Paging is cursor
+    based: pass the ``next_cursor`` from the previous response as ``after``.
+    That keeps every page the same cost, whereas ``offset`` forces the server to
+    walk and discard every skipped key (2.7 s to reach row 2000 of 16.5k).
+
+    ``total`` is ``None`` when the page did not reach the end of the bucket, so
+    the client can show "Showing X-Y" without a full-bucket count per request.
     """
     if bucket_key not in BUCKETS:
         raise HTTPException(status_code=404, detail=f"Unknown bucket key. Use one of: {list(BUCKETS.keys())}")
 
     bucket_name = BUCKETS[bucket_key]
+    walk_prefix = prefix
+    if job_id:
+        # Job ids appear as a path segment in folder-style names and as a token
+        # in flat names; widen the MinIO prefix only when we can.
+        walk_prefix = job_id if walk_prefix.endswith(job_id) else walk_prefix
+
     try:
-        objects = minio_client.client.list_objects(bucket_name, prefix=prefix, recursive=True)
-        items = [
-            {
-                "object_name": obj.object_name,
-                "size_bytes": obj.size,
-                "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
-            }
-            for obj in objects
-        ]
-        items = await _filter_objects_for_user(bucket_key, items, user)
-        return {"bucket": bucket_name, "total": len(items), "items": items}
+        allowed = await _allowed_job_ids(user)
+        wanted_job = job_id.upper() if job_id else ""
+        wanted_site = site.strip().lower()
+        if wanted_site:
+            walk_prefix = f"{walk_prefix.rstrip('/')}/{wanted_site}/" if walk_prefix else f"{wanted_site}/"
+
+        objects = minio_client.client.list_objects(
+            bucket_name,
+            prefix=walk_prefix or None,
+            recursive=True,
+            # S3/MinIO list keys in lexicographic order, so the last key of a
+            # page is a stable cursor for the next one.
+            start_after=after or None,
+        )
+
+        items: list[dict[str, Any]] = []
+        seen = 0
+        reached_end = True
+        for obj in objects:
+            name = obj.object_name
+            jid = _job_id_from_object(name)
+            # Ownership: admins are unrestricted, everyone else must match one
+            # of their own job ids. Objects whose job cannot be resolved stay
+            # hidden from non-admins (fail closed).
+            if allowed is not None and (not jid or jid not in allowed):
+                continue
+            if wanted_job and jid != wanted_job:
+                continue
+            if wanted_site and _site_from_object(name) != wanted_site:
+                continue
+            # Only honour `offset` for clients that predate cursor paging;
+            # when a cursor is present it has already skipped those keys.
+            if not after and seen < offset:
+                seen += 1
+                continue
+            if len(items) >= limit:
+                # One object past the page proves there is more to come, and
+                # lets us stop the walk instead of counting the whole bucket.
+                reached_end = False
+                break
+            seen += 1
+            items.append(
+                {
+                    "object_name": name,
+                    "size_bytes": obj.size,
+                    "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+                    "job_id": jid,
+                    "site": _site_from_object(name),
+                }
+            )
+
+        skipped = offset if not after else 0
+        return {
+            "bucket": bucket_name,
+            "total": len(items) + skipped if reached_end else None,
+            "limit": limit,
+            "offset": offset,
+            "has_more": not reached_end,
+            # Cursor for the next page; None once the bucket is exhausted.
+            "next_cursor": items[-1]["object_name"] if items and not reached_end else None,
+            "items": items,
+        }
     except Exception as e:
         logger.error(f"Failed to list bucket {bucket_name}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to list storage items") from e
+        raise HTTPException(status_code=500, detail="Could not load this list.") from e
 
 
 def _read_object(bucket_key: str, name: str) -> bytes:
@@ -444,7 +510,7 @@ async def download_many_objects(
                 included += 1
     except Exception as exc:
         logger.error("Failed to build ZIP archive for bucket %s: %s", bucket_key, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to build download archive") from exc
+        raise HTTPException(status_code=500, detail="Could not build the download.") from exc
 
     bytes_data = buffer.getvalue()
     disposition = f'attachment; filename="duka-scraper-{bucket_key}-{included}-items.zip"'

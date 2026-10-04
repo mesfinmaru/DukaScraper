@@ -4,6 +4,7 @@ import { Link, useNavigate } from "react-router-dom"
 import { api, ApiError } from "../api"
 import { ThemeToggle } from "../theme"
 import { Logo } from "../components/Logo"
+import { Msg } from "../components/ui"
 
 export default function ForgotPasswordPage() {
   const navigate = useNavigate()
@@ -30,7 +31,7 @@ export default function ForgotPasswordPage() {
       setNotice(res.message)
       setStep(2)
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to request a reset code.")
+      setError(err instanceof ApiError ? err.message : "Could not send the code.")
     } finally {
       setBusy(false)
     }
@@ -63,7 +64,7 @@ export default function ForgotPasswordPage() {
       setNotice(res.message)
       navigate("/", { replace: true })
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to reset password.")
+      setError(err instanceof ApiError ? err.message : "Could not save your new password.")
     } finally {
       setBusy(false)
     }
@@ -97,16 +98,8 @@ export default function ForgotPasswordPage() {
           }}
           className="rounded-2xl border border-slate-800 bg-[#050b08] p-6 shadow-2xl space-y-4"
         >
-          {error && (
-            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-400">
-              {error}
-            </p>
-          )}
-          {notice && step !== 3 && (
-            <p className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-600">
-              {notice}
-            </p>
-          )}
+          {error && <Msg tone="error">{error}</Msg>}
+          {notice && step !== 3 && <Msg tone="success">{notice}</Msg>}
 
           {step === 1 && (
             <>

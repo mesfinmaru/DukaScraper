@@ -17,12 +17,143 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from app.common.config.settings import settings
 from app.common.constants.worker_assignment import assign_worker_with_reason
 from app.common.logger.logger import logger
 from app.pipeline.producer.kafka_producer import kafka_producer
-from app.pipeline.schemas import CrawlRequest
+from app.pipeline.schemas import CrawlRequest, SearchRequest
 from app.pipeline.topics import topics
 from app.storage.postgres.client import pg_client
+
+#: Networks a discovery request may target. "all" is not a network with its own
+#: engines - it searches surface, deep and dark concurrently and merges the
+#: seeds (see ``TopicDiscoveryService._discover_all_networks``).
+DISCOVERY_NETWORKS = ("surface", "deep", "dark", "all")
+
+
+async def _require_kafka() -> None:
+    """Connect the Kafka producer on demand, or fail with a retryable 503.
+
+    The API frequently boots before the broker is listening, so a failed
+    startup attempt must not disable job submission for the lifetime of the
+    container. We retry the connection here (a background task retries in
+    parallel) instead of rejecting every submission until a restart.
+    """
+    if kafka_producer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Kafka is unavailable; retry after the messaging service is ready",
+        )
+    try:
+        await kafka_producer.ensure_started()
+    except Exception as exc:
+        logger.warning("Kafka unavailable for job submission: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Kafka is unavailable; retry after the messaging service is ready",
+        ) from exc
+
+
+async def submit_discovery_job(
+    *,
+    user_id: str,
+    query: str,
+    network: str = "surface",
+    language: str = "en",
+    max_results: int | None = None,
+    max_depth: int = 5,
+    recursive_config: dict[str, Any] | None = None,
+    engines: list[str] | None = None,
+    job_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a job row and publish a SearchRequest for the discovery-worker.
+
+    This is the topic-based counterpart of :func:`submit_crawl_job`: instead of
+    a seed URL the job starts from a query, and the discovery-worker resolves
+    it into plain CrawlRequests. The job row's ``url`` is the synthetic marker
+    ``search://<network>/<query>`` so it is obvious in the UI that the seeds
+    came from discovery rather than a hand-entered URL.
+
+    ``network`` chooses which engine list is queried; it is NOT a worker
+    choice - emitted seeds are still routed by the WorkerAssignmentEngine.
+    """
+    network = (network or "surface").lower()
+    if network not in DISCOVERY_NETWORKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"network must be one of {DISCOVERY_NETWORKS}",
+        )
+    query = (query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+
+    await _require_kafka()
+
+    from app.storage.postgres.client import _normalize_user_id
+
+    normalized_user_id = _normalize_user_id(user_id)
+    existing_user = await pg_client.ensure_user(normalized_user_id)
+    actual_user_id = existing_user["user_id"]
+
+    job_row = await pg_client.create_job(
+        user_id=actual_user_id,
+        url=f"search://{network}/{query}",
+        language=language,
+        assignment_reason=f"topic_discovery:{network}",
+    )
+
+    search_request = SearchRequest(
+        job_id=job_row["job_id"],
+        query=query,
+        network=network,
+        language=language,
+        max_results=max_results if max_results is not None else settings.SEARCH_DEFAULT_MAX_RESULTS,
+        engines=engines,
+        max_depth=max_depth,
+        recursive_config=dict(recursive_config or {"enable_extraction": True}),
+        job_params=job_params or {},
+    )
+
+    # One outstanding task for the discovery root. The discovery-worker
+    # registers child slots for each seed before publishing them and settles
+    # this root task last, so the job cannot complete while seeds are in flight.
+    await pg_client.register_job_tasks(job_row["job_id"], 1)
+
+    try:
+        await kafka_producer.publish_search_request(search_request)
+    except Exception as publish_err:
+        logger.error(
+            "Kafka publish failed for discovery job %s: %s", job_row["job_id"], publish_err
+        )
+        await pg_client.fail_job(
+            job_row["job_id"],
+            worker_type=network,
+            url=job_row["url"],
+            reason=(
+                "Job could not be queued: the message broker was unreachable. "
+                "Click Retry to resubmit."
+            ),
+            event_type="publish_failed",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Message broker unavailable — the discovery job was not queued.",
+        ) from publish_err
+
+    await pg_client.update_job_status(job_row["job_id"], "running")
+
+    logger.info(
+        "Submitted discovery job %s — network=%s query=%r (max_results=%s)",
+        job_row["job_id"], network, query, search_request.max_results,
+    )
+    return {
+        "message": "Topic discovery job submitted successfully",
+        "job_id": job_row["job_id"],
+        "network": network,
+        "query": query,
+        "max_results": search_request.max_results,
+        "kafka_topic": topics.SEARCH_REQUESTS,
+    }
 
 
 async def submit_crawl_job(
@@ -51,11 +182,7 @@ async def submit_crawl_job(
     optional and no longer required for correct routing.
     """
 
-    if kafka_producer is None or kafka_producer.producer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Kafka is unavailable; retry after the messaging service is ready",
-        )
+    await _require_kafka()
 
     from app.storage.postgres.client import _normalize_user_id
     worker_type, assignment_reason = assign_worker_with_reason(url, worker_override)

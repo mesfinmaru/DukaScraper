@@ -17,6 +17,17 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[i]}`
 }
 
+/**
+ * Turn a machine value into words: `cyber_threat` -> `Cyber threat`.
+ *
+ * Used for filter dropdown labels, which are built from the values the API
+ * reports rather than a hardcoded list, so they arrive in snake_case.
+ */
+export function humanize(value: string): string {
+  const spaced = value.replace(/_/g, " ").trim()
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+}
+
 export function formatNumber(n: number | null | undefined): string {
   if (n === null || n === undefined || Number.isNaN(n)) return "-"
   return n.toLocaleString("en-US")
@@ -54,6 +65,21 @@ export function formatDateTime(iso: string | null | undefined): string {
   })
 }
 
+/**
+ * Date without the time. Used where a full timestamp would widen a table
+ * column for no gain (e.g. the admin user list, which has to fit every
+ * column on screen at once).
+ */
+export function formatDateOnly(iso: string | null | undefined): string {
+  const d = parseApiDate(iso)
+  if (!d) return "-"
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  })
+}
+
 export function relativeTime(iso: string | null | undefined): string {
   const d = parseApiDate(iso)
   if (!d) return "-"
@@ -69,6 +95,18 @@ export function relativeTime(iso: string | null | undefined): string {
   return formatDateTime(iso)
 }
 
+/**
+ * Human-readable duration between two API timestamps.
+ *
+ * Both bounds go through `parseApiDate`. The backend sends naive UTC
+ * (`2026-10-02T09:14:03`, no offset), which `new Date()` would read as local
+ * time and skew the result by the browser's UTC offset - 180 minutes for a
+ * UTC+3 browser.
+ *
+ * The seconds are rounded into the minute total *before* being split, rather
+ * than each being rounded independently: rounding them separately lets the
+ * seconds reach 60 (119.6s -> "1m 60s") while the minute count stays put.
+ */
 export function formatDuration(
   startIso: string | null | undefined,
   endIso: string | null | undefined,
@@ -79,10 +117,13 @@ export function formatDuration(
   const ms = end.getTime() - start.getTime()
   if (!Number.isFinite(ms) || ms < 0) return "-"
   if (ms < 1000) return `${ms} ms`
-  const sec = ms / 1000
-  if (sec < 60) return `${sec.toFixed(1)} s`
-  const min = Math.floor(sec / 60)
-  const rem = Math.round(sec % 60)
+  const totalSec = Math.round(ms / 1000)
+  if (totalSec < 60) return `${(ms / 1000).toFixed(1)} s`
+  const min = Math.floor(totalSec / 60)
+  const rem = totalSec % 60
+  const hr = Math.floor(min / 60)
+  // Hours only once they exist, but "1h 0m" beats a bare minute count.
+  if (hr >= 1) return `${hr}h ${min % 60}m`
   return `${min}m ${rem}s`
 }
 
@@ -92,10 +133,11 @@ export function languageLabel(code: string | null | undefined): string {
       return "Amharic"
     case "en":
       return "English"
-    case "unknown":
-      return "Unknown"
     default:
-      return code ? code.toUpperCase() : "-"
+      // The system reports only AM and EN. Anything else - including codes
+      // stored before that policy existed - reads as Unknown rather than
+      // surfacing a language the product does not support.
+      return "Unknown"
   }
 }
 
@@ -106,6 +148,14 @@ export async function copyText(text: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/** Length of the emailed 6-digit verification code. */
+export const OTP_CODE_LENGTH = 6
+
+/** A blank six-digit entry state for the verification screens. */
+export function emptyOtpDigits(): string[] {
+  return Array(OTP_CODE_LENGTH).fill("")
 }
 
 export function escapeRegExp(s: string): string {

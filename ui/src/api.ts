@@ -1,5 +1,14 @@
 import { getConfig } from "./config"
+
+export interface ApiFailure {
+  service: string
+  status: number
+  message: string
+  at: number
+}
+
 import type {
+  AlertsResponse,
   ArticleItemDetail,
   SiteCredentialStatus,
   BucketItemsResponse,
@@ -13,6 +22,10 @@ import type {
   JobArticlesResponse,
   JobDetail,
   LoginResponse,
+  RequiresVerificationResponse,
+  VerifyOtpResponse,
+  DiscoverRequest,
+  DiscoverResponse,
   MetricsResponse,
   MonitoringHealthResponse,
   MonitoringUrlsResponse,
@@ -28,6 +41,9 @@ import type {
   EntitySummaryResponse,
   SemanticSearchResponse,
   ThreatAnalyticsResponse,
+  EmbedTokenResponse,
+  UnreadAlertsResponse,
+  ThreatQuery,
   TriggerJobResponse,
   UserJobsResponse,
   UserInfo,
@@ -43,6 +59,49 @@ export class ApiError extends Error {
     this.name = "ApiError"
     this.status = status
   }
+}
+
+// ---- Global API failure tracker ---------------------------------------------
+// The HealthPill polls /ready, which only sees infrastructure dependencies —
+// a page-level endpoint failing (dev-proxy 502, backend 500, network drop)
+// never reached it, so the dot stayed green over a broken page. Every failed
+// request records its service here; any later successful request to the same
+// service clears it. HealthPill subscribes and turns red/amber accordingly.
+
+const failureListeners = new Set<(failures: ApiFailure[]) => void>()
+const liveFailures = new Map<string, ApiFailure>()
+
+export const apiFailures = liveFailures
+
+export function subscribeApiFailures(fn: (failures: ApiFailure[]) => void): () => void {
+  failureListeners.add(fn)
+  fn([...liveFailures.values()])
+  return () => failureListeners.delete(fn)
+}
+
+function serviceOf(path: string): string {
+  const m = path.match(/^\/api\/v\d+\/([^/?#]+)/)
+  return m ? m[1] : "api"
+}
+
+function emitApiFailures() {
+  const snapshot = [...liveFailures.values()]
+  for (const fn of failureListeners) fn(snapshot)
+}
+
+function recordApiFailure(path: string, status: number, message: string) {
+  const service = serviceOf(path)
+  const prev = liveFailures.get(service)
+  if (prev && prev.status === status && prev.message === message) {
+    prev.at = Date.now()
+    return
+  }
+  liveFailures.set(service, { service, status, message, at: Date.now() })
+  emitApiFailures()
+}
+
+function recordApiSuccess(path: string) {
+  if (liveFailures.delete(serviceOf(path))) emitApiFailures()
 }
 
 function extractDetail(body: unknown, fallback: string): string {
@@ -67,11 +126,69 @@ function extractDetail(body: unknown, fallback: string): string {
   return fallback
 }
 
+// ---------- Recording failures from the request helper ----------
+
+request.__recordFailure = recordApiFailure as (path: string, status: number, message: string) => void
+request.__recordSuccess = recordApiSuccess as (path: string) => void
+
 // ---------- session (token) persistence ----------
 // Lives here so the API client can attach the bearer token without a circular
 // import through React context.
 
-const SESSION_KEY = "dukascraper.session.v1"
+const SESSION_KEY = "dukascraper.session.v1" // legacy single-session key
+/** Session of the most recent login, used to seed a brand-new tab. */
+const LAST_SESSION_KEY = "dukascraper.lastSession.v1"
+/** Random id for this tab, kept in sessionStorage so it dies with the tab. */
+const TAB_KEY = "dukascraper.tab.v1"
+
+function sessionStorageKey(): string {
+  return `${SESSION_KEY}.${tabId()}`
+}
+
+/** Stable id for this tab. Survives refresh, unique per tab. */
+function tabId(): string {
+  try {
+    const existing = sessionStorage.getItem(TAB_KEY)
+    if (existing) return existing
+    const fresh =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+    sessionStorage.setItem(TAB_KEY, fresh)
+    return fresh
+  } catch {
+    // Private mode / storage disabled: fall back to a process-stable id so the
+    // app still works for this page view.
+    return "ephemeral"
+  }
+}
+
+function parseSession(raw: string | null): StoredSession | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as StoredSession
+    return parsed.token && parsed.user ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Move a session written by an older build (one shared localStorage key) into
+ * the new layout, so upgrading does not sign everyone out.
+ */
+function migrateLegacySession(): void {
+  try {
+    const legacy = localStorage.getItem(SESSION_KEY)
+    if (!legacy) return
+    if (!localStorage.getItem(LAST_SESSION_KEY)) {
+      localStorage.setItem(LAST_SESSION_KEY, legacy)
+    }
+    localStorage.removeItem(SESSION_KEY)
+  } catch {
+    /* ignore */
+  }
+}
 
 export interface StoredSession {
   token: string
@@ -84,20 +201,45 @@ const sessionListeners = new Set<SessionListener>()
 
 export function getSession(): StoredSession | null {
   try {
-    const raw = localStorage.getItem(SESSION_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as StoredSession
-    return parsed.token && parsed.user ? parsed : null
+    const own = parseSession(sessionStorage.getItem(sessionStorageKey()))
+    if (own) return own
+
+    // A tab opened after the last sign-in has nothing of its own, so it adopts
+    // that login. It is then written to this tab's own slot, which is what keeps
+    // the account stable if another tab signs in as someone else afterwards.
+    const shared = localStorage.getItem(LAST_SESSION_KEY)
+    const adopted = parseSession(shared)
+    if (adopted) sessionStorage.setItem(sessionStorageKey(), shared as string)
+    return adopted
   } catch {
     return null
   }
 }
 
 export function setSession(session: StoredSession | null): void {
-  if (session) localStorage.setItem(SESSION_KEY, JSON.stringify(session))
-  else localStorage.removeItem(SESSION_KEY)
+  try {
+    const key = sessionStorageKey()
+    if (session) {
+      const encoded = JSON.stringify(session)
+      sessionStorage.setItem(key, encoded)
+      // Remembered so a later brand-new tab starts signed in.
+      localStorage.setItem(LAST_SESSION_KEY, encoded)
+    } else {
+      const previous = sessionStorage.getItem(key)
+      sessionStorage.removeItem(key)
+      // Only drop the shared fallback if it was this tab's own session;
+      // otherwise signing out here would sign out other tabs too.
+      if (previous && localStorage.getItem(LAST_SESSION_KEY) === previous) {
+        localStorage.removeItem(LAST_SESSION_KEY)
+      }
+    }
+  } catch {
+    /* ignore */
+  }
   for (const listener of sessionListeners) listener(session)
 }
+
+migrateLegacySession()
 
 export function onSessionChange(listener: SessionListener): () => void {
   sessionListeners.add(listener)
@@ -158,6 +300,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       },
     })
   } catch {
+    request.__recordFailure?.(path, 0, "API unreachable")
     const target = base || "http://localhost:8000 (via dev proxy)"
     throw new ApiError(
       0,
@@ -190,8 +333,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!res.ok) {
+    if (res.status >= 500) {
+      request.__recordFailure?.(path, res.status, extractDetail(body, `${res.status} ${res.statusText}`))
+    }
     throw new ApiError(res.status, extractDetail(body, `${res.status} ${res.statusText}`))
   }
+  request.__recordSuccess?.(path)
   return body as T
 }
 
@@ -275,6 +422,30 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
 
+  verifyOtp: (userId: string, code: string) =>
+
+    request<VerifyOtpResponse>("/api/v1/auth/verify-otp", { method: "POST", body: JSON.stringify({ user_id: userId, code }) }),
+
+
+
+  resendOtp: (userId: string) =>
+
+    request<RequiresVerificationResponse>("/api/v1/auth/verify-otp/resend", { method: "POST", body: JSON.stringify({ user_id: userId }) }),
+
+
+
+  createUser: (payload: { full_name: string; username: string; email: string; password: string; role: string }) =>
+
+    request<UserInfo>("/api/v1/auth/users", { method: "POST", body: JSON.stringify(payload) }),
+
+
+
+  discoverJob: (payload: DiscoverRequest) =>
+
+    request<DiscoverResponse>("/api/v1/jobs/discover", { method: "POST", body: JSON.stringify(payload) }),
+
+
+
   me: () => request<{ user: UserInfo } | UserInfo>("/api/v1/auth/me"),
 
   listUsers: () => request<UsersListResponse>("/api/v1/auth/users"),
@@ -344,6 +515,16 @@ export const api = {
       body: JSON.stringify({ email, code, new_password: newPassword }),
     }),
 
+  /** Confirm the email-verification token sent in the welcome email. */
+  /** Confirm an address with the emailed 6-digit code.
+   *  `user_id` identifies the account; the code is the proof of inbox
+   *  ownership. The link from the email deliberately cannot verify on its own. */
+  verifyEmailConfirm: (payload: { user_id: string; code: string }) =>
+    request<{ message: string }>("/api/v1/auth/email-verification/confirm", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
   // ---------- jobs ----------
   triggerJob: (payload: ScrapeRequest) =>
     request<TriggerJobResponse>("/api/v1/jobs/trigger", {
@@ -379,13 +560,33 @@ export const api = {
 
   getAllJobs: () => request<UserJobsResponse>("/api/v1/jobs/all"),
 
+  /**
+   * Pause a running job. Pages already being fetched finish and are kept; the
+   * job stops after that and resumes from the same point later.
+   */
+  pauseJob: (jobId: string) =>
+    request<{ job_id: string; status: string; message: string }>(
+      `/api/v1/jobs/${encodeURIComponent(jobId)}/pause`,
+      { method: "POST" },
+    ),
+
+  /** Resume a paused job, continuing from where it stopped. */
+  resumeJob: (jobId: string) =>
+    request<{ job_id: string; status: string; message: string }>(
+      `/api/v1/jobs/${encodeURIComponent(jobId)}/resume`,
+      { method: "POST" },
+    ),
+
   searchArticles: (q: string, size = 20) =>
     request<SearchApiResponse>(`/api/v1/articles/search?q=${encodeURIComponent(q)}&size=${size}`),
 
   getJobArticles: (jobId: string) =>
     request<JobArticlesResponse>(`/api/v1/articles/job/${encodeURIComponent(jobId)}`),
 
-  getJobSummary: (jobId: string) =>
+  getJobSummary: (
+    jobId: string,
+    params?: { limit?: number; offset?: number; include_raw?: boolean },
+  ) =>
     request<{
       job_id: string
       total: number
@@ -416,17 +617,47 @@ export const api = {
         } | null
         raw_html: string | null
       }>
-    }>(`/api/v1/articles/job/${encodeURIComponent(jobId)}/summary`),
+    }>(
+      `/api/v1/articles/job/${encodeURIComponent(jobId)}/summary` +
+        (params
+          ? `?${new URLSearchParams(
+              Object.entries(params)
+                .filter(([, v]) => v !== undefined)
+                .map(([k, v]) => [k, String(v)]),
+            ).toString()}`
+          : "")
+    ),
 
   getItem: (itemId: string) =>
     request<ArticleItemDetail>(`/api/v1/articles/${encodeURIComponent(itemId)}`),
 
   listBuckets: () => request<BucketOverviewResponse>("/api/v1/storage/"),
 
-  listBucketItems: (bucketKey: string, prefix = "") =>
-    request<BucketItemsResponse>(
-      `/api/v1/storage/${encodeURIComponent(bucketKey)}?prefix=${encodeURIComponent(prefix)}`,
-    ),
+  /**
+   * One page of bucket objects.
+   *
+   * Paged on the server with a keyset cursor: `after` is the last key of the
+   * previous page. Fetching the whole bucket and paginating in the browser was
+   * the cause of Storage taking up to a minute - 16.5k rows in one 2.1 MB
+   * response, re-downloaded on every refresh. `total` is null while more pages
+   * remain, so the UI shows "Showing X+" rather than claiming an exact count.
+   */
+  listBucketItems: (
+    bucketKey: string,
+    prefix = "",
+    opts: { limit?: number; after?: string; job_id?: string; site?: string } = {},
+  ) => {
+    const params = new URLSearchParams()
+    if (prefix) params.set("prefix", prefix)
+    if (opts.limit) params.set("limit", String(opts.limit))
+    if (opts.after) params.set("after", opts.after)
+    if (opts.job_id) params.set("job_id", opts.job_id)
+    if (opts.site) params.set("site", opts.site)
+    const qs = params.toString()
+    return request<BucketItemsResponse>(
+      `/api/v1/storage/${encodeURIComponent(bucketKey)}${qs ? `?${qs}` : ""}`,
+    )
+  },
 
   /** URL of a single MinIO object (for browser download links). */
   getStorageObjectUrl: storageObjectUrl,
@@ -491,8 +722,26 @@ export const api = {
 
   getMetrics: () => request<MetricsResponse>("/api/v1/analytics/evaluations/metrics"),
 
-  getThreatAnalytics: (limit = 50) =>
-    request<ThreatAnalyticsResponse>(`/api/v1/analytics/threats?limit=${limit}`),
+  /**
+   * Flagged-content list.
+   *
+   * Paginated rather than truncated to the newest N: with thousands of
+   * classified items the old shape made everything past the first page
+   * unreachable. The filters narrow both the page and the counts, so the
+   * numbers on screen always describe the rows underneath them.
+   */
+  getThreatAnalytics: (opts: ThreatQuery = {}) => {
+    const params = new URLSearchParams()
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset))
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit))
+    if (opts.category) params.set("category", opts.category)
+    if (opts.severity !== undefined) params.set("severity", String(opts.severity))
+    if (opts.source_type) params.set("source_type", opts.source_type)
+    const qs = params.toString()
+    return request<ThreatAnalyticsResponse>(
+      `/api/v1/analytics/threats${qs ? `?${qs}` : ""}`,
+    )
+  },
 
   getPerformance: (limit = 25) =>
     request<PerformanceResponse>(`/api/v1/analytics/performance?limit=${limit}`),
@@ -516,4 +765,50 @@ export const api = {
   getMonitoringUrls: () => request<MonitoringUrlsResponse>("/api/v1/monitoring/urls"),
 
   getPrometheusMetrics: () => request<PrometheusMetricsResponse>("/api/v1/monitoring/prometheus"),
+
+  /**
+   * Absolute origin for the monitoring embed proxy.
+   *
+   * Embeds must be absolute (they go in an iframe `src`, not a fetch), and must
+   * point at the API rather than Grafana directly: Grafana >= 13 sends
+   * `X-Frame-Options: deny` unconditionally, which the browser refuses to frame.
+   *
+   * The proxy mounts Grafana and Prometheus at the API *root* (`/grafana`,
+   * `/prometheus`), not under `/api/v1/monitoring/...`: Grafana builds every
+   * asset, API and websocket URL from its own `root_url`, so it has to sit at a
+   * real sub-path for those URLs to resolve inside the frame.
+   */
+  monitoringProxyBase: () => getConfig().apiBaseUrl.replace(/\/+$/, ""),
+
+  getMonitoringEmbedToken: () =>
+    request<EmbedTokenResponse>("/api/v1/monitoring/embed-token"),
+
+  // ---------- alerts ----------
+  getAlerts: (params: {
+    unread_only?: boolean
+    min_severity?: number
+    limit?: number
+    offset?: number
+  } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.unread_only) qs.set("unread_only", "true")
+    if (params.min_severity) qs.set("min_severity", String(params.min_severity))
+    if (params.limit) qs.set("limit", String(params.limit))
+    if (params.offset) qs.set("offset", String(params.offset))
+    const suffix = qs.toString()
+    return request<AlertsResponse>(`/api/v1/alerts${suffix ? `?${suffix}` : ""}`)
+  },
+
+  getUnreadAlerts: () => request<UnreadAlertsResponse>("/api/v1/alerts/unread"),
+
+  markAlertRead: (alertId: string) =>
+    request<{ alert_id: string; read: boolean }>(
+      `/api/v1/alerts/${encodeURIComponent(alertId)}/read`,
+      { method: "POST" },
+    ),
+
+  markAllAlertsRead: () =>
+    request<{ marked: number; unread: number }>("/api/v1/alerts/read-all", {
+      method: "POST",
+    }),
 }

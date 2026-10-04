@@ -6,7 +6,6 @@ No real browsers needed.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import importlib.util
 import os
@@ -104,7 +103,13 @@ sys.modules["app.language.language_detection.detector"].ETHIOPIC_LANGUAGES = {
 }
 
 # portal_handler mock
-ph = sys.modules["app.services.portal_handler"]
+# NOTE: app.services.portal_handler is imported for real by the FastAPI app,
+# which later system tests need. Snapshot the pre-mock state so the restore
+# below puts the REAL module back (or drops the shadow entirely) — assigning
+# attributes on a shared real module or leaving a MagicMock behind poisons
+# every later import of it.
+_ph_before = sys.modules.get("app.services.portal_handler")
+ph = sys.modules["app.services.portal_handler"] = MagicMock()
 ph.PortalHandler = MagicMock
 ph.PortalConfig = MagicMock
 ph.find_config_for_url = MagicMock(return_value=None)
@@ -133,8 +138,21 @@ for mod_name in list(sys.modules):
     else:
         sys.modules.pop(mod_name, None)
 
+# portal_handler was shadowed AFTER the _MODULES_BEFORE_MOCKS snapshot, so the
+# loop above restores it to whatever it was then. If it was not imported at
+# all before this file (the common case), pop the MagicMock — a leftover one
+# breaks later tests that import the real PortalConfig.
+if "app.services.portal_handler" in sys.modules and sys.modules[
+    "app.services.portal_handler"
+] is not _ph_before:
+    if _ph_before is None:
+        sys.modules.pop("app.services.portal_handler", None)
+    else:
+        sys.modules["app.services.portal_handler"] = _ph_before
+
 _is_cloudflare_challenge = _mod._is_cloudflare_challenge
 _html_has_cloudflare_challenge = _mod._html_has_cloudflare_challenge
+_html_is_challenge_interstitial = _mod._html_is_challenge_interstitial
 _CF_CHALLENGE_MARKERS = _mod._CF_CHALLENGE_MARKERS
 
 
@@ -152,7 +170,7 @@ class FakePage:
         return self._result
 
     @classmethod
-    def with_title_and_body(cls, title: str, body: str, body_len: int = 2000) -> "FakePage":
+    def with_title_and_body(cls, title: str, body: str, body_len: int = 2000) -> FakePage:
         """Build a FakePage simulating what the JS expression returns."""
         snippet = title + " " + body[:body_len]
         return cls(evaluate_result=snippet)
@@ -326,3 +344,113 @@ def test_small_antibot_success_page_is_not_challenge_html():
         "<p>Congratulations. You may continue.</p></body></html>"
     )
     assert _html_has_cloudflare_challenge(html) is False
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Localized interstitials — regression tests for a real production bug
+#
+# Camoufox randomizes the browser locale per attempt. On a de-DE profile the
+# interstitial is titled "Nur einen Moment…" and the success banner reads
+# "Überprüfung erfolgreich", so an English-only detector reported "no challenge"
+# and the deep-worker stored the Cloudflare interstitial as a real parsed item
+# (quality 0.72) instead of failing the job.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class DictFakePage:
+    """FakePage that returns the modern {title, text} shape from evaluate()."""
+
+    def __init__(self, title: str, body: str, turnstile: dict | None = None):
+        self._title = title
+        self._body = body
+        self._turnstile = turnstile or {"widget": False, "token": False}
+
+    async def evaluate(self, expr: str):
+        if "document.title" in expr:
+            return {"title": self._title, "text": self._body[:2000]}
+        return self._turnstile
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Nur einen Moment…",   # de
+        "Un instant...",                # fr
+        "Un momento...",             # es
+        "Attendi solo un momento",  # it
+        "Een moment...",                # nl
+    ],
+)
+async def test_localized_challenge_title_detected(title: str):
+    """A localized Cloudflare interstitial title must still read as a challenge."""
+    page = DictFakePage(title, "Sicherheitsüberprüfung wird durchgeführt")
+    assert await _is_cloudflare_challenge(page) is True
+
+
+@pytest.mark.asyncio
+async def test_localized_challenge_detected_via_structural_marker():
+    """The challenge runtime is present regardless of interface language.
+
+    This is the signal that must win when every visible string is translated.
+    """
+    page = DictFakePage(
+        "Nur einen Moment…",
+        "Überprüfung erfolgreich. Warten auf Antwort von www.scrapingcourse.com",
+    )
+    assert await _is_cloudflare_challenge(page) is True
+
+
+def test_real_de_interstitial_html_is_flagged_by_structure():
+    """The exact page published as content in production must be detected.
+
+    Trimmed from the real capture logged by deep-worker for
+    www.scrapingcourse.com/cloudflare-challenge. Note there is no English
+    "Just a moment" string anywhere in the body text - only the challenge
+    runtime identifies it.
+    """
+    html = (
+        "<!DOCTYPE html><html lang=\"en-US\"><head>"
+        "<title>Nur einen Moment…</title></head><body>"
+        "<p>Sicherheitsüberprüfung wird durchgeführt</p>"
+        "<p>Diese Website nutzt einen Sicherheitsservice</p>"
+        "<p>Enable JavaScript and cookies to continue</p>"
+        "<p>Ray ID: a44c52bc3f8e1bcc</p>"
+        "<script>window._cf_chl_opt={};</script>"
+        "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"
+        "</body></html>"
+    )
+    assert _html_has_cloudflare_challenge(html) is True
+
+
+@pytest.mark.asyncio
+async def test_normal_localized_page_is_not_a_challenge():
+    """Localized content must not be mistaken for an interstitial."""
+    page = DictFakePage(
+        "Nachrichten - Tageszeitung",
+        "Die Nachrichten von heute: Politik, Wirtschaft und Sport im Überblick.",
+    )
+    assert await _is_cloudflare_challenge(page) is False
+
+
+def test_real_logged_in_dashboard_is_not_an_interstitial():
+    """A real page that embeds Turnstile must NOT be failed by the store gate.
+
+    Regression: gating on the Turnstile API host threw away a *successful*
+    login. Verified against scrapingcourse.com/dashboard after a real login -
+    it references challenges.cloudflare.com once (the widget) but carries none
+    of the challenge-only markers.
+    """
+    html = (
+        "<!DOCTYPE html><html lang=\"en\"><head>"
+        "<title>Success Page - ScrapingCourse.com</title></head><body>"
+        "<h1>Scraping Login Challenge</h1>"
+        "<h2>Authentication Protected Data</h2>"
+        "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"
+        "</body></html>"
+    )
+    # The loose detector still sees the widget (used to decide whether to try
+    # the Camoufox fallback at all)...
+    assert _html_has_cloudflare_challenge(html) is True
+    # ...but the storage gate must let this page through.
+    assert _html_is_challenge_interstitial(html) is False

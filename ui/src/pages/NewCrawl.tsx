@@ -7,15 +7,24 @@ import {
   Loader2,
   Plus,
   Rocket,
+  Search,
   Trash2,
   Waypoints,
   XCircle,
 } from "lucide-react"
 import { api, ApiError } from "../api"
 import { useAuth } from "../config"
-import type { RecursiveConfig, SiteCredentialStatus, TriggerJobResponse, WorkerType } from "../types"
+import type {
+  DiscoverResponse,
+  CrawlDatatype,
+  DiscoveryNetwork,
+  RecursiveConfig,
+  SiteCredentialStatus,
+  TriggerJobResponse,
+  WorkerType,
+} from "../types"
 import { cn } from "../utils"
-import { CopyButton, PageHeader, WorkerBadge } from "../components/ui"
+import { CopyButton, Msg, PageHeader, WorkerBadge } from "../components/ui"
 import { KeyRound, ShieldCheck } from "lucide-react"
 
 function domainOf(url: string): string | null {
@@ -72,13 +81,26 @@ const WORKER_TYPES: { value: "" | WorkerType; label: string }[] = [
   { value: "dark", label: "Dark" },
 ]
 
+/**
+ * Content types the pipeline can actually fetch and extract. These mirror the
+ * backend's extension sets - HTML, PDF, DOCX/ODT, and audio (which is handed to
+ * the transcriber) - so the list cannot drift from what the crawler supports.
+ */
+const DATATYPES: { value: CrawlDatatype; label: string; hint: string }[] = [
+  { value: "all", label: "All types", hint: "Anything the crawler can extract text from" },
+  { value: "html", label: "Web pages", hint: "Ordinary HTML pages" },
+  { value: "pdf", label: "PDF", hint: "PDF documents" },
+  { value: "document", label: "Documents", hint: "Word and OpenDocument files" },
+  { value: "audio", label: "Audio", hint: "Audio files, transcribed to text" },
+]
+
 export default function NewCrawl() {
   const { session } = useAuth()
 
   const [urls, setUrls] = useState<UrlEntry[]>([
     { key: Date.now(), value: "", type: "" },
   ])
-  const [language, setLanguage] = useState("am")
+  const [language, setLanguage] = useState("en")
   const [maxDepth, setMaxDepth] = useState(5)
   const [allowLogin, setAllowLogin] = useState(false)
   const [allowSignup, setAllowSignup] = useState(false)
@@ -90,6 +112,20 @@ export default function NewCrawl() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [outcomes, setOutcomes] = useState<SubmitOutcome[] | null>(null)
+
+  // --- Topic discovery mode (query -> seed URLs via the discovery-worker) ---
+  const [mode, setMode] = useState<"urls" | "discover">("urls")
+  const [discoverQuery, setDiscoverQuery] = useState("")
+  // "all" is the default: a topic search should reach the whole system rather
+  // than requiring three separate submissions to cover the three layers.
+  const [discoverNetwork, setDiscoverNetwork] = useState<DiscoveryNetwork>("all")
+  const [datatype, setDatatype] = useState<CrawlDatatype>("all")
+  /** One line explaining what the current choice actually does. */
+  const datatypeHint =
+    DATATYPES.find((d) => d.value === datatype)?.hint ?? ""
+  const [discoverMaxResults, setDiscoverMaxResults] = useState(10)
+  const [discovering, setDiscovering] = useState(false)
+  const [discoverOutcome, setDiscoverOutcome] = useState<DiscoverResponse | null>(null)
 
   const [history, setHistory] = useState<{ url: string; lastCrawled: string | null }[]>([])
   const [showHistory, setShowHistory] = useState(false)
@@ -276,12 +312,12 @@ export default function NewCrawl() {
 
     const entries = urls.map((u) => ({ ...u, trimmed: u.value.trim() })).filter((u) => u.trimmed)
     if (!entries.length) {
-      setError("Add at least one target URL starting with http:// or https://")
+      setError("Add at least one link, starting with http:// or https://")
       return
     }
     const invalid = entries.find((u) => !isValidHttpUrl(u.trimmed))
     if (invalid) {
-      setError(`Invalid URL: ${invalid.trimmed} - every entry must start with http:// or https://`)
+      setError(`This link does not look right: ${invalid.trimmed}`)
       return
     }
 
@@ -323,6 +359,7 @@ export default function NewCrawl() {
         allow_login: allowLogin,
         allow_signup: allowSignup,
         allow_email_verification: allowEmailVerification,
+        datatype,
       })
       const results: SubmitOutcome[] = batch.jobs.map((job, index) => ({
         url: entries[index]?.trimmed ?? "unknown",
@@ -338,6 +375,39 @@ export default function NewCrawl() {
     }
   }
 
+  const submitDiscover = async (e: FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    setDiscoverOutcome(null)
+
+    const query = discoverQuery.trim()
+    if (!query) {
+      setError("Enter a topic or search to find links.")
+      return
+    }
+
+    setDiscovering(true)
+    try {
+      const res = await api.discoverJob({
+        query,
+        network: discoverNetwork,
+        user_id: session?.user.user_id ?? null,
+        language,
+        max_results: discoverMaxResults,
+        max_depth: maxDepth,
+        recursive_config: { enable_extraction: maxDepth > 0 },
+        datatype,
+      })
+      setDiscoverOutcome(res)
+    } catch (reason) {
+      setError(
+        reason instanceof ApiError ? reason.message : "Failed to start topic discovery",
+      )
+    } finally {
+      setDiscovering(false)
+    }
+  }
+
   const okCount = outcomes?.filter((o) => o.result).length ?? 0
   const failCount = outcomes?.filter((o) => o.error).length ?? 0
 
@@ -345,7 +415,192 @@ export default function NewCrawl() {
     <div>
       <PageHeader title="New Crawl" />
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+      <div className="mb-6 inline-flex rounded-lg border border-slate-800 bg-slate-950/60 p-1">
+        <button
+          type="button"
+          onClick={() => { setMode("urls"); setError(null) }}
+          className={cn(
+            "inline-flex cursor-pointer items-center gap-1.5 rounded-md px-4 py-1.5 text-sm font-medium transition",
+            mode === "urls"
+              ? "bg-sky-500/15 text-sky-300"
+              : "text-slate-400 hover:text-slate-200",
+          )}
+        >
+          <Rocket className="h-4 w-4" />
+          Crawl URLs
+        </button>
+        <button
+          type="button"
+          onClick={() => { setMode("discover"); setError(null) }}
+          className={cn(
+            "inline-flex cursor-pointer items-center gap-1.5 rounded-md px-4 py-1.5 text-sm font-medium transition",
+            mode === "discover"
+              ? "bg-sky-500/15 text-sky-300"
+              : "text-slate-400 hover:text-slate-200",
+          )}
+        >
+          <Search className="h-4 w-4" />
+          Discover by topic
+        </button>
+      </div>
+
+      {mode === "discover" && (
+        <form
+          onSubmit={(e) => void submitDiscover(e)}
+          className="card max-w-3xl space-y-5 p-6"
+        >
+          <div>
+            <label className="label" htmlFor="discover-query">
+              Topic / search query *
+            </label>
+            <input
+              id="discover-query"
+              className={cn(inputCls, "font-mono")}
+              value={discoverQuery}
+              onChange={(e) => setDiscoverQuery(e.target.value)}
+              placeholder="ethiopian telecom news"
+              spellCheck={false}
+              autoFocus
+              required
+            />
+            <p className="mt-1 text-[11px] text-slate-500">
+              The discovery worker searches the selected network and fans the results out as
+              crawl seeds — no starting URL needed.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <div>
+              <label className="label" htmlFor="discover-network">
+                Network
+              </label>
+              <select
+                id="discover-network"
+                className={inputCls}
+                value={discoverNetwork}
+                onChange={(e) => setDiscoverNetwork(e.target.value as DiscoveryNetwork)}
+              >
+                <option value="all">All layers (surface, deep and dark)</option>
+                <option value="surface">Surface only (clear web)</option>
+                <option value="deep">Deep only (JavaScript / login)</option>
+                <option value="dark">Dark only (Tor)</option>
+              </select>
+            </div>
+            <div>
+              <label className="label" htmlFor="crawl-datatype">
+                Content type
+              </label>
+              <select
+                id="crawl-datatype"
+                className={inputCls}
+                value={datatype}
+                onChange={(e) => setDatatype(e.target.value as CrawlDatatype)}
+                title="What kind of content to look for. Pages that turn out to be a different type are still captured."
+              >
+                {DATATYPES.map((d) => (
+                  <option key={d.value} value={d.value} title={d.hint}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="label" htmlFor="discover-results">
+                Max seed URLs
+              </label>
+              <input
+                id="discover-results"
+                type="number"
+                min={1}
+                max={100}
+                className={inputCls}
+                value={discoverMaxResults}
+                onChange={(e) => setDiscoverMaxResults(Number(e.target.value))}
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="discover-lang">
+                Language
+              </label>
+              <select
+                id="discover-lang"
+                className={inputCls}
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+              >
+                <option value="en">English (EN)</option>
+                <option value="am">Amharic (AM)</option>
+                <option value="all">Both (AM + EN)</option>
+              </select>
+            </div>
+            {/* Max depth sits beside Language in the same grid rather than in
+                its own full-width block below, so the two crawl-shaping
+                controls read together. */}
+            <div>
+              <label className="label" htmlFor="discover-depth">
+                Max depth per seed: <span className="text-indigo-600 normal-case">{maxDepth}</span>
+              </label>
+              <input
+                id="discover-depth"
+                type="range"
+                min={0}
+                max={10}
+                step={1}
+                value={maxDepth}
+                onChange={(e) => setMaxDepth(Number(e.target.value))}
+                className="mt-2.5 w-full accent-sky-500"
+              />
+              <p className="mt-1 text-[11px] text-slate-500">
+                {maxDepth === 0
+                  ? "Each seed is crawled once - no recursion"
+                  : `Each seed recurses up to depth ${maxDepth}`}
+              </p>
+            </div>
+          </div>
+
+          {error && (
+            <Msg tone="error" className="text-sm">{error}</Msg>
+          )}
+
+          <div className="flex items-center gap-3 border-t border-slate-800/80 pt-5">
+            <button type="submit" className="btn-primary min-w-44" disabled={discovering}>
+              {discovering ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+              {discovering ? "Discovering..." : "Start discovery"}
+            </button>
+          </div>
+
+          {discoverOutcome && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-emerald-300">
+                  Discovery job queued for {discoverOutcome.max_results} seed(s)
+                </p>
+                <Link
+                  to={`/jobs/${encodeURIComponent(discoverOutcome.job_id)}`}
+                  className="inline-flex items-center gap-1 text-[11px] font-medium text-sky-600 hover:text-sky-400"
+                >
+                  Track
+                  <Waypoints className="h-3 w-3" />
+                </Link>
+              </div>
+              <p className="mt-2 break-all font-mono text-[11px] text-slate-400">
+                search://{discoverOutcome.network}/{discoverOutcome.query}
+              </p>
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <span className="font-mono text-xs text-sky-600">{discoverOutcome.job_id}</span>
+                <CopyButton value={discoverOutcome.job_id} label="" />
+              </div>
+            </div>
+          )}
+        </form>
+      )}
+
+      <div
+        className={cn(
+          "grid grid-cols-1 gap-6 xl:grid-cols-3",
+          mode === "discover" && "hidden",
+        )}
+      >
         <form onSubmit={(e) => void submit(e)} className="card space-y-5 p-6 xl:col-span-2">
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -428,7 +683,7 @@ export default function NewCrawl() {
             ))}
           </div>
 
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <div>
               <label className="label" htmlFor="crawl-lang">
                 Language
@@ -439,8 +694,9 @@ export default function NewCrawl() {
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
               >
-                <option value="am">Amharic (am)</option>
-                <option value="en">English (en)</option>
+                <option value="en">English (EN)</option>
+                <option value="am">Amharic (AM)</option>
+                <option value="all">Both (AM + EN)</option>
               </select>
             </div>
             <div>
@@ -460,6 +716,28 @@ export default function NewCrawl() {
               <p className="mt-1 text-[11px] text-slate-500">
                 {maxDepth === 0 ? "Single page only - no recursion" : `Recursion up to depth ${maxDepth}`}
               </p>
+            </div>
+            {/* Same picker as topic mode, so the two forms offer identical
+                choices. Advisory: a link that turns out to be a PDF or an audio
+                file is still captured, whatever is selected here. */}
+            <div className="sm:col-span-2 xl:col-span-1">
+              <label className="label" htmlFor="crawl-datatype-url">
+                Content type
+              </label>
+              <select
+                id="crawl-datatype-url"
+                className={inputCls}
+                value={datatype}
+                onChange={(e) => setDatatype(e.target.value as CrawlDatatype)}
+                title="What kind of content to look for. Links that turn out to be a different type are still captured."
+              >
+                {DATATYPES.map((d) => (
+                  <option key={d.value} value={d.value} title={d.hint}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] text-slate-500">{datatypeHint}</p>
             </div>
           </div>
 
@@ -541,9 +819,7 @@ export default function NewCrawl() {
           </div>
 
           {error && (
-            <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm break-words text-rose-200">
-              {error}
-            </div>
+            <Msg tone="error" className="text-sm">{error}</Msg>
           )}
 
           <div className="flex items-center gap-3 border-t border-slate-800/80 pt-5">
@@ -636,7 +912,7 @@ export default function NewCrawl() {
                 ) : (
                   <CheckCircle2 className="h-5 w-5 text-amber-400" />
                 )}
-                <p className="text-sm font-semibold text-emerald-200">
+                <p className="text-sm font-semibold text-emerald-300">
                   {okCount} job{okCount === 1 ? "" : "s"} submitted
                   {failCount > 0 ? `, ${failCount} failed` : " - workers are scraping now"}
                 </p>
@@ -670,7 +946,7 @@ export default function NewCrawl() {
                         <p className="truncate font-mono text-[11px] text-slate-400" title={o.url}>
                           {o.url}
                         </p>
-                        <p className="mt-1 break-words text-xs text-rose-300">{o.error}</p>
+                        <p className="msg msg-error mt-1 text-xs">{o.error}</p>
                       </>
                     )}
                   </li>
@@ -728,9 +1004,7 @@ export default function NewCrawl() {
                 )}
 
                 {cred.error && (
-                  <p className="mb-3 rounded border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-400">
-                    {cred.error}
-                  </p>
+                  <Msg tone="error" className="mb-3">{cred.error}</Msg>
                 )}
 
                 <div className="space-y-3">

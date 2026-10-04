@@ -62,15 +62,45 @@ export function ThemeToggle({ className }: { className?: string }) {
       title={light ? "Switch to dark mode" : "Switch to light mode"}
       aria-label={light ? "Switch to dark mode" : "Switch to light mode"}
       className={cn(
-        "cursor-pointer rounded-full border border-slate-800 bg-slate-950 p-2 text-slate-400 shadow-sm transition hover:border-indigo-500 hover:text-indigo-300",
+        "relative inline-flex h-7 w-[3.25rem] cursor-pointer items-center rounded-full border transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-black",
+        light
+          ? "border-indigo-400/60 bg-indigo-50/80"
+          : "border-slate-700 bg-slate-900",
         className,
       )}
     >
-      {light ? (
-        <Sun className="h-3.5 w-3.5" />
-      ) : (
-        <Moon className="h-3.5 w-3.5" />
-      )}
+      {/* Track icons */}
+      <span className="pointer-events-none absolute left-1 flex h-4 w-4 items-center justify-center">
+        <Moon
+          className={cn(
+            "h-3 w-3 transition-all duration-300",
+            light ? "scale-75 opacity-30 text-slate-400" : "scale-100 opacity-100 text-slate-400",
+          )}
+        />
+      </span>
+      <span className="pointer-events-none absolute right-1 flex h-4 w-4 items-center justify-center">
+        <Sun
+          className={cn(
+            "h-3 w-3 transition-all duration-300",
+            light ? "scale-100 opacity-100 text-amber-500" : "scale-75 opacity-30 text-slate-600",
+          )}
+        />
+      </span>
+      {/* Thumb */}
+      <span
+        className={cn(
+          "pointer-events-none absolute flex h-5 w-5 items-center justify-center rounded-full shadow-md transition-all duration-300",
+          light
+            ? "translate-x-[1.625rem] bg-white"
+            : "translate-x-[0.125rem] bg-slate-700",
+        )}
+      >
+        {light ? (
+          <Sun className="h-3 w-3 text-amber-500" />
+        ) : (
+          <Moon className="h-3 w-3 text-slate-300" />
+        )}
+      </span>
     </button>
   )
 }

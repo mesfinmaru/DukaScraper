@@ -4,6 +4,10 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    # Prometheus runs with --web.external-url=/prometheus, which also makes it
+    # serve under a /prometheus route prefix (bare /api/v1/query_range 404s).
+    # The base URL has to carry that prefix or every Grafana panel renders
+    # "No data" with a downstream 404.
+    url: http://prometheus:9090/prometheus
     isDefault: true
     editable: true

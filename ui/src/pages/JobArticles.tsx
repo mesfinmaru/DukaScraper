@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 import { useParams, useNavigate, useSearchParams } from "react-router-dom"
-import { ArrowLeft, Download, Eye, RefreshCw, Search, ShieldCheck } from "lucide-react"
+import { ArrowLeft, Download, Eye, Search, ShieldCheck } from "lucide-react"
 import { api, ApiError } from "../api"
 import { cn, formatDateTime } from "../utils"
 import {
@@ -10,6 +10,7 @@ import {
   Modal,
   PageHeader,
 } from "../components/ui"
+import { useAutoRefresh } from "../useAutoRefresh"
 
 type TabKey = "metadata" | "content"
 
@@ -23,6 +24,9 @@ function storageObjectName(path: string | null | undefined): string {
 type JobSummary = {
   job_id: string
   total: number
+  limit?: number
+  offset?: number
+  has_more?: boolean
   items: Array<{
     item_id: string
     source_url: string
@@ -58,30 +62,55 @@ export default function JobArticles() {
   const navigate = useNavigate()
   const [summary, setSummary] = useState<JobSummary | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [pageCount, setPageCount] = useState(1)
   const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<TabKey>("content")
   const [viewer, setViewer] = useState<{ item: JobSummary["items"][0]; type: "parsed" | "raw" } | null>(null)
 
   const filterItemId = searchParams.get("itemId")
 
+  const PAGE_SIZE = 10
+
   const load = useCallback(async () => {
     if (!jobId) return
     setLoading(true)
     try {
-      const res = await api.getJobSummary(jobId)
+      // Re-request everything the user has already asked to see, rather than
+      // just the first page: this list is polled for live updates, and
+      // fetching offset 0 only would throw away the pages they loaded.
+      const res = await api.getJobSummary(jobId, {
+        limit: PAGE_SIZE * pageCount,
+        offset: 0,
+      })
       setSummary(res)
       setError(null)
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load job articles")
+      setError(e instanceof ApiError ? e.message : "Could not load the results.")
       setSummary(null)
     } finally {
       setLoading(false)
     }
-  }, [jobId])
+  }, [jobId, pageCount])
+
+  // The summary endpoint is paged server-side: it embeds parsed text per item,
+  // so an unpaged call returned megabytes and the list appeared truncated.
+  const loadMore = useCallback(() => {
+    if (loadingMore) return
+    setLoadingMore(true)
+    setPageCount((p) => p + 1)
+  }, [loadingMore])
+
+  useEffect(() => {
+    if (!loadingMore) setLoadingMore(false)
+  }, [summary, loadingMore])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  // New items appear while a job runs; poll so the list stays current.
+  useAutoRefresh({ load })
 
   const openViewer = (item: JobSummary["items"][0], type: "parsed" | "raw") => {
     setViewer({ item, type })
@@ -111,10 +140,6 @@ export default function JobArticles() {
                 Show all items
               </button>
             )}
-            <button type="button" className="btn-secondary" onClick={load} disabled={loading}>
-              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
-              Refresh
-            </button>
             <button type="button" className="btn-secondary" onClick={() => navigate("/jobs")}>
               <ArrowLeft className="h-4 w-4" />
               Back to jobs
@@ -191,7 +216,7 @@ export default function JobArticles() {
                           <Eye className="h-3 w-3" />
                           View
                         </button>
-                        {item.raw_html && (
+                        {(item.raw_object || item.raw_html) && (
                           <button
                             type="button"
                             onClick={() => openViewer(item, "raw")}
@@ -218,20 +243,22 @@ export default function JobArticles() {
                         </div>
                       </div>
                       <div className="flex flex-col items-end gap-1">
-                        {item.parsed_content?.content_quality_score !== null && item.parsed_content && (
+                        {Number.isFinite(item.parsed_content?.content_quality_score) && (
                           <div className="w-40">
                             <div className="mb-1 flex justify-between text-[10px] text-slate-500">
                               <span>Quality</span>
-                              <span className="font-mono text-slate-300">{(item.parsed_content.content_quality_score * 100).toFixed(1)}%</span>
+                              <span className="font-mono text-slate-300">
+                                {((item.parsed_content!.content_quality_score as number) * 100).toFixed(1)}%
+                              </span>
                             </div>
                             <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
                               <div
                                 className={cn(
                                   "h-full rounded-full transition-all duration-500",
-                                  item.parsed_content.content_quality_score > 0.7 ? "bg-emerald-500" :
-                                  item.parsed_content.content_quality_score > 0.3 ? "bg-amber-500" : "bg-rose-500"
+                                  (item.parsed_content!.content_quality_score as number) > 0.7 ? "bg-emerald-500" :
+                                  (item.parsed_content!.content_quality_score as number) > 0.3 ? "bg-amber-500" : "bg-rose-500"
                                 )}
-                                style={{ width: `${Math.min(100, Math.max(0, item.parsed_content.content_quality_score * 100))}%` }}
+                                style={{ width: `${Math.min(100, Math.max(0, (item.parsed_content!.content_quality_score as number) * 100))}%` }}
                               />
                             </div>
                           </div>
@@ -271,7 +298,7 @@ export default function JobArticles() {
           )}
 
           {activeTab === "metadata" && (
-            <div className="card overflow-hidden">
+            <div className="card table-scroll">
               <table className="w-full min-w-[800px]">
                 <thead className="bg-slate-900/40">
                   <tr>
@@ -289,20 +316,20 @@ export default function JobArticles() {
                 <tbody className="divide-y divide-slate-800/60">
                   {filteredItems.map((item) => (
                     <tr key={item.item_id} className="hover:bg-slate-800/30">
-                      <td className="px-5 py-3 font-mono text-xs text-sky-600">{item.item_id}</td>
-                      <td className="max-w-48 truncate px-5 py-3 font-mono text-xs text-slate-400" title={item.source_url}>
+                      <td data-label="Item ID" className="px-5 py-3 font-mono text-xs text-sky-600">{item.item_id}</td>
+                      <td data-label="URL" className="max-w-48 truncate px-5 py-3 font-mono text-xs text-slate-400" title={item.source_url}>
                         {item.source_url}
                       </td>
-                      <td className="px-5 py-3 text-xs text-slate-400">{item.language.toUpperCase()}</td>
-                      <td className="max-w-40 truncate px-5 py-3 text-sm text-slate-300" title={item.title || ""}>
+                      <td data-label="Lang" className="px-5 py-3 text-xs text-slate-400">{item.language.toUpperCase()}</td>
+                      <td data-label="Title" className="max-w-40 truncate px-5 py-3 text-sm text-slate-300" title={item.title || ""}>
                         {item.title || "—"}
                       </td>
-                      <td className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">{item.publish_date || "—"}</td>
-                      <td className="px-5 py-3 text-xs text-slate-400">
+                      <td data-label="Published" className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">{item.publish_date || "—"}</td>
+                      <td data-label="Chars / Words" className="px-5 py-3 text-xs text-slate-400">
                         {item.character_count?.toLocaleString()} / {item.word_count?.toLocaleString()}
                       </td>
-                      <td className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">{formatDateTime(item.parsed_at)}</td>
-                      <td className="px-5 py-3">
+                      <td data-label="Parsed At" className="px-5 py-3 text-xs whitespace-nowrap text-slate-500">{formatDateTime(item.parsed_at)}</td>
+                      <td data-label="Status" className="px-5 py-3">
                         <div className="flex flex-wrap items-center gap-1.5">
                           {item.intelligence_processed && (
                             <span className="inline-flex items-center gap-1 rounded-full border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium text-violet-500">
@@ -340,6 +367,21 @@ export default function JobArticles() {
               hint={filterItemId ? "The requested item may not have parsed content yet." : "The parser worker may not have processed this job yet."}
               icon={<Search className="h-8 w-8" />}
             />
+          )}
+
+          {summary?.has_more && (
+            <div className="mt-4 flex justify-center">
+              <button
+                type="button"
+                onClick={() => void loadMore()}
+                disabled={loadingMore}
+                className="btn-secondary px-3 py-1.5 text-xs disabled:opacity-60"
+              >
+                {loadingMore
+                  ? "Loading..."
+                  : `Load more (showing ${summary.items.length} of ${summary.total})`}
+              </button>
+            </div>
           )}
         </>
       ) : null}
@@ -380,7 +422,8 @@ export default function JobArticles() {
             <pre className="max-h-[60vh] overflow-auto rounded-lg border border-slate-800 bg-slate-950/80 p-4 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap text-slate-300">
               {viewer.type === "parsed" && viewer.item.parsed_content
                 ? JSON.stringify(viewer.item.parsed_content, null, 2)
-                : viewer.item.raw_html || "No raw HTML available"}
+                : viewer.item.raw_html ||
+                  "Raw HTML is not loaded into the page to keep it fast — use Download above to stream the original file."}
             </pre>
           </div>
         ) : null}

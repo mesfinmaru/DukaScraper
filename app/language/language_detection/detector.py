@@ -87,11 +87,11 @@ def _detect_ethiopic_language(text: str) -> str:
     return "am"
 
 
-def detect_language_from_text(text: str, fallback: str = "unknown") -> str:
+def _detect_language_raw(text: str, fallback: str = "unknown") -> str:
     """Detect the language of a text snippet.
 
-    Supports only Ethiopian local languages (am, om, ti, so, sg, sid)
-    and English.  All other languages return "other".
+    Supports Ethiopian local languages (am, om, ti, so, sg, sid) and English.
+    All other languages return "other".
 
     Uses a multi-stage approach:
     1. Ethiopic script detection → Ethiopian language disambiguation
@@ -144,6 +144,25 @@ def detect_language_from_text(text: str, fallback: str = "unknown") -> str:
     # --- Stage 3: Non-Ethiopic, non-Latin scripts → "other" ---
     # Devanagari, Arabic, CJK, Cyrillic, Thai, etc. — not our target languages.
     return "other"
+
+
+# The system reports exactly two languages: Amharic and English. Anything else
+# is collapsed to "unknown" at this single boundary so no downstream consumer
+# (storage, API, UI, exports) can leak a language the product does not support.
+SYSTEM_LANGUAGES = ("am", "en")
+
+
+def detect_language_from_text(text: str, fallback: str = "unknown") -> str:
+    """Detect the language of a text snippet, restricted to AM/EN.
+
+    The underlying detector can tell Tigrinya from Oromo from Somali, but the
+    system only supports Amharic and English, so every other verdict (including
+    the raw "other") is reported as "unknown" rather than surfaced.
+    """
+    detected = _detect_language_raw(text, fallback)
+    if detected in SYSTEM_LANGUAGES:
+        return detected
+    return "unknown"
 
 
 # langdetect-based detection for when you need to distinguish specific

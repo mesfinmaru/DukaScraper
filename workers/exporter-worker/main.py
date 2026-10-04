@@ -29,7 +29,7 @@ if APP_ENV == "wsl":
 
 from app.common.config.settings import settings
 from app.common.logger.logger import setup_logging as _setup_worker_logging
-from app.common.utils.minio_naming import parsed_name
+from app.common.utils.minio_naming import parsed_name, site_from_url
 from app.pipeline.schemas import ParsedItem
 from app.pipeline.topics import topics
 from app.storage.postgres.client import pg_client
@@ -199,11 +199,22 @@ async def store_single_item(parsed_item: ParsedItem) -> dict[str, Any]:
 
     parsed_payload = parsed_item.model_dump()
     parsed_payload["data"] = data
-    payload_bytes = json.dumps(parsed_payload, ensure_ascii=False).encode("utf-8")
 
-    parsed_object_name = parsed_name(parsed_item.worker, job_id, item_id)
-    await upload_bytes_to_minio(settings.MINIO_PARSED_BUCKET, parsed_object_name, payload_bytes, "application/json")
-    logger.info(f"Saved parsed JSON for {item_id} to MinIO bucket '{settings.MINIO_PARSED_BUCKET}'")
+    # NOTE: deliberately NOT re-uploading here. The parser already saved this
+    # exact object at this exact key, and its payload is the richer of the two:
+    # it carries content_quality_score, structure_valid, sections,
+    # banner_leakage and detected_language. Writing the same key again from
+    # here replaced that file with a narrower payload rebuilt from the Kafka
+    # message, silently dropping those fields - which is why the UI rendered
+    # "NaN%" for quality. This worker owns exports; the parser owns the parsed
+    # object.
+    parsed_object_name = parsed_name(
+        parsed_item.worker, job_id, item_id, site_from_url(parsed_item.url)
+    )
+    logger.debug(
+        "Parsed object %s is owned by parser-worker; not overwriting it here",
+        parsed_object_name,
+    )
 
     try:
         await es_client.index(
@@ -281,10 +292,16 @@ def _batch_to_json_bytes(batch: Sequence[dict[str, Any]]) -> bytes:
     return json.dumps(list(batch), ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def _job_item_object_name(job_id: str | int, item_id: str | int, extension: str = ".csv.gz") -> str:
-    clean_job = str(job_id).strip()
-    clean_item = str(item_id).strip()
-    return f"{clean_job}/{clean_item}{extension}"
+def _item_object_name(site: str, item_id: str | int, extension: str = ".csv.gz") -> str:
+    """Object key for one exported row: ``<site>/<item_id>.csv.gz``.
+
+    Grouped by site, not by job id. A job id says nothing about the content
+    ("JOB1791014365721" tells you nothing; "bbc.com" does), and a single site is
+    usually covered by several jobs, so the site is the level people actually
+    browse, share, and download at.
+    """
+    label = re.sub(r"[^a-z0-9.\-]+", "-", str(site or "unknown").lower()).strip("-.") or "unknown"
+    return f"{label}/{str(item_id).strip()}{extension}"
 
 
 class BatchExportManager:
@@ -328,6 +345,7 @@ class BatchExportManager:
         export_row = None
         export_id = None
         total_size_mb = 0.0
+        folders: set[str] = set()
 
         try:
             export_row = await pg_client.create_export(
@@ -343,17 +361,22 @@ class BatchExportManager:
                 if item_id is None:
                     continue
 
+                site = site_from_url(item.get("url", ""))
                 raw_bytes = _single_item_to_csv_bytes(item)
                 gzipped_bytes = gzip.compress(raw_bytes)
-                object_name = _job_item_object_name(batch_job_id, item_id)
+                object_name = _item_object_name(site, item_id)
                 await upload_bytes_to_minio(EXPORTS_BUCKET, object_name, gzipped_bytes, "text/csv")
                 total_size_mb += len(gzipped_bytes) / (1024 * 1024)
+                folders.add(site)
                 logger.info(f"Exported item {item_id} for job {batch_job_id} to path '{object_name}'")
 
-            folder_path = f"s3://{EXPORTS_BUCKET}/{batch_job_id}/"
+            folder_path = f"s3://{EXPORTS_BUCKET}/{sorted(folders)[0]}/"
             await pg_client.update_export_file_path(export_id, folder_path)
             await pg_client.update_export_status(export_id, "completed", round(total_size_mb, 2))
-            logger.info(f"Exported batch {export_id} ({export_type}) with {len(batch)} items under job folder '{batch_job_id}'")
+            logger.info(
+                "Exported batch %s (%s) with %d items under site folder(s) %s",
+                export_id, export_type, len(batch), sorted(folders),
+            )
         except Exception as e:
             logger.error(f"Batch export failure for {export_type} export: {e}", exc_info=True)
             if export_id:

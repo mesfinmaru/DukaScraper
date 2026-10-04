@@ -47,6 +47,18 @@ for mod_name in _MOCK_MODULES:
         sys.modules[mod_name] = MagicMock()
 
 # Import the module
+# The worker registers Prometheus collectors at import time, and other test
+# files load it under a different module name. Prometheus refuses to register
+# the same metric twice in one process, so the registry is emptied first —
+# otherwise collection fails depending on which module was imported first.
+try:
+    from prometheus_client import REGISTRY as _PROM_REGISTRY
+
+    for _collector in list(getattr(_PROM_REGISTRY, "_collector_to_names", {})):
+        _PROM_REGISTRY.unregister(_collector)
+except Exception:  # pragma: no cover
+    pass
+
 _spec = importlib.util.spec_from_file_location(
     "workers.llm_worker_main",
     os.path.join(_PROJECT_ROOT, "workers", "llm-worker", "main.py"),

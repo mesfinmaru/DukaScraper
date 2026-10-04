@@ -1,13 +1,16 @@
 import { useState } from "react"
 import { Loader2, LogIn } from "lucide-react"
-import { Link } from "react-router-dom"
+import { Link, useNavigate } from "react-router-dom"
 import { ApiError } from "../api"
+import { isRequiresVerification } from "../types"
 import { useAuth } from "../config"
 import { ThemeToggle } from "../theme"
 import { Logo } from "../components/Logo"
+import { Msg } from "../components/ui"
 
 export default function LoginPage() {
   const { login } = useAuth()
+  const navigate = useNavigate()
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
@@ -18,7 +21,15 @@ export default function LoginPage() {
     setBusy(true)
     setError(null)
     try {
-      await login(username.trim().toLowerCase(), password)
+      const res = await login(username.trim().toLowerCase(), password)
+      // An admin-provisioned (still unverified) account gets a 6-digit code
+      // by email instead of a session — transition straight to the OTP page.
+      if (isRequiresVerification(res)) {
+        navigate("/verify-otp", {
+          replace: true,
+          state: { userId: res.user_id, maskedEmail: res.masked_email, expiresIn: res.expires_in_seconds },
+        })
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Login failed. Please try again.")
     } finally {
@@ -41,11 +52,7 @@ export default function LoginPage() {
           onSubmit={(e) => void submit(e)}
           className="rounded-2xl border border-slate-800 bg-[#050b08] p-6 shadow-2xl space-y-4"
         >
-          {error && (
-            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-400">
-              {error}
-            </p>
-          )}
+          {error && <Msg tone="error">{error}</Msg>}
 
           <div>
             <label htmlFor="login-user" className="label">

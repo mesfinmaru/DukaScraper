@@ -1,0 +1,16 @@
+# Windows checkouts must not rewrite line endings for anything that becomes an
+# executable inside a container image. A CRLF in a shebang line
+# ("#!/bin/bash\r") makes the kernel fail with "no such file or directory"
+# even though the file exists and is marked executable — which is exactly how
+# deep-worker/docker-entrypoint.sh broke after a Windows-side rebuild.
+* text=auto
+
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf
+wait_for_kafka.sh text eol=lf
+start_wsl_workers.sh text eol=lf
+retry_with_backoff.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

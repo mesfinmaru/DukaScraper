@@ -16,6 +16,7 @@ from app.pipeline.schemas import (
     CrawlResult,
     IntelligenceAnalytics,
     ParsedItem,
+    SearchRequest,
 )
 from app.pipeline.topics import topics
 
@@ -39,6 +40,14 @@ class TestKafkaTopicDefinitions:
 
     def test_dlq_topic_exists(self):
         assert hasattr(topics, "CRAWL_REQUESTS_DLQ") or "dlq" in "crawl.requests.dlq"
+
+    def test_search_requests_topic(self):
+        assert topics.SEARCH_REQUESTS == "search.requests"
+        assert topics.SEARCH_REQUESTS in topics.ALL_TOPICS
+
+    def test_audio_requests_topic(self):
+        assert topics.AUDIO_REQUESTS == "audio.requests"
+        assert topics.AUDIO_REQUESTS in topics.ALL_TOPICS
 
 
 class TestStage1_APIToWorker:
@@ -80,6 +89,90 @@ class TestStage1_APIToWorker:
         assert restored.job_id == original.job_id
         assert restored.url == original.url
         assert restored.depth == original.depth
+
+
+class TestTopicDiscovery:
+    """Validate SearchRequest → CrawlRequest flow (topic-based discovery)."""
+
+    def test_search_request_to_crawl_request(self):
+        """A discovered seed becomes an ordinary CrawlRequest — no new message shape."""
+        search = SearchRequest(
+            job_id="JOB00000001",
+            query="ethiopian telecom news",
+            network="dark",
+            language="am",
+            max_depth=4,
+        )
+        crawl = CrawlRequest(
+            job_id=search.job_id,
+            url="http://examplehidden.onion/page",
+            language=search.language,
+            worker_type="dark",
+            max_depth=search.max_depth,
+        )
+        assert crawl.job_id == search.job_id
+        assert crawl.language == search.language
+        assert crawl.max_depth == search.max_depth
+
+    def test_search_request_json_roundtrip(self):
+        """SearchRequest survives JSON serialization for Kafka."""
+        original = SearchRequest(
+            job_id="JOB00000001", query="query", network="surface", max_results=7
+        )
+        restored = SearchRequest(**json.loads(original.model_dump_json().encode("utf-8")))
+        assert restored.query == original.query
+        assert restored.network == original.network
+        assert restored.max_results == original.max_results
+
+    def test_network_is_shared_across_all_networks(self):
+        """The same SearchRequest shape works for surface, deep, and dark alike."""
+        for network in ("surface", "deep", "dark"):
+            req = SearchRequest(job_id="JOB00000001", query="q", network=network)
+            assert req.network == network
+
+
+class TestMultiFormatContent:
+    """Validate multi-format ingestion without disturbing the HTML contract."""
+
+    def test_crawl_result_defaults_to_html(self):
+        """Plain HTML crawling must be unchanged: content_kind defaults to 'html'."""
+        result = CrawlResult(
+            job_id="JOB00000001", item_id="ITEM00000001",
+            url="https://example.com", html="<html>x</html>",
+            status_code=200, worker="surface", language="en",
+        )
+        assert result.content_kind == "html"
+        assert result.content_type is None
+
+    def test_non_html_crawl_result_roundtrip(self):
+        """A PDF's extracted text travels in `html` with content_kind='pdf'."""
+        original = CrawlResult(
+            job_id="JOB00000001", item_id="ITEM00000001",
+            url="https://example.com/report.pdf",
+            html="Extracted PDF text",
+            status_code=200, worker="surface", language="en",
+            content_kind="pdf", content_type="application/pdf",
+        )
+        restored = CrawlResult(**json.loads(original.model_dump_json().encode("utf-8")))
+        assert restored.content_kind == "pdf"
+        assert restored.url.endswith(".pdf")
+        assert restored.html == "Extracted PDF text"
+
+    def test_audio_transcription_request_roundtrip(self):
+        """Audio hand-off works identically from any of the three workers."""
+        from app.pipeline.schemas import AudioTranscriptionRequest
+
+        for worker, network in (("surface", "surface"), ("deep", "surface"), ("dark", "dark")):
+            req = AudioTranscriptionRequest(
+                job_id="JOB00000001", item_id="ITEM00000001",
+                url="https://example.com/audio.mp3",
+                worker_type=worker, network=network,
+            )
+            restored = AudioTranscriptionRequest(
+                **json.loads(req.model_dump_json().encode("utf-8"))
+            )
+            assert restored.worker_type == worker
+            assert restored.network == network
 
 
 class TestStage2_WorkerToParser:

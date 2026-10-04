@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.pipeline.schemas import (
+    AudioTranscriptionRequest,
     CrawlRequest,
     CrawlResult,
     CreateJobRequest,
@@ -21,6 +22,7 @@ from app.pipeline.schemas import (
     ParsedItem,
     ParsedItemData,
     ParsedItemRecord,
+    SearchRequest,
     SearchResponse,
     UserRecord,
 )
@@ -36,7 +38,7 @@ class TestCrawlRequestSchema:
             worker_type="surface",
         )
         assert req.job_id == "JOB00000001"
-        assert req.language == "am"  # default
+        assert req.language == "en"  # default (explicit language is always set by submit_crawl_job)
         assert req.depth == 0  # default
         assert req.max_depth == 5  # default
         assert req.retry_count == 0  # default
@@ -199,6 +201,61 @@ class TestIntelligenceAnalyticsSchema:
                 summary="Test",
             )
             assert intel.threat_severity == sev
+
+
+class TestSearchRequestSchema:
+    """Validate the search.requests Kafka message contract."""
+
+    def test_defaults(self):
+        req = SearchRequest(job_id="JOB00000001", query="ethiopian telecom")
+        assert req.network == "surface"
+        assert req.language == "en"
+        assert req.max_results == 10
+        assert req.max_depth == 5
+        assert req.engines is None
+
+    def test_network_accepts_all_three(self):
+        for network in ("surface", "deep", "dark"):
+            assert SearchRequest(job_id="JOB1", query="q", network=network).network == network
+
+    def test_missing_required_field_raises(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(job_id="JOB00000001")  # Missing query
+
+    def test_engine_allowlist(self):
+        req = SearchRequest(job_id="JOB1", query="q", engines=["duckduckgo"])
+        assert req.engines == ["duckduckgo"]
+
+
+class TestAudioTranscriptionRequestSchema:
+    """Validate the audio.requests Kafka message contract."""
+
+    def test_valid_request(self):
+        req = AudioTranscriptionRequest(
+            job_id="JOB00000001",
+            item_id="ITEM00000001",
+            url="https://example.com/audio.mp3",
+            worker_type="surface",
+        )
+        assert req.network == "surface"  # default
+        assert req.language == "en"  # default
+        assert req.content_type is None
+
+    def test_missing_required_field_raises(self):
+        with pytest.raises(ValidationError):
+            AudioTranscriptionRequest(job_id="JOB00000001", item_id="ITEM00000001")  # no url/worker_type
+
+    def test_crawl_result_content_kind_default(self):
+        result = CrawlResult(
+            job_id="JOB00000001",
+            item_id="ITEM00000001",
+            url="https://example.com",
+            html="<html></html>",
+            status_code=200,
+            worker="surface",
+            language="en",
+        )
+        assert result.content_kind == "html"
 
 
 class TestDatabaseRecordSchemas:

@@ -588,6 +588,13 @@ class AutoSignupHandler:
                         logger.info("Filled name field '%s' with '%s'", input_name, _name_value)
                         continue
 
+            # The per-field heuristics above fill at most one name input, so a
+            # split firstName/lastName form keeps a required field empty. HTML5
+            # then refuses to submit: nothing navigates, no error is shown, and
+            # the form still looks present, which we report as a signup failure
+            # with no clue why. Sweep whatever is still required and empty.
+            await self._fill_missing_required_fields(page, email, password)
+
             if not email_filled or not password_filled:
                 # Try XenForo-specific fallback selectors
                 if not email_filled:
@@ -902,6 +909,78 @@ class AutoSignupHandler:
             logger.error("[%s] Signup exception: %s", email, exc, exc_info=True)
 
         return result
+
+    async def _fill_missing_required_fields(self, page: Page, email: str, password: str) -> None:
+        """Fill any `required` control the field heuristics left empty.
+
+        HTML5 constraint validation blocks submission silently — the browser
+        simply refuses to post, nothing navigates, and the page keeps looking
+        like the form is still there. Split name fields (firstName + lastName,
+        the norm on Facebook/LinkedIn-style forms and on the student-portal
+        configs in this repo) hit this constantly because the name pass fills
+        only the first name input it recognises.
+
+        Deliberately conservative: only text-like controls get a guessed value.
+        Phone, date, number and file inputs are skipped rather than invented,
+        because a made-up phone number or DOB would create a genuinely wrong
+        account on a real site, which is worse than a clear signup failure.
+        """
+        candidates = await page.query_selector_all(
+            "input[required]:visible, select[required]:visible, textarea[required]:visible"
+        )
+        for el in candidates:
+            try:
+                tag = (await el.evaluate("e => e.tagName.toLowerCase()")) or ""
+
+                if tag == "select":
+                    if await el.evaluate("e => e.value"):
+                        continue
+                    options = await el.evaluate(
+                        "e => [...e.options].map(o => o.value).filter(v => v !== '')"
+                    )
+                    if options:
+                        await el.select_option(options[0])
+                        logger.info("Selected first option for required <select>")
+                    continue
+
+                input_type = ((await el.get_attribute("type")) or "text").lower()
+                if input_type in ("checkbox", "radio", "hidden", "submit", "button"):
+                    continue
+                if input_type in ("tel", "date", "datetime-local", "month", "week",
+                                  "time", "file", "number"):
+                    continue
+                if await el.evaluate("e => e.value"):
+                    continue
+
+                hints = " ".join(
+                    filter(None, [
+                        await el.get_attribute("name"),
+                        await el.get_attribute("id"),
+                        await el.get_attribute("placeholder"),
+                    ])
+                ).lower()
+
+                if "email" in hints or input_type == "email":
+                    value = email
+                elif "pass" in hints or input_type == "password":
+                    value = password
+                elif "last" in hints or "lname" in hints or "surname" in hints:
+                    value = _SIGNUP_LAST_NAME
+                elif "first" in hints or "fname" in hints:
+                    value = _SIGNUP_FIRST_NAME
+                elif "name" in hints or "address" in hints or "city" in hints:
+                    value = _SIGNUP_FULL_NAME
+                else:
+                    value = _SIGNUP_FULL_NAME
+
+                await el.fill(value)
+                logger.info(
+                    "Filled required field '%s' left empty by heuristics (%s)",
+                    (await el.get_attribute("name")) or await el.get_attribute("id") or "?",
+                    input_type,
+                )
+            except Exception as exc:
+                logger.debug("Could not fill a required field: %s", exc)
 
     async def _tick_agreement_checkboxes(self, page: Page) -> None:
         """Check agreement / terms-of-service checkboxes on signup forms."""

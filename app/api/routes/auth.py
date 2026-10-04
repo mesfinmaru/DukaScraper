@@ -25,7 +25,7 @@ from app.services.email_service import (
     send_account_confirmation_email,
     send_password_reset_email,
     send_security_code_email,
-    send_verification_email,
+    send_welcome_credentials_email,
 )
 from app.storage.postgres.client import pg_client
 
@@ -34,6 +34,13 @@ router = APIRouter()
 USERNAME_PATTERN = r"^[a-z0-9][a-z0-9_.\-]{2,31}$"
 SIGNUP_CODE_EXPIRE_MINUTES = 10
 SIGNUP_CONFIRM_EXPIRE_MINUTES = 30
+LOGIN_OTP_EXPIRE_MINUTES = 10
+
+
+def _mask_email(email: str) -> str:
+    """jane.doe@corp.com -> j***@corp.com (safe to show in the UI)."""
+    local, _, domain = email.partition("@")
+    return f"{(local or "?")[0]}***@{domain or "?"}"
 
 
 def _six_digit_code() -> str:
@@ -63,7 +70,7 @@ class CreateUserRequest(BaseModel):
     full_name: str = Field(min_length=2, max_length=150)
     username: str = Field(min_length=3, max_length=100, description="Unique login username")
     email: EmailStr
-    password: str = Field(min_length=12, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
     role: str = Field(default="user", pattern="^(user|admin)$")
 
 
@@ -97,7 +104,15 @@ class RefreshRequest(BaseModel):
 
 
 class EmailVerificationRequest(BaseModel):
-    token: str = Field(min_length=20, max_length=256)
+    """Verify an address with the emailed code.
+
+    `user_id` only identifies the account - it is not a secret. The code proves
+    inbox ownership, and the email link no longer verifies on its own, so a
+    one-click "Verify Email" is no longer possible.
+    """
+
+    user_id: str = Field(min_length=3, max_length=64)
+    code: str = Field(pattern=r"^\d{6}$", description="6-digit emailed code")
 
 
 def public_user(user) -> dict:
@@ -166,10 +181,10 @@ async def login(request: LoginRequest, http_request: Request):
             detail="This account has been disabled. Contact an administrator.",
         )
     if not user.get("email_verified"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Verify your account email before signing in.",
-        )
+        # First login of an admin-provisioned account: challenge email
+        # ownership with a 6-digit OTP instead of rejecting the sign-in.
+        # The SPA reads `redirect_to` and transitions to /verify-otp.
+        return await _issue_login_otp(user)
     await pg_client.record_audit_event(
         actor_user_id=user["user_id"],
         action="login",
@@ -182,6 +197,81 @@ async def login(request: LoginRequest, http_request: Request):
 @router.post("/refresh")
 async def refresh(request: RefreshRequest):
     return await refresh_token(request.refresh_token)
+
+
+# ── First-login email verification (6-digit OTP) ─────────────
+
+
+class VerifyOtpRequest(BaseModel):
+    user_id: str = Field(min_length=3, max_length=64)
+    code: str = Field(pattern=r"^\d{6}$", description="6-digit emailed code")
+
+
+class ResendOtpRequest(BaseModel):
+    user_id: str = Field(min_length=3, max_length=64)
+
+
+async def _issue_login_otp(user) -> dict:
+    """Email a fresh 6-digit login OTP and tell the SPA where to go next."""
+    code = _six_digit_code()
+    try:
+        await pg_client.store_email_verification_token(
+            user["user_id"],
+            sha256(code.encode()).hexdigest(),
+            expires_minutes=LOGIN_OTP_EXPIRE_MINUTES,
+        )
+        await send_security_code_email(user["email"], code, purpose="signup")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Verification email is temporarily unavailable")
+    return {
+        "status": "REQUIRES_VERIFICATION",
+        "user_id": user["user_id"],
+        "redirect_to": "/verify-otp",
+        "masked_email": _mask_email(user["email"]),
+        "expires_in_seconds": LOGIN_OTP_EXPIRE_MINUTES * 60,
+    }
+
+
+@router.post("/verify-otp")
+async def verify_login_otp(request: VerifyOtpRequest, http_request: Request):
+    """Exchange a valid emailed OTP for a full token pair (auto-login)."""
+    await enforce_rate_limit(http_request, scope="verify-otp", limit=20, window_seconds=600)
+    user = await _resolve_user(request.user_id.strip())
+    if not user or user.get("email_verified"):
+        raise HTTPException(status_code=400, detail="Verification code is invalid or expired")
+    valid = await pg_client.is_valid_verification_code(
+        user["user_id"],
+        "email_verification",
+        sha256(request.code.encode()).hexdigest(),
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail="Verification code is invalid or expired")
+    if not await pg_client.consume_verification_code(
+        user["user_id"], "email_verification", sha256(request.code.encode()).hexdigest()
+    ):
+        raise HTTPException(status_code=400, detail="Verification code is invalid or expired")
+    await pg_client.mark_email_verified(user["user_id"])
+    await pg_client.record_audit_event(
+        actor_user_id=user["user_id"],
+        action="login",
+        target_type="user",
+        target_id=user["user_id"],
+        details="email_verified",
+    )
+    refreshed = await pg_client.get_user(user["user_id"])
+    return {**await create_token_pair(user_id=user["user_id"], role=user["role"]), "user": public_user(refreshed or user)}
+
+
+@router.post("/verify-otp/resend")
+async def resend_login_otp(request: ResendOtpRequest, http_request: Request):
+    """Re-email a fresh OTP for an account that is still unverified."""
+    await enforce_rate_limit(http_request, scope="verify-otp-resend", limit=5, window_seconds=3600)
+    user = await _resolve_user(request.user_id.strip())
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if user.get("email_verified"):
+        raise HTTPException(status_code=400, detail="This account is already verified — just sign in.")
+    return await _issue_login_otp(user)
 
 
 @router.post("/logout", status_code=204)
@@ -242,14 +332,54 @@ async def confirm_password_reset(request: PasswordResetConfirmRequest):
 # ── Email verification ────────────────────────────────────────
 
 
+@router.get("/verify-email")
+async def verify_email_page():
+    """Landing target for the "Verify Email" button in the welcome email.
+
+    The link only opens the app's verification page; it verifies nothing.
+    Confirming the address requires the 6-digit code from the same email
+    (POST /email-verification/confirm).
+    """
+    return {"status": "ok", "message": "Verification endpoint ready"}
+
+
 @router.post("/email-verification/confirm")
-async def confirm_email_verification(request: EmailVerificationRequest):
-    email = await pg_client.verify_email_token(
-        sha256(request.token.encode()).hexdigest(),
+async def confirm_email_verification(
+    request: EmailVerificationRequest,
+    http_request: Request,
+):
+    """Confirm an address with the emailed 6-digit code.
+
+    Uses the same single-use, expiry-aware primitives as the first-login OTP, so
+    a code cannot be replayed and an expired one is rejected. This does not sign
+    the user in: the path is reached from the email, where no password has been
+    presented, so the caller is sent to the sign-in page afterwards.
+    """
+    await enforce_rate_limit(
+        http_request, scope="email-verification", limit=10, window_seconds=600
     )
-    if not email:
-        raise HTTPException(status_code=400, detail="Verification token is invalid, expired, or already used")
-    await send_account_confirmation_email(email, "email_verified")
+    user = await _resolve_user(request.user_id.strip())
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if user.get("email_verified"):
+        raise HTTPException(
+            status_code=400, detail="This account is already verified - just sign in."
+        )
+
+    digest = sha256(request.code.encode()).hexdigest()
+    if not await pg_client.is_valid_verification_code(
+        user["user_id"], "email_verification", digest
+    ):
+        raise HTTPException(status_code=400, detail="That code is not right or has expired.")
+    # Atomic single-use: a replayed code fails here even when a concurrent
+    # second request got past the check above.
+    if not await pg_client.consume_verification_code(
+        user["user_id"], "email_verification", digest
+    ):
+        raise HTTPException(status_code=400, detail="That code is not right or has expired.")
+
+    await pg_client.mark_email_verified(user["user_id"])
+    await send_account_confirmation_email(user["email"], "email_verified")
     return {"message": "Email verified. You can sign in now."}
 
 
@@ -537,6 +667,13 @@ async def list_users(_: Annotated[object, Depends(require_admin)]):
 
 @router.post("/users", status_code=201)
 async def create_user(request: CreateUserRequest, admin=Depends(require_admin)):
+    """Admin creates the account in one step; the user is emailed credentials.
+
+    The admin's responsibility ends here: the account is created unverified
+    (email_verified=False) with a forced password change, and the credentials
+    are emailed. The user's first sign-in triggers the 6-digit email-verification
+    challenge (POST /login returns REQUIRES_VERIFICATION) and then auto-login.
+    """
     if await pg_client.get_user_by_email(str(request.email).lower()):
         raise HTTPException(status_code=409, detail="Email is already in use")
     if await pg_client.get_user_by_username(request.username.lower()):
@@ -547,26 +684,46 @@ async def create_user(request: CreateUserRequest, admin=Depends(require_admin)):
         email=str(request.email).lower(),
         password_hash=hash_password(request.password),
         role=request.role,
+        email_verified=False,
     )
-    verification_token = token_urlsafe(32)
+    await pg_client.set_must_change_password(user["user_id"], True)
+    # A 6-digit code, not a link token. store_email_verification_token deletes
+    # any previous code for the user, so only one outstanding code can exist and
+    # the emailed link can never verify on its own.
+    verification_code = _six_digit_code()
     await pg_client.store_email_verification_token(
         user["user_id"],
-        sha256(verification_token.encode()).hexdigest(),
+        sha256(verification_code.encode()).hexdigest(),
+        expires_minutes=LOGIN_OTP_EXPIRE_MINUTES,
     )
     try:
-        await send_verification_email(user["email"], verification_token)
+        await send_welcome_credentials_email(
+            user["email"],
+            user["username"],
+            request.password,
+            verification_code,
+            full_name=user["full_name"],
+            user_id=user["user_id"],
+        )
     except Exception:
+        # Roll back so the admin can retry the same form.
+        try:
+            await pg_client.delete_user(user["user_id"])
+        except Exception:
+            pass
         raise HTTPException(
             status_code=503,
-            detail="User created but verification email could not be sent; check SMTP settings",
+            detail="We could not send the welcome email, so the user was not created. Check the mail settings and try again.",
         )
     await pg_client.record_audit_event(
         actor_user_id=admin["user_id"],
         action="user_created",
         target_type="user",
         target_id=user["user_id"],
+        details="welcome_credentials_emailed",
     )
-    return public_user(user)
+    refreshed = await pg_client.get_user(user["user_id"])
+    return public_user(refreshed or user)
 
 
 @router.patch("/users/{user_id}")

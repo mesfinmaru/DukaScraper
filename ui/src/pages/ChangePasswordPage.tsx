@@ -3,6 +3,7 @@ import { KeyRound, Loader2, Lock, LogOut, ShieldCheck } from "lucide-react"
 import { ApiError } from "../api"
 import { useAuth } from "../config"
 import { ThemeToggle } from "../theme"
+import { Msg } from "../components/ui"
 
 export default function ChangePasswordPage() {
   const { changePassword, logout } = useAuth()
@@ -16,7 +17,7 @@ export default function ChangePasswordPage() {
     e.preventDefault()
     setError(null)
     if (newPassword.length < 8) {
-      setError("New password must be at least 8 characters.")
+      setError("Password must be at least 8 characters.")
       return
     }
     if (newPassword !== confirmPassword) {
@@ -27,7 +28,7 @@ export default function ChangePasswordPage() {
     try {
       await changePassword(currentPassword, newPassword)
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to change password.")
+      setError(err instanceof ApiError ? err.message : "Could not change your password.")
     } finally {
       setBusy(false)
     }
@@ -55,11 +56,7 @@ export default function ChangePasswordPage() {
           onSubmit={(e) => void submit(e)}
           className="rounded-2xl border border-slate-800 bg-[#050b08] p-6 shadow-2xl space-y-4"
         >
-          {error && (
-            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-400">
-              {error}
-            </p>
-          )}
+          {error && <Msg tone="error">{error}</Msg>}
 
           <div>
             <label htmlFor="cp-current" className="label">

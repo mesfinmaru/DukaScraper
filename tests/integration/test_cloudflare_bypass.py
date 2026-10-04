@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ═════════════════════════════════════════════════════════════════════
 # Pre-import mocks: the deep worker imports Kafka, MinIO, PostgreSQL,
 # and many app services at module level.  We mock them all BEFORE
@@ -273,6 +272,23 @@ class MockCamoufoxCM:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _fast_bypass_sleeps(monkeypatch):
+    """Shrink every asyncio.sleep in the bypass path.
+
+    The worker's settle/retry waits are production tuning (2–8s); against mock
+    pages they add ~3 minutes of pure wall-clock across this module without
+    exercising any new logic. The 60s challenge poll is bounded by its own
+    condition, so shrinking ticks to 5ms only speeds the clock up.
+    """
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *args, **kwargs):
+        return await real_sleep(min(float(delay), 0.005), *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+
 def _make_worker() -> DeepWorker:
     worker = DeepWorker()
     worker.captcha_solver = MagicMock()
@@ -480,24 +496,15 @@ async def test_content_never_unbound():
     with (
         patch.object(_mod, "_is_cloudflare_challenge", side_effect=mock_is_cf),
         patch.object(_mod, "shared_proxy_manager", mock_pm),
+        # Simulate "Camoufox not installed" via the flag the worker checks.
+        # Deliberately NOT patching builtins.__import__: shadowing the import
+        # machinery mid-test wedged the runner (the Camoufox retry loop no
+        # longer honoured its per-attempt asyncio.timeout and blocked forever).
+        patch.object(_mod, "HAS_CAMOUFOX", False),
     ):
-        # Make Camoufox import fail
-        real_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-
-        def blocking_import(name, *args, **kwargs):
-            if "camoufox" in name:
-                raise ImportError("No module named 'camoufox'")
-            return real_import(name, *args, **kwargs)
-
-        mock_proc = AsyncMock()
-        mock_proc.wait = AsyncMock()
-        with (
-            patch("builtins.__import__", side_effect=blocking_import),
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
-        ):
-            response, content = await worker._navigate_and_solve(
-                patchright_page, url, "TEST0001", 30000
-            )
+        response, content = await worker._navigate_and_solve(
+            patchright_page, url, "TEST0001", 30000
+        )
 
     assert isinstance(content, str), f"content should be str, got {type(content)}"
 
@@ -595,7 +602,10 @@ async def test_camoufox_receives_expected_launch_options():
     patchright_page = MockPage(is_challenge=True, html_content=CF_CHALLENGE_HTML)
 
     async def mock_is_cf(page):
-        return True
+        # Let the Camoufox page clear immediately: this test measures the launch
+        # options, not the challenge poll (which would otherwise sleep 60s per
+        # attempt against a permanent "still challenged" mock).
+        return "Welcome to Neowin" not in getattr(page, "_html", "")
 
     captured_opts = {}
 
@@ -624,8 +634,14 @@ async def test_camoufox_receives_expected_launch_options():
             )
 
     assert "headless" in captured_opts
+    # The worker launches Camoufox HEADFUL (headless=False) and relies on Xvfb
+    # (DISPLAY=:99) for the display: native headless (True) is fingerprinted by
+    # the anti-bot engine, and Camoufox's own headless="virtual" allocates a
+    # 1x1 px virtual screen on Linux (daijro/camoufox#458), which is neither a
+    # real window geometry nor indistinguishable from headful.
     assert captured_opts["headless"] is False
     assert "humanize" in captured_opts
+    assert captured_opts["humanize"] is True
     assert "os" in captured_opts
 
 
@@ -669,8 +685,10 @@ async def test_camoufox_retries_with_rotation_until_success():
     # Track which profiles were attempted
     attempted_profiles: list[str] = []
 
-    # First Camoufox attempt: still challenged
-    # Second Camoufox attempt: clears challenge
+    # First Camoufox attempt: challenged for the entire poll (never clears)
+    # Second Camoufox attempt: clears immediately, with NO clearance cookie so
+    # the worker adopts the Camoufox content directly (this isolates rotation
+    # from the cookie-transfer/re-nav path, which other tests cover).
     attempt_count = 0
 
     class RotatingCamoufoxCM:
@@ -680,14 +698,12 @@ async def test_camoufox_retries_with_rotation_until_success():
             os_val = kwargs.get("os", "unknown")
             attempted_profiles.append(str(os_val))
 
-            # First attempt stays challenged, second clears
             is_clear = attempt_count >= 2
             self._browser = MockCamoufoxBrowser(
                 MockPage(
                     is_challenge=not is_clear,
                     html_content=REAL_PAGE_HTML if is_clear else CF_CHALLENGE_HTML,
-                    cookies=[{CF_CLEARANCE_COOKIE: CF_CLEARANCE_VALUE, "name": CF_CLEARANCE_COOKIE,
-                              "value": CF_CLEARANCE_VALUE, "domain": ".example.com"}],
+                    cookies=[],
                 )
             )
 
@@ -697,24 +713,9 @@ async def test_camoufox_retries_with_rotation_until_success():
         async def __aexit__(self, *args):
             pass
 
-    renav_count = 0
-
-    async def mock_goto(url="", wait_until="commit", timeout=30000):
-        nonlocal renav_count
-        renav_count += 1
-        if renav_count >= 2:
-            patchright_page._html = REAL_PAGE_HTML
-        return MockResponse(status=200, body=patchright_page._html)
-
-    patchright_page.goto = mock_goto
-
     async def mock_is_cf(page):
-        # Camoufox pages after attempt 2 are clear
-        if hasattr(page, "_html") and "Welcome to Neowin" in page._html:
-            return False
-        if renav_count >= 2:
-            return False
-        return True
+        # Only the second attempt's page (real content) is clear.
+        return "Welcome to Neowin" not in getattr(page, "_html", "")
 
     with (
         patch.object(_mod, "_is_cloudflare_challenge", side_effect=mock_is_cf),
@@ -732,6 +733,7 @@ async def test_camoufox_retries_with_rotation_until_success():
     # Profiles should be different (rotation working)
     assert len(set(attempted_profiles)) >= 2, f"Profiles should rotate: {attempted_profiles}"
     assert len(content) > 500
+    assert "Welcome to Neowin" in content
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -741,7 +743,6 @@ async def test_camoufox_retries_with_rotation_until_success():
 @pytest.mark.asyncio
 async def test_all_profiles_exhausted_graceful_fallback():
     """When all Camoufox profiles fail, content is still a string."""
-    from workers.deep_worker_main import CAMOUFOX_FINGERPRINT_PROFILES
 
     worker = _make_worker()
     url = "https://example.com/page"
@@ -769,6 +770,9 @@ async def test_all_profiles_exhausted_graceful_fallback():
     with (
         patch.object(_mod, "_is_cloudflare_challenge", side_effect=mock_is_cf),
         patch.object(_mod, "shared_proxy_manager", mock_pm),
+        # One profile is enough to prove the exhausted-fallback path and keeps
+        # the test bounded (each attempt sleeps the full challenge poll).
+        patch.object(_mod, "CAMOUFOX_FINGERPRINT_PROFILES", _mod.CAMOUFOX_FINGERPRINT_PROFILES[:1]),
         patch("camoufox.async_api.AsyncCamoufox", AlwaysFailCM),
     ):
         mock_proc = AsyncMock()

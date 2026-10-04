@@ -37,6 +37,7 @@ from workers.common import (
     complete_job_task_from_message,
     extract_and_queue_children,
     fail_job_from_message,
+    wait_while_paused as _wait_while_paused,
 )
 from workers.health import HealthServer
 from workers.metrics import WorkerMetrics
@@ -45,8 +46,12 @@ from app.services.link_extraction_service import LinkExtractionService
 from app.language.cleaning.cleaner import clean_and_extract_text
 from app.language.language_detection.detector import detect_language_from_text
 from app.services.page_validation_service import PageValidationService
+from app.services.content_ingestion_service import ContentIngestionService, ContentKind
 from app.services.dead_letter_service import publish_crawl_dead_letter
 from app.services.politeness_service import PolitenessService
+from app.services.raw_object_store import RawObjectStore
+
+RAW_STORE = RawObjectStore()
 from app.services.content_fingerprint_service import (
     generate_fingerprint, url_fingerprint, content_hash, simhash,
 )
@@ -193,6 +198,10 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes):
                          request.job_id, request.worker_type, WORKER_TYPE)
             return
 
+        # --- Pause gate ---
+        # Wait rather than skip: discarding the message would lose this page.
+        await _wait_while_paused(request.job_id)
+
         # --- Dedup: skip jobs already completed (prevents re-processing on worker restart)
         # When auto_offset_reset="earliest" is set, a restarted worker replays
         # all messages from the start of the topic.
@@ -255,18 +264,51 @@ async def _process_request_inner(producer: AIOKafkaProducer, request: CrawlReque
         if proxy_url:
             logger.info(f"Routing job {request.job_id} through proxy: {proxy_url.split('@')[-1]}")
 
+        # --- Multi-format content: PDF / DOCX / audio are not HTML ---
+        # Classified once, before the HTML fetch, using the shared allow-list so
+        # the surface worker behaves identically to deep and dark.
+        content_kind = ContentIngestionService.classify_url(request.url)
+        if content_kind is not ContentKind.HTML:
+            await process_non_html_content(
+                producer, request, item_id, content_kind, proxy_url=proxy_url
+            )
+            return
+
         start_time = time.perf_counter()
         await publish_job_stage(
             job_id=request.job_id, url=url, stage="fetching", state="active",
         )
         try:
-            status_code, html, final_url = await fetch_with_agent_rotation(
+            status_code, html, final_url, response_content_type = await fetch_with_agent_rotation(
                 job_id=request.job_id,
                 url=request.url,
                 proxy=proxy_url,
                 timeout=settings.http_timeout_seconds,
                 max_attempts=3,
             )
+
+            # The URL looked like a page but the server disagreed. This is
+            # routine in the wild (arxiv.org/pdf/1706.03762 and friends), and
+            # carrying on would hand the parser decoded PDF bytes labelled
+            # text/html while the raw bucket kept no file at all. Hand the site
+            # to the ingestion path instead, which stores the real bytes and
+            # extracts text from them.
+            actual_kind = ContentIngestionService.kind_from_response(
+                final_url or request.url, response_content_type
+            )
+            # Only the three kinds ingestion can actually convert are re-routed.
+            # ``OTHER`` deliberately stays on the HTML path: an unrecognised
+            # content type is far more often a page behind an odd header than a
+            # document, and failing it outright would be worse than mis-labelling it.
+            if actual_kind in (ContentKind.PDF, ContentKind.DOCX, ContentKind.AUDIO) and status_code < 400:
+                logger.info(
+                    "Re-routing %s to the %s ingestion path (server said %s)",
+                    request.url, actual_kind.value, response_content_type or "nothing",
+                )
+                await process_non_html_content(
+                    producer, request, item_id, actual_kind, proxy_url=proxy_url
+                )
+                return
             await publish_job_stage(
                 job_id=request.job_id, url=url, stage="fetching", state="passed",
                 detail=f"HTTP {status_code}",
@@ -504,6 +546,120 @@ async def _process_request_inner(producer: AIOKafkaProducer, request: CrawlReque
         raise PageProcessingError(
             f"Surface worker crashed while processing {request.url}: {e}"
         ) from e
+
+
+async def process_non_html_content(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    item_id: str,
+    kind: ContentKind,
+    *,
+    proxy_url: str | None = None,
+) -> None:
+    """Handle PDF/DOCX/audio without touching the HTML path.
+
+    PDF/DOCX are fetched and converted by the shared ContentIngestionService;
+    audio is handed off to the transcribe-worker so a slow transcription can
+    never block this worker. Shared by all three crawl workers.
+    """
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="fetching", state="active",
+        detail=f"non_html:{kind.value}",
+    )
+
+    if kind is ContentKind.AUDIO:
+        handed_off = await ContentIngestionService.hand_off_audio(
+            producer,
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            language=request.language,
+            worker_type=WORKER_TYPE,
+            network="surface",
+        )
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            "audio_handoff", "passed" if handed_off else "failed", request.retry_count,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="passed" if handed_off else "failed",
+            detail="audio handed off for transcription",
+        )
+        return
+
+    try:
+        async with httpx.AsyncClient(
+            headers=ContentIngestionService.ingestion_headers(),
+            follow_redirects=True,
+            timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+            proxy=proxy_url,
+        ) as client:
+            ingestion = await ContentIngestionService.fetch_and_extract(client, request.url)
+    except Exception as exc:
+        logger.warning("Non-HTML ingestion failed for %s: %s", request.url, exc)
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            f"ingest_{kind.value}_failed", "failed", request.retry_count,
+            details=str(exc)[:300],
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished", state="failed",
+            detail=f"{kind.value} ingestion failed",
+        )
+        return
+
+    # Archive the ORIGINAL bytes before they go out of scope: this worker only
+    # ever holds the payload in memory, and the parser downstream stores text.
+    # Losing the PDF/DOCX here would mean re-fetching from the origin to ever
+    # reprocess it. Non-fatal — a failed archival copy must not fail the crawl.
+    raw_ref = await RAW_STORE.store(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        payload=ingestion.raw_bytes,
+        content_type=ingestion.content_type,
+    )
+
+    result = CrawlResult(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        language=request.language,
+        html=ingestion.text,
+        status_code=ingestion.status_code,
+        network="surface",
+        depth=request.depth,
+        content_kind=ingestion.kind.value,
+        content_type=ingestion.content_type,
+        raw_object_path=raw_ref.path if raw_ref else None,
+        raw_content_type=raw_ref.content_type if raw_ref else None,
+        raw_size_bytes=raw_ref.size_bytes if raw_ref else None,
+        raw_sha256=raw_ref.sha256 if raw_ref else None,
+    )
+    await producer.send_and_wait(
+        PRODUCE_TOPIC,
+        value=result.model_dump_json().encode("utf-8"),
+        key=request.job_id.encode("utf-8"),
+    )
+    await pg_client.record_crawl_log(
+        request.job_id, item_id, ingestion.final_url, WORKER_TYPE,
+        f"{ingestion.kind.value}_extracted", "completed", request.retry_count,
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="parsing", state="passed",
+        detail=f"{ingestion.kind.value} extracted ({ingestion.payload_size_bytes} bytes)",
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="site_finished", state="passed",
+        detail=f"{ingestion.kind.value} extracted",
+    )
+    logger.info(
+        "Extracted %s for %s (%d chars)",
+        ingestion.kind.value, request.url, len(ingestion.text),
+    )
 
 
 async def process_message_safely(producer: AIOKafkaProducer, message_value: bytes):

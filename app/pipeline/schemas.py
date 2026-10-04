@@ -33,6 +33,45 @@ from app.common.constants.intelligence_categories import DEFAULT_INTELLIGENCE_CA
 # ============================================================================
 
 
+class SearchRequest(BaseModel):
+    """
+    Schema for search.requests Kafka topic.
+
+    Input for the discovery-worker: turns a topic/query into seed URLs by
+    querying the search engines configured for ``network`` (configs/
+    search_engines.json). This is deliberately network-agnostic - surface,
+    deep, and dark all use the exact same message shape; ``network`` only
+    selects which engine list is queried (dark engines go through Tor).
+
+    The OUTPUT is NOT a new message type: the discovery-worker emits ordinary
+    CrawlRequest messages on crawl.requests, so the three crawl workers need
+    zero changes to consume a topic-derived seed instead of a hand-entered URL.
+    """
+
+    job_id: str = Field(..., description="Job identifier, e.g. 'JOB00000001'")
+    query: str = Field(..., description="Topic / search query to discover seed URLs for")
+    network: str = Field(
+        default="surface",
+        description="Which engine list to query: 'surface', 'deep', or 'dark'",
+    )
+    language: str = Field(default="en", description="Language: 'en', 'am', or 'all'")
+    max_results: int = Field(
+        default=10, description="Maximum seed URLs to fan out as CrawlRequests"
+    )
+    engines: list[str] | None = Field(
+        default=None,
+        description="Optional engine-name allowlist; None uses every enabled engine for the network",
+    )
+    max_depth: int = Field(
+        default=5, description="Recursion ceiling applied to the emitted CrawlRequests"
+    )
+    recursive_config: dict = Field(
+        default_factory=lambda: {"enable_extraction": True},
+        description="Recursion rules copied onto every emitted CrawlRequest",
+    )
+    job_params: dict = Field(default_factory=dict, description="Additional per-job worker parameters")
+
+
 class CrawlRequest(BaseModel):
     """
     Schema for crawl.requests Kafka topic
@@ -42,7 +81,7 @@ class CrawlRequest(BaseModel):
 
     job_id: str = Field(..., description="Job identifier, e.g. 'JOB00000001'")
     url: str = Field(..., description="The URL to be crawled")
-    language: str = Field(default="am", description="Language: 'en' or 'am'")
+    language: str = Field(default="en", description="Language: 'en', 'am', or 'all'")
     worker_type: str = Field(
         ..., description="Worker type: 'surface', 'deep', or 'dark' (assigned by rules engine)"
     )
@@ -84,22 +123,87 @@ class CrawlRequest(BaseModel):
     )
 
 
+class AudioTranscriptionRequest(BaseModel):
+    """
+    Schema for audio.requests Kafka topic.
+
+    Published by ANY crawl worker (surface/deep/dark) when it fetches an audio
+    payload. Audio transcription is far heavier than HTML/PDF/DOCX extraction,
+    so it is deliberately NOT done inline: the crawl worker hands the URL off
+    to the transcribe-worker and keeps crawling. The transcribe-worker fetches
+    the audio, transcribes it, and emits a normal CrawlResult on crawl.raw, so
+    everything downstream of the crawl workers is unchanged.
+    """
+
+    job_id: str = Field(..., description="Job identifier, e.g. 'JOB00000001'")
+    item_id: str = Field(..., description="Item id allocated by the crawl worker")
+    url: str = Field(..., description="URL of the audio payload")
+    language: str = Field(default="en", description="Language: 'en', 'am', or 'all'")
+    worker_type: str = Field(..., description="Worker that fetched it: 'surface', 'deep', or 'dark'")
+    network: str = Field(default="surface", description="Network used: surface, deep, dark")
+    content_type: str | None = Field(default=None, description="Reported audio content type")
+    payload_size_bytes: int | None = Field(default=None, description="Size of the audio payload in bytes")
+    raw_object_path: str | None = Field(
+        default=None,
+        description=(
+            "s3:// path of the audio already stored in the raw bucket. The "
+            "transcribe-worker reads from here instead of re-downloading."
+        ),
+    )
+
+
 class CrawlResult(BaseModel):
     """
     Schema for crawl.raw Kafka topic
     Raw output produced by crawl workers
     NOTE: source_type removed; only url + html for downstream parsing
+
+    NOTE on multi-format content:
+    ``html`` remains the single content carrier for backward compatibility.
+    For non-HTML payloads (PDF/DOCX) it holds the text extracted by the shared
+    ContentIngestionService, and ``content_kind`` records what it was. Plain
+    HTML crawls leave both defaults untouched.
     """
 
     job_id: str = Field(..., description="job_id of the originating CrawlRequest")
     item_id: str = Field(..., description="Per-page item identifier, e.g. 'ITEM00000001'")
     url: str
-    html: str  # Raw HTML content
+    html: str  # Raw HTML content, or extracted text for non-HTML (content_kind != 'html')
     status_code: int
     worker: str  # Which worker produced this ('surface', 'deep', 'dark')
     language: str
     network: str = Field(default="surface", description="Network used: surface, deep, dark")
     fetch_duration: float | None = None  # Crawl time in seconds
+
+    # --- Multi-format content (additive; defaults preserve HTML behavior) ---
+    content_kind: str = Field(
+        default="html",
+        description="Content type of `html`: 'html', 'pdf', 'docx', or 'audio'",
+    )
+    content_type: str | None = Field(
+        default=None, description="Reported HTTP content-type, when known"
+    )
+
+    # ------------------------------------------------------------------
+    # Raw retention
+    # ------------------------------------------------------------------
+    # When the producing worker already archived the ORIGINAL payload (a PDF,
+    # a DOCX, an audio file) in the raw bucket, it says so here so the parser
+    # reuses that object instead of overwriting it with the text it derives.
+    # ``html`` still carries the extracted text either way.
+    raw_object_path: str | None = Field(
+        default=None,
+        description="s3:// path of the already-stored original payload, when one exists",
+    )
+    raw_content_type: str | None = Field(
+        default=None, description="Content type of the stored original payload"
+    )
+    raw_size_bytes: int | None = Field(
+        default=None, description="Byte size of the stored original payload"
+    )
+    raw_sha256: str | None = Field(
+        default=None, description="SHA-256 of the stored original payload"
+    )
 
     # ========================================================================
     # RECURSIVE CRAWLING FIELDS
@@ -164,6 +268,30 @@ class ParsedItemData(BaseModel):
         default=None,
         description="Why the content was flagged: 'language_mismatch' or 'unsupported_language'",
     )
+    content_kind: str = Field(
+        default="html",
+        description="Source payload kind the text came from: 'html', 'pdf', 'docx', or 'audio'",
+    )
+    # The parser computes these for every item. They were absent here, and
+    # Pydantic drops undeclared keys on validation, so they were silently
+    # discarded before the parsed object reached MinIO -- which is why the UI's
+    # quality bar rendered "NaN%" and document sections never appeared.
+    sections: list = Field(
+        default_factory=list,
+        description="Headings and their text, used to render a document outline",
+    )
+    content_quality_score: float | None = Field(
+        default=None,
+        description="Heuristic text-quality score between 0 and 1",
+    )
+    structure_valid: bool | None = Field(
+        default=None,
+        description="False when the page had no usable heading structure or leaked a banner",
+    )
+    banner_leakage: bool | None = Field(
+        default=None,
+        description="True when wiki/banner edit markers leaked into the extracted text",
+    )
 
 
 class ParsedItem(BaseModel):
@@ -221,6 +349,18 @@ class IntelligenceAnalytics(BaseModel):
     )
     summary: str = Field(..., description="LLM-generated summary of findings")
     language: str = Field(default="unknown", description="Resolved content language")
+    analysis_source: str = Field(
+        default="llm",
+        description=(
+            "Provenance of this record: 'llm' = a real model produced it; "
+            "'fallback' = the rule-based heuristic did because no model was "
+            "reachable; 'partial' = a model answered but its labels could not be "
+            "parsed; 'unavailable' = nothing could analyze the payload; "
+            "'legacy' = written before this column existed, so provenance is "
+            "unknowable. Human-evaluation accuracy is only meaningful over "
+            "'llm' rows."
+        ),
+    )
     llm_model: str = Field(default="qwen2:8b", description="Which LLM model performed analysis")
     llm_score: float | None = Field(default=None, description="Deprecated: no per-response confidence is inferred")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Analysis timestamp")

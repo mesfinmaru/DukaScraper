@@ -103,6 +103,15 @@ class TestRequiredTables:
         "crawl_log",
         "discovered_external_links",
         "content_fingerprints",
+        # Durable queue for LLM analysis (Batch 3). Listed explicitly: this
+        # guard exists to catch tables that were added by accident, so a table
+        # that is here on purpose has to be declared here on purpose.
+        "llm_analysis_queue",
+        # High-severity alert feed + per-user read markers (Batch 4). Same
+        # reasoning as the queue: a table added on purpose has to be declared
+        # here on purpose or this guard treats it as an accident.
+        "alerts",
+        "alert_reads",
     }
 
     def test_all_required_tables_exist(self):

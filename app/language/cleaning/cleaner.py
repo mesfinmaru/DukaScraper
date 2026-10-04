@@ -9,12 +9,25 @@ from bs4 import BeautifulSoup, FeatureNotFound
 from app.language.normalization.normalize import normalize_text
 
 
-def clean_and_extract_text(raw_html_or_text: str, language: str, *, preserve_amharic: bool = True) -> str:
+def clean_and_extract_text(
+    raw_html_or_text: str,
+    language: str,
+    *,
+    preserve_amharic: bool = True,
+    plain_text: bool = False,
+) -> str:
     """Strip boilerplate and extract readable text, with language-specific filtering.
 
     Supports Amharic and English extraction targets. When language is `am` or
     `en`, it filters paragraphs by script ratio. When `other` is requested, it
     returns normalized extracted text unless Amharic preservation is enabled.
+
+    Set `plain_text=True` when the input is already extracted prose rather than
+    markup — a PDF/DOCX text dump or an audio transcript. There is no boilerplate
+    to strip and no script-ratio noise to filter in that case, so the
+    minimum-paragraph-length and language-ratio passes below are skipped; they
+    exist to sift HTML noise and would otherwise silently discard short but
+    perfectly valid speech ("Yes.", "Okay.", a one-word PDF).
     """
     if not raw_html_or_text:
         return ""
@@ -58,6 +71,9 @@ def clean_and_extract_text(raw_html_or_text: str, language: str, *, preserve_amh
     clean_text = "\n".join(filtered_lines)
     if not clean_text.strip():
         return ""
+
+    if plain_text:
+        return normalize_text(clean_text)
 
     paragraphs = [p.strip() for p in clean_text.split("\n") if len(p.strip()) >= 8]
     if not paragraphs:

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 # Import API routes and settings
 from app.api.middleware.request_id import RequestIDMiddleware, register_error_handlers
+from app.api.routes import monitoring_proxy
 from app.api.routes.api import api_router
 from app.api.websocket.job_status import (
     start_job_updates_listener,
@@ -23,6 +25,30 @@ from app.storage.minio.client import minio_client
 from app.storage.postgres.client import pg_client
 
 
+async def _keep_kafka_connected(app: FastAPI) -> None:
+    """Retry the Kafka connection until it succeeds, then watch it stay up.
+
+    Job submission depends on the producer, but the API routinely starts
+    before Kafka is accepting connections. Without this loop a single failed
+    startup attempt left ``/health`` reporting ``kafka: false`` and every
+    crawl/retry returning 503 for the lifetime of the container.
+    """
+    while True:
+        try:
+            if not kafka_producer.ready:
+                await kafka_producer.ensure_started()
+                logger.info("Kafka producer reconnected; dependency is healthy again")
+            app.state.dependencies["kafka"] = kafka_producer.ready
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app.state.dependencies["kafka"] = False
+            logger.warning("Kafka reconnect attempt failed: %s", exc)
+        # Poll quickly while broken so a submission right after the broker
+        # comes up succeeds on the next attempt, and calmly once healthy.
+        await asyncio.sleep(2 if not kafka_producer.ready else 30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -30,6 +56,7 @@ async def lifespan(app: FastAPI):
     """
     logger.info("API starting up...")
     app.state.dependencies = {}
+    kafka_reconnector: asyncio.Task | None = None
 
     async def start_dependency(name: str, starter) -> None:
         try:
@@ -61,6 +88,10 @@ async def lifespan(app: FastAPI):
             logger.warning("Initial administrator bootstrap skipped: admin credentials are not configured")
     if kafka_producer:
         await start_dependency("kafka", kafka_producer.start)
+        # The API often boots before the broker: keep retrying in the
+        # background so job submission heals on its own instead of returning
+        # 503 until the container is restarted.
+        kafka_reconnector = asyncio.create_task(_keep_kafka_connected(app))
     else:
         app.state.dependencies["kafka"] = False
 
@@ -98,6 +129,12 @@ async def lifespan(app: FastAPI):
     logger.info("API shutting down...")
     stop_job_watchdog()
     stop_job_updates_listener()
+    if kafka_reconnector is not None:
+        kafka_reconnector.cancel()
+        try:
+            await kafka_reconnector
+        except asyncio.CancelledError:
+            pass
     await pg_client.close()
     if kafka_producer:
         await kafka_producer.stop()
@@ -128,6 +165,14 @@ register_error_handlers(app)
 
 # Include the main API router
 app.include_router(api_router, prefix=settings.API_V1_STR)
+
+# Grafana and Prometheus are mounted at the app root (/grafana, /prometheus)
+# rather than under /api/v1/monitoring: Grafana generates every asset, API and
+# websocket URL from its own root_url, so with GF_SERVER_SERVE_FROM_SUB_PATH it
+# needs the mount point to be a real sub-path. Under a deeper prefix its router
+# 404s on its own asset URLs and the frame renders "Page not found".
+for _tool in monitoring_proxy.TOOLS:
+    app.include_router(monitoring_proxy.build_proxy_router(_tool), prefix=f"/{_tool}")
 
 
 @app.get("/", tags=["Health"])
@@ -182,7 +227,7 @@ def _dependency_status() -> dict[str, bool]:
     checks = getattr(app.state, "dependencies", {})
     return {
         "postgres": checks.get("postgres", pg_client.system_pool is not None),
-        "kafka": checks.get("kafka", False),
+        "kafka": checks.get("kafka", False) or kafka_producer.ready,
         "minio": checks.get("minio", False),
         "clickhouse": checks.get("clickhouse", ch_client.client is not None),
         "elasticsearch": checks.get("elasticsearch", es_client.client is not None),

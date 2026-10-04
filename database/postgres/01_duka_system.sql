@@ -325,6 +325,18 @@ CREATE INDEX IF NOT EXISTS idx_parsed_items_intelligence_processed ON parsed_ite
 CREATE UNIQUE INDEX IF NOT EXISTS uq_parsed_items_job_source_url
     ON parsed_items(job_id, source_url);
 
+-- Raw-binary retention. ``raw_html_path`` records WHERE the original payload
+-- lives in the raw bucket; these four record WHAT it is. Without them the only
+-- way to learn that an item was a 3 MB FLAC rather than an HTML page is to
+-- download the object and look, and a re-uploaded file is undetectable.
+-- Added after the fact, so they must stay nullable for existing rows.
+ALTER TABLE parsed_items ADD COLUMN IF NOT EXISTS raw_object_name  TEXT;
+ALTER TABLE parsed_items ADD COLUMN IF NOT EXISTS raw_content_type VARCHAR(120);
+ALTER TABLE parsed_items ADD COLUMN IF NOT EXISTS raw_size_bytes   BIGINT;
+ALTER TABLE parsed_items ADD COLUMN IF NOT EXISTS raw_sha256       VARCHAR(64);
+
+CREATE INDEX IF NOT EXISTS idx_parsed_items_raw_sha256 ON parsed_items(raw_sha256);
+
 -- ============================================================
 -- EXPORTS TABLE
 -- ============================================================
@@ -455,3 +467,105 @@ CREATE INDEX IF NOT EXISTS idx_fp_content ON content_fingerprints(content_finger
 CREATE INDEX IF NOT EXISTS idx_fp_simhash ON content_fingerprints(simhash);
 CREATE INDEX IF NOT EXISTS idx_fp_item    ON content_fingerprints(item_id);
 CREATE INDEX IF NOT EXISTS idx_fp_job     ON content_fingerprints(job_id);
+
+-- ============================================================
+-- LLM ANALYSIS QUEUE (durable)
+-- ============================================================
+-- The llm-worker used to run its analysis inline inside the Kafka consume loop,
+-- which meant a crash lost every in-flight item and the backlog was invisible.
+-- Consumption now only enqueues here, and a batch loop claims rows with FOR
+-- UPDATE SKIP LOCKED. Completed rows are deleted, so this table tracks the
+-- backlog rather than all history; 'failed' rows are kept on purpose so a
+-- permanently-unanalysable item stays visible instead of disappearing.
+CREATE TABLE IF NOT EXISTS llm_analysis_queue (
+
+    item_id         VARCHAR(20) PRIMARY KEY,
+
+    job_id          VARCHAR(20) NOT NULL,
+
+    payload         JSONB NOT NULL,
+
+    status          VARCHAR(16) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','processing','done','failed')),
+
+    attempts        INT NOT NULL DEFAULT 0,
+
+    last_error      TEXT,
+
+    next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    claimed_at      TIMESTAMP,
+
+    worker_id       VARCHAR(64),
+
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_queue_claim ON llm_analysis_queue (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_llm_queue_job   ON llm_analysis_queue (job_id);
+
+-- ============================================================
+-- HIGH-SEVERITY ALERTS
+-- ============================================================
+-- A mirror of every intelligence row whose threat_severity is 4 or 5. ClickHouse
+-- has no concept of "this operator has read this", so the alert feed and its
+-- unread badge cannot live there. UNIQUE (item_id) makes the raise idempotent:
+-- Kafka redelivery and queue retries re-analyse items, and a plain INSERT
+-- would either error or raise a duplicate notification.
+CREATE SEQUENCE IF NOT EXISTS alert_seq START 1 INCREMENT 1;
+
+CREATE TABLE IF NOT EXISTS alerts (
+
+    alert_id        VARCHAR(24) PRIMARY KEY
+        DEFAULT ('ALR' || LPAD(nextval('alert_seq')::TEXT, 14, '0')),
+
+    job_id          VARCHAR(20) NOT NULL,
+
+    item_id         VARCHAR(20) NOT NULL,
+
+    url             TEXT NOT NULL,
+
+    title           TEXT DEFAULT '',
+
+    category        VARCHAR(64) DEFAULT '',
+
+    severity        SMALLINT NOT NULL DEFAULT 4 CHECK (severity BETWEEN 1 AND 5),
+
+    language        VARCHAR(8) DEFAULT '',
+
+    summary         TEXT DEFAULT '',
+
+    entities        JSONB DEFAULT '[]'::jsonb,
+
+    -- Provenance, exactly as in intelligence_analytics: a heuristic label is
+    -- never presented to an operator as a model verdict.
+    analysis_source VARCHAR(16) DEFAULT 'llm',
+
+    llm_model       VARCHAR(128) DEFAULT '',
+
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_created  ON alerts (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts (severity DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_job      ON alerts (job_id);
+
+-- Per-user read markers. Keyed on (alert_id, user_id) so two operators of the
+-- same job each clear their own badge; CASCADE keeps rows from outliving their
+-- alert.
+CREATE TABLE IF NOT EXISTS alert_reads (
+
+    alert_id        VARCHAR(24) NOT NULL REFERENCES alerts(alert_id) ON DELETE CASCADE,
+
+    user_id         VARCHAR(8) NOT NULL,
+
+    read_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (alert_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_reads_user ON alert_reads (user_id);

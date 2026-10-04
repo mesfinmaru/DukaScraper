@@ -1,26 +1,39 @@
 import { useEffect, useState } from "react"
 import { cn } from "../utils"
-import { api } from "../api"
+import { api, subscribeApiFailures, type ApiFailure } from "../api"
 
 type HealthState = "loading" | "ready" | "degraded" | "down"
 
 /**
- * Colored readiness dot for the whole platform.
+ * The dot's colour, blink period and ring cadence are all driven by
+ * [data-state] in index.css. This component only decides *which* state the
+ * platform is in, so the animation can be retuned — or switched off entirely
+ * for prefers-reduced-motion — without touching React.
+ */
+
+/**
+ * Readiness dot for the whole platform — dot only, no surrounding pill, but it
+ * blinks and pulses so a change in state is noticeable without watching the
+ * header. See `.health-dot` in index.css for the severity-driven animation.
  *
- * Uses `/ready` (readiness) rather than `/health` (liveness): the API can be
- * alive while Kafka/Postgres/ClickHouse are down, and a liveness-based pill
- * showed green in exactly the states users need to know about.
+ * Green ONLY when nothing is broken anywhere. Two sources of truth:
+ *  - /ready poll  → infrastructure dependencies (postgres/kafka/minio/…).
+ *  - request feed → every failed API call (5xx / network error) recorded by
+ *    api.ts. Page-level breakage (dev-proxy 502, backend 500) never showed up
+ *    in /ready, which is how the dot stayed green over a page full of errors.
  *
- * green = all dependencies ready, amber = degraded / starting,
- * red = API unreachable or not ready, pulsing amber = still checking.
- *
- * Colors are hardcoded (not theme tokens) so the state is readable in BOTH
- * themes — green/amber/red mean the same thing everywhere; only the pill's
- * surface adapts via the `light:` overrides in index.css.
+ * Amber = partially broken (a dependency or some API calls failing),
+ * red = the API itself is unreachable, pulsing amber = still checking.
+ * A short message (e.g. "analytics 502 · 2 deps down") sits beside the dot;
+ * hover for the same summary as a tooltip.
  */
 export function HealthPill({ online }: { online: boolean | null }) {
   const [state, setState] = useState<HealthState>(online === null ? "loading" : online ? "ready" : "down")
   const [failed, setFailed] = useState<string[]>([])
+  const [reqFailures, setReqFailures] = useState<ApiFailure[]>([])
+
+  // Latest failure per API service, updated live by api.ts.
+  useEffect(() => subscribeApiFailures(setReqFailures), [])
 
   useEffect(() => {
     let cancelled = false
@@ -28,7 +41,6 @@ export function HealthPill({ online }: { online: boolean | null }) {
       try {
         const res = await api.ready()
         if (cancelled) return
-        // network error inside api.ready() -> throw
         setFailed(res.failed ?? [])
         setState(res.ready ? "ready" : "degraded")
       } catch {
@@ -47,7 +59,7 @@ export function HealthPill({ online }: { online: boolean | null }) {
   }, [])
 
   // API liveness (from Layout's /health poll) is the floor: if the API is
-  // unreachable, the pill must be RED even if a cached /ready said otherwise.
+  // unreachable, the dot must be RED even if a cached /ready said otherwise.
   useEffect(() => {
     if (online === false) {
       setState("down")
@@ -55,46 +67,36 @@ export function HealthPill({ online }: { online: boolean | null }) {
     }
   }, [online])
 
-  const dotClass: Record<HealthState, string> = {
-    loading: "bg-amber-500 animate-pulse",
-    ready: "bg-emerald-600",
-    degraded: "bg-amber-500",
-    down: "bg-rose-600",
+  const down = state === "down"
+  const loading = state === "loading"
+
+  // Short messages, most severe first. When the API is fully down, the
+  // per-service "unreachable" entries are redundant noise — one line says it.
+  const messages: string[] = []
+  if (down) messages.push("API down")
+  if (failed.length) messages.push(`${failed.length} dep${failed.length > 1 ? "s" : ""} down`)
+  if (!down) {
+    for (const f of reqFailures) {
+      messages.push(f.status === 0 ? `${f.service} unreachable` : `${f.service} ${f.status}`)
+    }
   }
 
-  const tooltip =
-    state === "ready"
-      ? "All platform dependencies are ready"
-      : state === "loading"
-        ? "Checking platform readiness…"
-        : state === "down"
-          ? "API is offline or unreachable"
-          : `Degraded — failing: ${failed.length ? failed.join(", ") : "some dependencies"}. See Monitoring.`
-
-  const degraded =
-    state === "degraded" || state === "down"
+  const dotState: HealthState = down ? "down" : loading ? "loading" : messages.length ? "degraded" : "ready"
+  const tooltip = messages.length
+    ? `${messages.join(" · ")} — see Monitoring for details`
+    : "All platform dependencies are ready"
 
   return (
-    <span
-      title={tooltip}
-      className={cn(
-        "inline-flex items-center gap-2 rounded-full border px-2.5 py-1 shadow-sm transition-colors",
-        state === "down"
-          ? "border-rose-500/60 bg-rose-500/10"
-          : state === "degraded"
-            ? "border-amber-500/60 bg-amber-500/10"
-            : "health-pill-neutral",
-      )}
-    >
-      <span className={cn("h-2 w-2 shrink-0 rounded-full", dotClass[state])} />
-      {degraded && (
+    <span title={tooltip} aria-live="polite" className="inline-flex items-center gap-1.5">
+      <span className="health-dot shrink-0" data-state={dotState} />
+      {messages.length > 0 && (
         <span
           className={cn(
-            "max-w-[220px] truncate text-[10px] font-semibold tracking-wide",
-            state === "down" ? "text-rose-600 health-label-down" : "text-amber-700 health-label-degraded",
+            "max-w-[260px] truncate text-[10px] font-semibold tracking-wide",
+            down ? "text-rose-600 health-label-down" : "text-amber-700 health-label-degraded",
           )}
         >
-          {state === "down" ? "API DOWN" : failed.length ? `${failed.length} DOWN` : "DEGRADED"}
+          {messages.join(" · ")}
         </span>
       )}
     </span>

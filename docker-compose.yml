@@ -108,6 +108,12 @@ services:
       --topic crawl.parsed --partitions 10 --replication-factor 1
 
       /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic search.requests --partitions 5 --replication-factor 1
+
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
+      --topic audio.requests --partitions 3 --replication-factor 1
+
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092
       --topic crawl.requests.dlq --partitions 5 --replication-factor 1
 
       echo "Kafka topics initialized successfully."
@@ -145,7 +151,10 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - curl -s http://localhost:9200/ >/dev/null || exit 1
+      # Numeric loopback: name resolution ('localhost') intermittently hangs in
+      # this environment (glibc getaddrinfo -> rtnl_dumpit), taking the healthcheck
+      # down with it. The IP literal skips the resolver entirely.
+      - curl -s -m 5 http://127.0.0.1:9200/ >/dev/null || exit 1
       interval: 30s
       timeout: 10s
       retries: 5
@@ -182,7 +191,7 @@ services:
       - wget
       - --spider
       - -q
-      - http://localhost:8123/ping
+      - http://127.0.0.1:8123/ping
       interval: 10s
       timeout: 5s
       retries: 5
@@ -223,7 +232,7 @@ services:
       - CMD
       - curl
       - -f
-      - http://localhost:9000/minio/health/live
+      - http://127.0.0.1:9000/minio/health/live
       interval: 10s
       timeout: 5s
       retries: 5
@@ -295,7 +304,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - curl -sf http://localhost:8000/health || exit 1
+      - curl -sf -m 5 http://127.0.0.1:8000/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 5
@@ -318,7 +327,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -350,7 +359,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -373,6 +382,11 @@ services:
     - RESIDENTIAL_PROXY=${RESIDENTIAL_PROXY:-}
     - DISPLAY=:99
     - HEALTH_PORT=8080
+    # Camoufox runs headful over the Xvfb framebuffer, i.e. a full Firefox
+    # process rather than a headless shell. Firefox uses /dev/shm for its IPC
+    # and Docker's 64 MB default makes its tabs crash unpredictably; give it
+    # headroom so a challenge fallback is not lost to a shared-memory SIGBUS.
+    shm_size: "2gb"
     volumes:
     - .:/app
     extra_hosts:
@@ -380,7 +394,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -425,7 +439,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -437,6 +451,61 @@ services:
         condition: service_healthy
       tor:
         condition: service_started
+  discovery-worker:
+    build:
+      context: .
+      dockerfile: workers/discovery-worker/Dockerfile
+    container_name: discovery-worker
+    restart: unless-stopped
+    environment:
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - TOR_SOCKS5_PROXY=socks5h://tor:9050
+    - HEALTH_PORT=8080
+    volumes:
+    - .:/app
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      kafka:
+        condition: service_healthy
+      tor:
+        condition: service_started
+  transcribe-worker:
+    build:
+      context: .
+      dockerfile: workers/transcribe-worker/Dockerfile
+    container_name: transcribe-worker
+    restart: unless-stopped
+    environment:
+    - APP_ENV=docker
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - TRANSCRIBE_ENABLED=${TRANSCRIBE_ENABLED:-true}
+    - TRANSCRIBE_MODEL=${TRANSCRIBE_MODEL:-base}
+    - HEALTH_PORT=8080
+    volumes:
+    - .:/app
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - duka-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      kafka:
+        condition: service_healthy
   llm-worker:
     build:
       context: .
@@ -471,7 +540,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -498,7 +567,7 @@ services:
     networks:
     - duka-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -m 4 http://127.0.0.1:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -513,8 +582,19 @@ services:
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
+    # Loopback-only, for the same reason as Grafana above.
     ports:
-    - 9090:9090
+    - "127.0.0.1:9090:9090"
+    command:
+    # Overriding command replaces the image's own args, so --config.file has to
+    # be repeated or Prometheus starts with no config and crash-loops.
+    - --config.file=/etc/prometheus/prometheus.yml
+    # The API proxies Prometheus at /prometheus. Without a route prefix every
+    # link Prometheus renders is root-relative (/graph redirects to /query, which
+    # lands outside the mount), so in-frame navigation walks straight out of the
+    # embed. Kept as a bare path so the embed works on whatever origin serves the
+    # UI - the Vite dev server in development, the API in production.
+    - --web.external-url=/prometheus
     volumes:
     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     - ./monitoring/alerts:/etc/prometheus/rules
@@ -539,8 +619,11 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
+    # Loopback-only. The UI embeds Grafana through the API's /grafana proxy
+    # mount, which strips the X-Frame-Options header that blocks framing in
+    # Grafana >= 13.
     ports:
-    - 3000:3000
+    - "127.0.0.1:3000:3000"
     volumes:
     - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
     - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
@@ -549,6 +632,11 @@ services:
     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
     # Allow the dashboard to be embedded in the UI's Monitoring page iframe.
     - GF_ALLOW_EMBEDDING=true
+    # The API proxies Grafana at /grafana. Telling Grafana its own sub-path makes
+    # it generate /grafana-prefixed asset, API and websocket URLs instead of
+    # root-relative ones - without this its router 404s inside the iframe.
+    - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    - GF_SERVER_ROOT_URL=/grafana
     - GF_AUTH_ANONYMOUS_ENABLED=true
     - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
     - GF_AUTH_BASIC_ENABLED=false

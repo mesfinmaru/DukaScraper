@@ -38,8 +38,12 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     PASSWORD_RESET_EXPIRE_MINUTES: int = 30
-    PASSWORD_RESET_URL: str = "http://localhost:5173/reset-password"
-    EMAIL_VERIFICATION_URL: str = "http://localhost:5173/verify-email"
+    # The SPA uses a HashRouter, so a deep link MUST carry the hash route or the
+    # token lands on the app root and is silently dropped. The token is appended
+    # as a query param (`_token_link`), e.g.
+    #   http://localhost:5173/#/verify-email?token=...
+    PASSWORD_RESET_URL: str = "http://localhost:5173/#/forgot-password"  # base URL for password-reset link (token appended as query param)
+    EMAIL_VERIFICATION_URL: str = "http://localhost:5173/#/verify-email"  # base URL for the verification button link (token appended as query param)
     LOGIN_RATE_LIMIT_PER_MINUTE: int = 10
     RESET_RATE_LIMIT_PER_HOUR: int = 5
 
@@ -56,6 +60,15 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM_EMAIL: str = ""
     SMTP_USE_TLS: bool = True
+
+    # High-severity alerting (severity 4/5). Off by default: the SMTP settings
+    # above are frequently filled in for password resets in an environment that
+    # must not also emit unsolicited intelligence mail. Alerts are always
+    # recorded in the feed and the badge regardless - this switch only controls
+    # whether the owner is emailed.
+    ALERT_EMAILS_ENABLED: bool = False
+    #: Browser-facing base URL used to deep-link the alert from the email body.
+    UI_BASE_URL: str = "http://localhost:5173"
 
     # ==================================================================
     # CORS
@@ -103,7 +116,7 @@ class Settings(BaseSettings):
     # dead browser sockets, endless Cloudflare retries) must not stall the
     # whole job — the message task is cancelled at this deadline and the site
     # is closed out as failed.
-    DEEP_MESSAGE_BUDGET_SECONDS: float = 150.0
+    DEEP_MESSAGE_BUDGET_SECONDS: float = 240.0
 
     # ==================================================================
     # Job watchdog — fails jobs stuck in running/pending forever
@@ -126,6 +139,38 @@ class Settings(BaseSettings):
     DARK_READ_TIMEOUT: float = 60.0
     DARK_WRITE_TIMEOUT: float = 60.0
     DARK_POOL_TIMEOUT: float = 60.0
+
+    # ==================================================================
+    # Topic-based Discovery (discovery-worker, shared by all three networks)
+    # ==================================================================
+    # Engine list is config-driven so surface/deep/dark discovery all read the
+    # same file and differ only by which network block is selected.
+    SEARCH_ENGINES_CONFIG_PATH: str = "configs/search_engines.json"
+    SEARCH_DEFAULT_MAX_RESULTS: int = 10
+    SEARCH_ENGINE_TIMEOUT_SECONDS: float = 20.0
+    SEARCH_MAX_CONCURRENT_ENGINES: int = 4
+    # Optional override for a self-hosted SearXNG instance; when set it wins
+    # over the base_url in configs/search_engines.json.
+    SEARXNG_BASE_URL: str = ""
+
+    # ==================================================================
+    # Multi-format ingestion (shared by all three crawl workers)
+    # ==================================================================
+    # Hard cap on a single non-HTML payload before extraction is refused, so a
+    # mislabeled multi-GB download cannot OOM a worker.
+    INGESTION_MAX_PAYLOAD_BYTES: int = 25 * 1024 * 1024  # 25 MB
+    # Timeout for the dedicated binary fetch (separate from the HTML fetch).
+    INGESTION_FETCH_TIMEOUT_SECONDS: float = 60.0
+
+    # ==================================================================
+    # Transcription worker (audio, off the fast path)
+    # ==================================================================
+    TRANSCRIBE_ENABLED: bool = True
+    TRANSCRIBE_FETCH_TIMEOUT_SECONDS: float = 120.0
+    TRANSCRIBE_MAX_PAYLOAD_BYTES: int = 100 * 1024 * 1024  # 100 MB
+    # faster-whisper model id; the worker lazy-imports the backend, so a missing
+    # install degrades to a clear per-item failure instead of crashing startup.
+    TRANSCRIBE_MODEL: str = "base"
 
     # ==================================================================
     # LLM Worker
@@ -164,6 +209,10 @@ class Settings(BaseSettings):
     crawl_request_topic: str = "crawl.requests"
     crawl_raw_topic: str = "crawl.raw"
     crawl_parsed_topic: str = "crawl.parsed"
+    # API -> discovery-worker: topic/query in, seed CrawlRequests out.
+    search_request_topic: str = "search.requests"
+    # Crawl worker -> transcribe-worker: audio handed off off the fast path.
+    audio_request_topic: str = "audio.requests"
 
     # ==================================================================
     # Elasticsearch

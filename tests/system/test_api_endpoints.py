@@ -4,7 +4,9 @@ Verifies that all API routes, middleware, and schemas are correctly
 configured without requiring a running server.
 """
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 
 class TestAPIAppConfiguration:
@@ -21,12 +23,18 @@ class TestAPIAppConfiguration:
 
     def test_app_has_health_endpoint(self):
         app = self._get_app()
-        routes = [r.path for r in app.routes]
+        # Newer Starlette wraps included routers (no .path on the wrapper), so
+        # fall back to the OpenAPI schema for a version-independent route check.
+        routes = {getattr(r, "path", None) for r in app.routes}
+        if "/health" not in routes:
+            routes = set(app.openapi().get("paths", {}).keys())
         assert "/health" in routes
 
     def test_app_has_metrics_endpoint(self):
         app = self._get_app()
-        routes = [r.path for r in app.routes]
+        routes = {getattr(r, "path", None) for r in app.routes}
+        if "/metrics" not in routes:
+            routes = set(app.openapi().get("paths", {}).keys())
         assert "/metrics" in routes
 
     def test_app_has_docs_endpoint(self):
@@ -53,6 +61,39 @@ class TestAPIAppConfiguration:
         app = self._get_app()
         has_rid = any("RequestID" in str(m) for m in app.user_middleware)
         assert has_rid, "RequestID middleware not found."
+
+
+class TestDiscoveryEndpoint:
+    """Validate the topic-discovery API contract (query in, seeds out)."""
+
+    def test_discover_route_registered(self):
+        from app.main import app
+
+        paths = set(app.openapi().get("paths", {}).keys())
+        assert "/api/v1/jobs/discover" in paths
+
+    def test_discover_request_defaults(self):
+        from app.api.routes.jobs import DiscoverRequest
+
+        req = DiscoverRequest(query="ethiopian telecom")
+        assert req.network == "surface"
+        assert req.language == "en"
+        assert req.max_results == 10
+        assert req.max_depth == 5
+
+    def test_discover_network_is_constrained(self):
+        from app.api.routes.jobs import DiscoverRequest
+
+        for network in ("surface", "deep", "dark"):
+            assert DiscoverRequest(query="q", network=network).network == network
+        with pytest.raises(ValidationError):
+            DiscoverRequest(query="q", network="clearnet")
+
+    def test_discover_requires_non_empty_query(self):
+        from app.api.routes.jobs import DiscoverRequest
+
+        with pytest.raises(ValidationError):
+            DiscoverRequest(query="", network="surface")
 
 
 class TestAPIRouterRegistration:

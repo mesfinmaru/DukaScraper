@@ -21,7 +21,8 @@ duka_system.credential_usage:
 duka_system.parsed_items:
     item_id (VARCHAR12 PK, auto), job_id, source_url, language,
     worker_type, title, publish_date, character_count, word_count,
-    raw_html_path, parsed_json_path, parsed_at, is_exported
+    raw_html_path, parsed_json_path, parsed_at, is_exported,
+    raw_object_name, raw_content_type, raw_size_bytes, raw_sha256
 
 duka_system.exports:
     export_id (VARCHAR11 PK, auto), job_id, export_type, file_path,
@@ -52,6 +53,11 @@ import asyncpg
 from app.common.config.settings import settings
 
 logger = logging.getLogger("dukascraper")
+
+#: Advisory-lock key held while a container migrates the duka_system schema.
+#: Arbitrary but stable; must be identical in every container so they serialise
+#: against each other rather than each taking a different lock.
+_SCHEMA_MIGRATION_LOCK_KEY = 0x64756B61  # "duka"
 
 
 # Note: previous code normalized incoming user IDs to match an 8-char
@@ -353,6 +359,20 @@ class PostgreSQLClient:
                 user_id, token_type, token_hash,
             ))
 
+    async def consume_verification_code(self, user_id: str, token_type: str, token_hash: str) -> bool:
+        """Atomically mark an unused, unexpired code as used; False if it cannot."""
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE verification_tokens SET used_at = NOW() "
+                "WHERE user_id = $1 AND token_type = $2 AND token_hash = $3 "
+                "AND used_at IS NULL AND expires_at > NOW() "
+                "RETURNING token_id",
+                user_id, token_type, token_hash,
+            )
+            return row is not None
+
     async def update_user_credentials(
         self, user_id: str, *, password_hash: str | None, must_change_password: bool | None
     ):
@@ -638,6 +658,19 @@ class PostgreSQLClient:
         async with self.system_pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC", user_id)
 
+    async def get_job_ids_for_user(self, user_id: str):
+        """Just the job_id values owned by a user.
+
+        Used to scope reads of pipeline output that hangs off ``job_id`` but
+        lives outside this database (ClickHouse, Elasticsearch, Qdrant).
+        Deliberately selects one column rather than reusing get_jobs_by_user,
+        which pulls every column for rows that are only used as an id filter.
+        """
+        if not self.system_pool:
+            raise RuntimeError("Database not connected")
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetch("SELECT job_id FROM jobs WHERE user_id = $1", user_id)
+
     async def get_active_job_for_url(self, user_id: str, url: str):
         """Return an existing non-terminal job for the same user + URL, if any.
 
@@ -710,6 +743,75 @@ class PostgreSQLClient:
                 )
         await self._publish_job_event(event="job_status", job_id=job_id, status=status)
 
+    async def pause_job(self, job_id: str) -> str:
+        """Pause a running/queued job, remembering the status to resume into.
+
+        Returns the resulting status. Idempotent: pausing an already-paused job
+        succeeds and keeps the original ``resume_status``, so a double-click
+        cannot erase where the job was going to return to.
+        """
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE jobs
+                      SET resume_status = status,
+                          status = 'paused'
+                    WHERE job_id = $1
+                      AND status IN ('pending', 'running', 'needs_review')
+                RETURNING status, resume_status""",
+                job_id,
+            )
+            if row:
+                return "paused"
+            current = await conn.fetchval(
+                "SELECT status FROM jobs WHERE job_id = $1", job_id
+            )
+            return current or ""
+
+    async def resume_job(self, job_id: str) -> str:
+        """Resume a paused job into the status it was paused from.
+
+        Falls back to ``running`` when the remembered status is missing or is
+        itself a terminal state, so a job can never resume into a state it has
+        already left.
+        """
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE jobs
+                      SET status = CASE
+                              WHEN resume_status IN ('pending', 'running', 'needs_review')
+                              THEN resume_status
+                              ELSE 'running'
+                          END,
+                          resume_status = NULL
+                    WHERE job_id = $1 AND status = 'paused'
+                RETURNING status""",
+                job_id,
+            )
+            if row:
+                return row["status"]
+            current = await conn.fetchval(
+                "SELECT status FROM jobs WHERE job_id = $1", job_id
+            )
+            return current or ""
+
+    async def is_job_paused(self, job_id: str) -> bool:
+        """True when the job is paused.
+
+        Workers call this between units of work so a pause takes effect at the
+        next checkpoint instead of after the whole crawl.
+        """
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM jobs WHERE job_id = $1", job_id
+            )
+        return status == "paused"
+
     async def register_job_tasks(self, job_id: str, task_count: int) -> None:
         """Add child crawl tasks before they are published to Kafka."""
         if task_count <= 0:
@@ -755,7 +857,8 @@ class PostgreSQLClient:
                            SET status = 'failed',
                                completed_at = COALESCE(completed_at, NOW()),
                                active_tasks = GREATEST(active_tasks - 1, 0)
-                         WHERE job_id = $1 AND status <> 'completed'
+                         WHERE job_id = $1
+                           AND status NOT IN ('completed', 'paused')
                          RETURNING status""",
                         job_id,
                     )
@@ -767,7 +870,15 @@ class PostgreSQLClient:
                                status = CASE
                                    WHEN active_tasks <= 1
                                         AND status IN ('pending', 'running', 'needs_review')
-                                   THEN 'completed' ELSE status END,
+                                   THEN CASE
+                                       WHEN EXISTS (
+                                           SELECT 1 FROM crawl_log
+                                           WHERE crawl_log.job_id = jobs.job_id
+                                             AND crawl_log.status = 'completed'
+                                       ) THEN 'completed'
+                                       ELSE 'failed'
+                                   END
+                                   ELSE status END,
                                completed_at = CASE
                                    WHEN active_tasks <= 1
                                         AND status IN ('pending', 'running', 'needs_review')
@@ -777,6 +888,22 @@ class PostgreSQLClient:
                         job_id,
                     )
                     final_status = row["status"] if row else ""
+                    # Every site failed but the counter ran out — the job must
+                    # not turn green. Write a reason so the UI explains the
+                    # red status instead of showing a bare "failed".
+                    if final_status == "failed":
+                        try:
+                            await conn.execute(
+                                """INSERT INTO crawl_log
+                                   (job_id, item_id, url, worker_type, event_type, status, retry_count, details)
+                                   VALUES ($1, NULL, '', 'worker', 'all_sites_failed', 'failed', 0, $2)""",
+                                job_id,
+                                await self._describe_empty_result(conn, job_id),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Could not record all-sites-failed for %s: %s", job_id, exc
+                            )
                 if failed and fail_reason:
                     try:
                         await conn.execute(
@@ -790,6 +917,71 @@ class PostgreSQLClient:
         if final_status in ("completed", "failed"):
             await self._publish_job_event(event="job_status", job_id=job_id, status=final_status)
         return final_status
+
+    async def _describe_empty_result(self, conn, job_id: str) -> str:
+        """Explain an empty result in terms of what the job was actually doing.
+
+        "No pages were stored" is wrong and confusing for most non-HTML jobs:
+        an audio crawl produces a transcript rather than pages, a PDF produces
+        one extracted document, and a job stopped by Cloudflare or a login wall
+        never gets that far. Read what the crawl actually attempted and name it.
+        """
+        try:
+            rows = await conn.fetch(
+                """SELECT event_type, status, COUNT(*) AS n
+                     FROM crawl_log
+                    WHERE job_id = $1 AND event_type <> 'all_sites_failed'
+                    GROUP BY event_type, status
+                    ORDER BY n DESC
+                    LIMIT 12""",
+                job_id,
+            )
+        except Exception as exc:
+            logger.debug("Could not inspect crawl_log for %s: %s", job_id, exc)
+            return "No pages were stored — every crawled site failed or was skipped"
+
+        if not rows:
+            return "No content was produced — the crawl produced no results"
+
+        kinds = {r["event_type"] for r in rows}
+        statuses = {r["status"] for r in rows}
+
+        if "audio_transcribed" in kinds or "audio_handoff" in kinds:
+            if "audio_handoff" in kinds and "audio_transcribed" not in kinds:
+                return (
+                    "Audio was queued for transcription but never produced a "
+                    "transcript — the transcribe worker did not finish"
+                )
+            return (
+                "Audio was transcribed but no text could be stored — the "
+                "transcript was empty or was a duplicate of an existing item"
+            )
+        if kinds & {"pdf_extracted", "docx_extracted", "text_extracted"}:
+            got = sorted(kinds & {"pdf_extracted", "docx_extracted", "text_extracted"})
+            return (
+                f"Document extraction ran ({', '.join(got)}) but nothing was "
+                "stored — the extracted text was empty or a duplicate"
+            )
+        if "challenge_detected" in kinds or "challenge" in kinds:
+            return (
+                "The site served an anti-bot challenge that was not solved, so "
+                "no content could be read"
+            )
+        if "login_failed" in kinds or "signup_failed" in kinds:
+            return "Authentication failed, so no protected content could be read"
+        if "registration_page" in kinds:
+            return (
+                "The site requires a registered account and no usable "
+                "credentials were available"
+            )
+        if statuses == {"failed"}:
+            failed_kinds = sorted(kinds)[:3]
+            return (
+                "Every request failed"
+                + (f" ({', '.join(failed_kinds)})" if failed_kinds else "")
+                + " — no content could be retrieved"
+            )
+        return "No content was stored — every crawled page failed or was skipped"
 
     async def fail_job(
         self,
@@ -867,11 +1059,15 @@ class PostgreSQLClient:
             )
 
     async def allocate_item_id(self) -> str:
-        """Allocate an item_id before raw/log records are written."""
+        """Allocate an item_id before raw/log records are written.
+
+        Delegates to the same SQL generator the column default uses, so ids
+        minted here and ids minted by an INSERT are indistinguishable.
+        """
         if not self.system_pool:
             await self.connect()
         async with self.system_pool.acquire() as conn:
-            return await conn.fetchval("SELECT 'ITEM' || LPAD(nextval('item_seq')::TEXT, 8, '0')")
+            return await conn.fetchval("SELECT generate_item_id()")
 
     async def record_crawl_log(
         self,
@@ -896,6 +1092,197 @@ class PostgreSQLClient:
     async def record_crawl_error(self, job_id: str, url: str, worker_type: str, error_type: str, status: str, retry_count: int = 0, details: str | None = None):
         """Backward-compatible wrapper for older callers."""
         await self.record_crawl_log(job_id, None, url, worker_type, error_type, status, retry_count, details)
+
+    # ========== High-severity alerts ==========
+
+    async def upsert_alert(
+        self,
+        *,
+        job_id: str,
+        item_id: str,
+        url: str,
+        title: str = "",
+        category: str = "",
+        severity: int = 4,
+        language: str = "",
+        summary: str = "",
+        entities: list[str] | None = None,
+        analysis_source: str = "llm",
+        llm_model: str = "",
+    ) -> str:
+        """Insert or update the alert for ``item_id`` and return its alert_id.
+
+        Idempotent on ``item_id``. Kafka at-least-once delivery means the same
+        item can be analysed more than once, and a plain INSERT would raise a
+        duplicate-key error and lose the *update* — so a re-analysis that raises
+        severity would never be reflected.
+        """
+        if not self.system_pool:
+            await self.connect()
+        import json as _json
+
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO alerts
+                       (job_id, item_id, url, title, category, severity, language,
+                        summary, entities, analysis_source, llm_model)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)
+                   ON CONFLICT (item_id) DO UPDATE SET
+                       job_id = EXCLUDED.job_id,
+                       url = EXCLUDED.url,
+                       title = EXCLUDED.title,
+                       category = EXCLUDED.category,
+                       severity = EXCLUDED.severity,
+                       language = EXCLUDED.language,
+                       summary = EXCLUDED.summary,
+                       entities = EXCLUDED.entities,
+                       analysis_source = EXCLUDED.analysis_source,
+                       llm_model = EXCLUDED.llm_model
+                   RETURNING alert_id""",
+                job_id, item_id, url, title or "", category or "", int(severity),
+                language or "", summary or "", _json.dumps(entities or [], ensure_ascii=False),
+                analysis_source or "llm", llm_model or "",
+            )
+        return row["alert_id"]
+
+    async def list_alerts(
+        self,
+        *,
+        user_id: str,
+        job_ids: set[str] | None,
+        unread_only: bool = False,
+        minimum_severity: int = 4,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list, int]:
+        """Page the caller's alerts, newest first, with the total count.
+
+        ``job_ids=None`` means unrestricted (admin). An empty set still yields a
+        real ``= ANY('{}')`` clause, which matches nothing — a fresh account
+        with no jobs sees an empty feed, not the whole system.
+        """
+        if not self.system_pool:
+            await self.connect()
+        unread = " AND ar.alert_id IS NULL" if unread_only else ""
+        async with self.system_pool.acquire() as conn:
+            # The count binds only $1/$2, so its scope placeholder is $3; the
+            # page query additionally binds LIMIT/OFFSET as $3/$4 and so needs
+            # $4. asyncpg refuses to prepare a query with a skipped, unbound
+            # placeholder ("could not determine data type of parameter $3").
+            count_scope, count_params = self._alert_scope(job_ids, start_index=3)
+            total = await conn.fetchval(
+                f"""SELECT COUNT(*)
+                      FROM alerts a
+                 LEFT JOIN alert_reads ar
+                        ON ar.alert_id = a.alert_id AND ar.user_id = $1
+                     WHERE a.severity >= $2{count_scope}{unread}""",
+                user_id, int(minimum_severity), *count_params,
+            )
+            page_scope, page_params = self._alert_scope(job_ids, start_index=5)
+            rows = await conn.fetch(
+                f"""SELECT a.*, (ar.alert_id IS NOT NULL) AS is_read
+                      FROM alerts a
+                 LEFT JOIN alert_reads ar
+                        ON ar.alert_id = a.alert_id AND ar.user_id = $1
+                     WHERE a.severity >= $2{unread}{page_scope}
+                     ORDER BY a.created_at DESC, a.alert_id DESC
+                     LIMIT $3 OFFSET $4""",
+                user_id, int(minimum_severity), int(limit), int(offset), *page_params,
+            )
+        return list(rows), int(total or 0)
+
+    @staticmethod
+    def _alert_scope(
+        job_ids: set[str] | None, *, start_index: int
+    ) -> tuple[str, tuple]:
+        """Build the owner-scope clause for an alert query.
+
+        ``None`` (admin) means unrestricted. An empty set still produces a real
+        ``= ANY(...)`` clause, which matches nothing — the distinction that
+        stops a fresh account reading every alert in the system. The parameter
+        index is explicit because these clauses are spliced into queries that
+        already bind several positional parameters.
+        """
+        if job_ids is None:
+            return "", ()
+        return f" AND a.job_id = ANY(${start_index}::text[])", (sorted(job_ids),)
+
+    async def count_unread_alerts(
+        self, *, user_id: str, job_ids: set[str] | None
+    ) -> int:
+        """Unread alert count for the nav badge — the hot path, so it is a
+        single COUNT rather than a full page fetch."""
+        if not self.system_pool:
+            await self.connect()
+        scope, scope_params = self._alert_scope(job_ids, start_index=2)
+        async with self.system_pool.acquire() as conn:
+            value = await conn.fetchval(
+                f"""SELECT COUNT(*)
+                      FROM alerts a
+                 LEFT JOIN alert_reads ar
+                        ON ar.alert_id = a.alert_id AND ar.user_id = $1
+                     WHERE a.severity >= 4{scope}
+                       AND ar.alert_id IS NULL""",
+                user_id, *scope_params,
+            )
+        return int(value or 0)
+
+    async def get_alert(self, alert_id: str):
+        """One alert row by id, or None. Read state is not joined: callers
+        either email it (state irrelevant) or check scope."""
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM alerts WHERE alert_id = $1", alert_id)
+
+    async def alert_in_scope(self, alert_id: str, job_ids: set[str] | None) -> bool:
+        """True when this alert exists and belongs to a job the caller can read."""
+        if not self.system_pool:
+            await self.connect()
+        if job_ids is None:
+            async with self.system_pool.acquire() as conn:
+                return bool(await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM alerts WHERE alert_id = $1)",
+                    alert_id,
+                ))
+        async with self.system_pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM alerts WHERE alert_id = $1 AND job_id = ANY($2::text[]))",
+                alert_id, sorted(job_ids),
+            ))
+
+    async def mark_alert_read(self, user_id: str, alert_id: str) -> bool:
+        """Record that this user has read one alert. Idempotent."""
+        if not self.system_pool:
+            await self.connect()
+        async with self.system_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO alert_reads (alert_id, user_id) VALUES ($1, $2)
+                   ON CONFLICT (alert_id, user_id) DO UPDATE SET read_at = CURRENT_TIMESTAMP
+                   RETURNING alert_id""",
+                alert_id, user_id,
+            )
+        return row is not None
+
+    async def mark_all_alerts_read(self, user_id: str, job_ids: set[str] | None) -> int:
+        """Mark every visible unread alert read; returns how many were newly read."""
+        if not self.system_pool:
+            await self.connect()
+        scope, scope_params = self._alert_scope(job_ids, start_index=2)
+        async with self.system_pool.acquire() as conn:
+            status = await conn.execute(
+                f"""INSERT INTO alert_reads (alert_id, user_id)
+                    SELECT a.alert_id, $1 FROM alerts a
+                 LEFT JOIN alert_reads ar
+                        ON ar.alert_id = a.alert_id AND ar.user_id = $1
+                    WHERE a.severity >= 4{scope} AND ar.alert_id IS NULL
+                    ON CONFLICT (alert_id, user_id) DO NOTHING""",
+                user_id, *scope_params,
+            )
+        try:
+            return int(str(status).rsplit(" ", 1)[-1])
+        except (TypeError, ValueError):
+            return 0
 
     # ========== Discovered external links (link discovery & review) ==========
 
@@ -1453,16 +1840,34 @@ class PostgreSQLClient:
         This is a safety net for when the SQL init file didn't run
         (e.g. connecting to an existing database). The SQL file at
         database/postgres/01_duka_system.sql is the primary source of truth.
+
+        Serialised behind an advisory lock: every worker in the stack runs this
+        on startup at the same moment, and two sessions issuing the same
+        ``ALTER TABLE ... ADD COLUMN`` collide inside the catalog —
+        ``tuple concurrently updated`` — which kills the second worker's
+        startup. One migrates, the rest wait and then find nothing to do.
         """
         if not self.system_pool:
             raise RuntimeError("Database not connected")
         async with self.system_pool.acquire() as conn:
+            await conn.execute("SELECT pg_advisory_lock($1)", _SCHEMA_MIGRATION_LOCK_KEY)
+            try:
+                await self._apply_duka_system_schema(conn)
+            finally:
+                try:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock($1)", _SCHEMA_MIGRATION_LOCK_KEY
+                    )
+                except Exception:  # pragma: no cover - connection already gone
+                    pass
+
+    async def _apply_duka_system_schema(self, conn) -> None:
             # --- Sequences ---
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS job_seq START 1 INCREMENT 1")
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS item_seq START 1 INCREMENT 1")
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS export_seq START 1 INCREMENT 1")
 
-            # --- Helper function ---
+            # --- Helper functions ---
             await conn.execute(
                 "CREATE OR REPLACE FUNCTION generate_user_id() "
                 "RETURNS VARCHAR AS $$ DECLARE new_id VARCHAR(8); "
@@ -1470,6 +1875,44 @@ class PostgreSQLClient:
                 "EXIT WHEN NOT EXISTS (SELECT 1 FROM users WHERE user_id = new_id); "
                 "END LOOP; RETURN new_id; END; $$ LANGUAGE plpgsql;"
             )
+
+            # Timestamp ids for jobs/items/exports: prefix + epoch milliseconds.
+            #
+            # Uniqueness comes from a monotonic clock, not from retrying on
+            # collision. Retrying "until the value is free" is unsound here:
+            # allocate_item_id() hands ids to callers that insert later, so two
+            # allocations in the same millisecond both see an empty table and
+            # both return the same id. Instead one row per prefix remembers the
+            # last millisecond issued, and a single UPDATE ... RETURNING under a
+            # row lock both reads and advances it. That makes every allocation
+            # strictly greater than the last, across every process and
+            # connection, with no dependency on whether a row exists yet.
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS id_clock ("
+                "  prefix VARCHAR(8) PRIMARY KEY,"
+                "  last_ms BIGINT NOT NULL DEFAULT 0)"
+            )
+            # (id prefix, function suffix). The two do not always match -
+            # EXP becomes generate_export_id, not generate_exp_id - so the
+            # mapping is explicit rather than derived from the prefix.
+            for prefix, suffix in (("JOB", "job"), ("ITEM", "item"), ("EXP", "export")):
+                await conn.execute(
+                    "CREATE OR REPLACE FUNCTION generate_"
+                    + suffix
+                    + "_id() RETURNS VARCHAR AS $$ DECLARE next_ms BIGINT; BEGIN "
+                    "INSERT INTO id_clock (prefix, last_ms) VALUES ('"
+                    + prefix
+                    + "', 0) ON CONFLICT (prefix) DO NOTHING; "
+                    "UPDATE id_clock SET last_ms = GREATEST("
+                    "  last_ms + 1,"
+                    "  (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
+                    ") WHERE prefix = '"
+                    + prefix
+                    + "' RETURNING last_ms INTO next_ms; "
+                    "RETURN '"
+                    + prefix
+                    + "' || next_ms::TEXT; END; $$ LANGUAGE plpgsql;"
+                )
 
             # --- Users (with RBAC columns) ---
             await conn.execute(
@@ -1544,7 +1987,7 @@ class PostgreSQLClient:
             # --- Jobs ---
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (
-    job_id VARCHAR(11) PRIMARY KEY DEFAULT ('JOB' || LPAD(nextval('job_seq')::TEXT, 8, '0')),
+    job_id VARCHAR(20) PRIMARY KEY DEFAULT generate_job_id(),
     user_id VARCHAR(8) NOT NULL,
     url TEXT NOT NULL,
     language VARCHAR(10) DEFAULT 'am',
@@ -1563,7 +2006,7 @@ class PostgreSQLClient:
             )
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (
-    job_id VARCHAR(11) PRIMARY KEY DEFAULT ('JOB' || LPAD(nextval('job_seq')::TEXT, 8, '0')),
+    job_id VARCHAR(20) PRIMARY KEY DEFAULT generate_job_id(),
     user_id VARCHAR(8) NOT NULL,
     url TEXT NOT NULL,
     language VARCHAR(10) DEFAULT 'am',
@@ -1577,6 +2020,48 @@ class PostgreSQLClient:
             await conn.execute("ALTER TABLE jobs DROP COLUMN IF EXISTS worker_type")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+            # Pause/resume: 'paused' is a real status and resume_status records
+            # what the job was doing before the pause, so resuming a running
+            # job does not silently demote it to 'pending'.
+            await conn.execute(
+                "ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check"
+            )
+            await conn.execute(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_status VARCHAR(20)"
+            )
+            await conn.execute(
+                "ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK "
+                "(status IN ('pending','running','paused','completed','failed',"
+                "'skipped','needs_review'))"
+            )
+            # Timestamp ids are 20 characters ("JOB" + 13 epoch-ms digits), so
+            # columns that were sized for "JOB00000042" have to grow. Widening a
+            # VARCHAR never truncates or rewrites existing values.
+            for table, column in (
+                ("jobs", "job_id"),
+                ("parsed_items", "item_id"),
+                ("parsed_items", "job_id"),
+                ("exports", "export_id"),
+                ("exports", "job_id"),
+                ("crawl_log", "job_id"),
+                ("crawl_log", "item_id"),
+                ("discovered_external_links", "job_id"),
+                ("content_fingerprints", "job_id"),
+                ("content_fingerprints", "item_id"),
+            ):
+                # Postgres has no "ALTER COLUMN IF EXISTS", and a table absent
+                # from a given deployment must not abort the whole bootstrap, so
+                # check the catalogue before altering.
+                exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = $1 AND column_name = $2)",
+                    table,
+                    column,
+                )
+                if exists:
+                    await conn.execute(
+                        f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR(20)"
+                    )
 
             # --- Credential management (merged credentials + credential_usage) ---
             await conn.execute(
@@ -1625,8 +2110,8 @@ class PostgreSQLClient:
             await conn.execute("CREATE SEQUENCE IF NOT EXISTS export_seq START 1 INCREMENT 1")
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS parsed_items (
-    item_id VARCHAR(12) PRIMARY KEY DEFAULT ('ITEM' || LPAD(nextval('item_seq')::TEXT, 8, '0')),
-    job_id VARCHAR(11) NOT NULL,
+    item_id VARCHAR(20) PRIMARY KEY DEFAULT generate_item_id(),
+    job_id VARCHAR(20) NOT NULL,
     source_url TEXT NOT NULL,
     language VARCHAR(10) DEFAULT 'am',
     worker_type VARCHAR(20) NOT NULL CHECK (worker_type IN ('surface','deep','dark')),
@@ -1647,6 +2132,18 @@ class PostgreSQLClient:
                    ADD COLUMN IF NOT EXISTS worker_type VARCHAR(20) NOT NULL DEFAULT 'surface'
                    CHECK (worker_type IN ('surface','deep','dark'))"""
             )
+            # Raw-binary retention. ``raw_html_path`` says *where* the object is;
+            # these say *what* it is, so nothing has to download a file to learn
+            # its type and a re-uploaded file is detectable by digest.
+            for _raw_col in (
+                "raw_object_name TEXT",
+                "raw_content_type VARCHAR(120)",
+                "raw_size_bytes BIGINT",
+                "raw_sha256 VARCHAR(64)",
+            ):
+                await conn.execute(
+                    f"ALTER TABLE parsed_items ADD COLUMN IF NOT EXISTS {_raw_col}"
+                )
             await conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_parsed_items_job_source_url
                    ON parsed_items(job_id, source_url)"""
@@ -1661,8 +2158,8 @@ class PostgreSQLClient:
             # --- Exports ---
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS exports (
-    export_id VARCHAR(11) PRIMARY KEY DEFAULT ('EXP' || LPAD(nextval('export_seq')::TEXT, 8, '0')),
-    job_id VARCHAR(11) NOT NULL,
+    export_id VARCHAR(20) PRIMARY KEY DEFAULT generate_export_id(),
+    job_id VARCHAR(20) NOT NULL,
     export_type VARCHAR(20) NOT NULL CHECK (export_type IN ('csv','json','parquet')),
     file_path TEXT NOT NULL,
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','completed','failed')),
@@ -1678,8 +2175,8 @@ class PostgreSQLClient:
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS crawl_log (
     log_id BIGSERIAL PRIMARY KEY,
-    job_id VARCHAR(11) NOT NULL,
-    item_id VARCHAR(12),
+    job_id VARCHAR(20) NOT NULL,
+    item_id VARCHAR(20),
     url TEXT NOT NULL,
     worker_type VARCHAR(20) NOT NULL,
     event_type VARCHAR(80) NOT NULL,
@@ -1697,7 +2194,7 @@ class PostgreSQLClient:
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS discovered_external_links (
     id BIGSERIAL PRIMARY KEY,
-    job_id VARCHAR(11) NOT NULL,
+    job_id VARCHAR(20) NOT NULL,
     parent_url TEXT NOT NULL,
     discovered_url TEXT NOT NULL,
     discovered_domain TEXT NOT NULL,
@@ -1720,8 +2217,8 @@ class PostgreSQLClient:
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS content_fingerprints (
     id BIGSERIAL PRIMARY KEY,
-    job_id VARCHAR(11) NOT NULL,
-    item_id VARCHAR(12),
+    job_id VARCHAR(20) NOT NULL,
+    item_id VARCHAR(20),
     url TEXT NOT NULL,
     url_fingerprint VARCHAR(64) NOT NULL,
     content_fingerprint VARCHAR(64) NOT NULL,
@@ -1729,7 +2226,7 @@ class PostgreSQLClient:
     word_count INT DEFAULT 0,
     char_count INT DEFAULT 0,
     text_preview TEXT DEFAULT '',
-    duplicate_of VARCHAR(12),
+    duplicate_of VARCHAR(20),
     duplicate_type VARCHAR(20) CHECK (duplicate_type IN ('url_exact','content_exact','near_duplicate',NULL)),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(url_fingerprint)
@@ -1752,8 +2249,68 @@ class PostgreSQLClient:
                 "CREATE INDEX IF NOT EXISTS idx_fp_job ON content_fingerprints(job_id)"
             )
 
-        logger.info("Ensured duka_system schema exists.")
+            # --- High-severity alerts (severity 4/5) + per-user read state ---
+            # Mirrors qualifying intelligence_analytics rows so an alert is
+            # raised once per item and each user gets their own unread badge.
+            await conn.execute("CREATE SEQUENCE IF NOT EXISTS alert_seq START 1 INCREMENT 1")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS alerts (
+    alert_id VARCHAR(24) PRIMARY KEY DEFAULT ('ALR' || LPAD(nextval('alert_seq')::TEXT, 14, '0')),
+    job_id VARCHAR(20) NOT NULL,
+    item_id VARCHAR(20) NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT DEFAULT '',
+    category VARCHAR(64) DEFAULT '',
+    severity SMALLINT NOT NULL DEFAULT 4 CHECK (severity BETWEEN 1 AND 5),
+    language VARCHAR(8) DEFAULT '',
+    summary TEXT DEFAULT '',
+    entities JSONB DEFAULT '[]'::jsonb,
+    analysis_source VARCHAR(16) DEFAULT 'llm',
+    llm_model VARCHAR(128) DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(item_id)
+)
+"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts (created_at DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts (severity DESC, created_at DESC)"
+            )
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_job ON alerts (job_id)")
+
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS alert_reads (
+    alert_id VARCHAR(24) NOT NULL REFERENCES alerts(alert_id) ON DELETE CASCADE,
+    user_id VARCHAR(8) NOT NULL,
+    read_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (alert_id, user_id)
+)
+"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_reads_user ON alert_reads (user_id)"
+            )
+
+            # CREATE TABLE IF NOT EXISTS skips tables that already exist, so a
+            # database created before this change keeps its original sequence
+            # default and would keep minting JOB000000NN ids forever. Re-point
+            # the defaults explicitly on every startup; this is idempotent.
+            # Applied last so every table exists before it runs.
+            for table, column, generator in (
+                ("jobs", "job_id", "generate_job_id"),
+                ("parsed_items", "item_id", "generate_item_id"),
+                ("exports", "export_id", "generate_export_id"),
+            ):
+                await conn.execute(
+                    f"ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {generator}()"
+                )
+
+            logger.info("Ensured duka_system schema exists.")
 
 
 # Global PostgreSQL client instance
+
+
 pg_client = PostgreSQLClient()

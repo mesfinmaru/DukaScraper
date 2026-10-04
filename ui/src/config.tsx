@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 import type { ReactNode } from "react"
 import { api, getSession, onSessionChange, setSession } from "./api"
+import { isRequiresVerification, type LoginResult } from "./types"
 import type { StoredSession } from "./api"
 
 export interface AppConfig {
@@ -29,9 +30,11 @@ const ConfigContext = createContext<ConfigContextValue | null>(null)
 
 interface AuthContextValue {
   session: StoredSession | null
-  login: (username: string, password: string) => Promise<void>
+  login: (username: string, password: string) => Promise<LoginResult>
   logout: () => void
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>
+  /** Store the session created by OTP verification (auto-login). */
+  setVerifiedSession: (s: StoredSession) => void
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -43,7 +46,11 @@ export function AppProviders({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string) => {
     const res = await api.login(username, password)
+    // Unverified (admin-provisioned) account: no session yet — the caller
+    // transitions to the OTP verification page with the returned context.
+    if (isRequiresVerification(res)) return res
     setSession({ token: res.access_token, refreshToken: res.refresh_token, user: res.user })
+    return res
   }, [])
 
   const logout = useCallback(() => setSession(null), [])
@@ -64,7 +71,7 @@ export function AppProviders({ children }: { children: ReactNode }) {
     [],
   )
   const authValue = useMemo(
-    () => ({ session, login, logout, changePassword }),
+    () => ({ session, login, logout, changePassword, setVerifiedSession: setSession }),
     [session, login, logout, changePassword],
   )
 

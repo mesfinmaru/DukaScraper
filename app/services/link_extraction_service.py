@@ -30,6 +30,7 @@ import socket
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
+from app.common.constants.content_extensions import NON_CONTENT_EXTENSIONS
 from app.common.logger.logger import logger
 
 try:
@@ -139,17 +140,11 @@ class LinkExtractionService:
     INVALID_SCHEMES = {"mailto", "javascript", "tel", "sms", "data"}
     ALLOWED_FETCH_SCHEMES = {"http", "https"}
 
-    EXCLUDED_EXTENSIONS = {
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp",
-        ".tiff", ".avif", ".heic", ".heif",
-        ".css", ".js", ".json", ".map", ".wasm",
-        ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz",
-        ".exe", ".msi", ".dll", ".bin", ".apk", ".dmg", ".iso", ".torrent",
-        ".mp4", ".mp3", ".wav", ".avi", ".mov", ".mkv", ".webm", ".m4a",
-        ".m4v", ".flac", ".ogg", ".oga", ".weba",
-        ".woff", ".woff2", ".ttf", ".eot", ".otf",
-        ".rss", ".xml",
-    }
+    # Single source of truth lives in app.common.constants.content_extensions.
+    # PDF/DOCX/audio were REMOVED from this set on purpose: they are now
+    # fetchable content (PDF/DOCX converted, audio handed off for transcription)
+    # rather than being dropped at link-extraction time.
+    EXCLUDED_EXTENSIONS = set(NON_CONTENT_EXTENSIONS)
 
     # Non-content page path patterns that should never be crawled as articles.
     # Matches against the lowercased path of the resolved absolute URL.

@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "_comment": "Topic-based discovery engines for the discovery-worker. The same SearchRequest shape is used for every network; 'network' on the request selects which block below is queried. surface/deep engines are fetched over plain HTTP, dark engines over the Tor SOCKS5 client. Engine 'type' is one of: searxng_json (SearXNG JSON API) or html_links (generic anchor extraction from a results page).",
+  "surface": {
+    "engines": [
+      {
+        "name": "duckduckgo",
+        "type": "html_links",
+        "enabled": true,
+        "url_template": "https://html.duckduckgo.com/html/?q={query}",
+        "unwrap_query_param": "uddg",
+        "link_pattern": "^https?://",
+        "result_domains_exclude": ["duckduckgo.com"]
+      },
+      {
+        "name": "searxng",
+        "type": "searxng_json",
+        "enabled": false,
+        "base_url": "http://searxng:8080",
+        "_comment": "Requires a self-hosted SearXNG instance with the JSON format enabled. Enable and set base_url, or leave disabled and rely on the html_links engines."
+      }
+    ]
+  },
+  "deep": {
+    "engines": [
+      {
+        "name": "duckduckgo",
+        "type": "html_links",
+        "enabled": true,
+        "url_template": "https://html.duckduckgo.com/html/?q={query}",
+        "unwrap_query_param": "uddg",
+        "link_pattern": "^https?://",
+        "result_domains_exclude": ["duckduckgo.com"]
+      }
+    ]
+  },
+  "dark": {
+    "engines": [
+      {
+        "name": "ahmia",
+        "type": "html_links",
+        "enabled": true,
+        "url_template": "https://ahmia.fi/search/?q={query}",
+        "link_pattern": "\\.onion",
+        "require_onion": true,
+        "_comment": "Clearnet gateway that indexes .onion services; fetched through Tor like the rest of the dark network."
+      },
+      {
+        "name": "torch",
+        "type": "html_links",
+        "enabled": false,
+        "url_template": "http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/search?query={query}",
+        "link_pattern": "\\.onion",
+        "require_onion": true,
+        "_comment": "Historically unreliable; left disabled so the dark list fails over to ahmia only."
+      }
+    ]
+  }
+}

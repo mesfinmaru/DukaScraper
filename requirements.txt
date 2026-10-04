@@ -17,6 +17,12 @@ clickhouse-connect>=0.8.0
 
 # --- Web Scraping & Data Extraction ---
 beautifulsoup4>=4.12.3
+# Language detection: without it every Latin-script page falls back to
+# "assume English" (see app/language/language_detection/detector.py).
+langdetect==1.0.9
+# Multi-format ingestion (shared ContentIngestionService): PDF + DOCX -> text.
+pypdf>=4.3.0
+python-docx>=1.1.2
 lxml>=5.3.0
 selenium>=4.27.0
 scrapy>=2.12.0

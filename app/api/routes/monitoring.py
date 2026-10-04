@@ -12,6 +12,7 @@ Consumed by the admin Monitoring page:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import defaultdict
 
@@ -135,17 +136,35 @@ def _collect_samples() -> dict[str, list[Sample]]:
 
 
 def _histogram_percentiles(buckets: list[tuple[float, float]], total: float) -> dict[int, float]:
-    """Approximate percentiles from cumulative histogram buckets."""
+    """Approximate percentiles from cumulative histogram buckets.
+
+    The ``+Inf`` bucket is never reported as a value. It is the catch-all for
+    observations slower than the largest finite bound (10s for this app's
+    histogram), and a slow route - a Prometheus scrape, or a Grafana dashboard
+    proxied through the API - puts *every* observation there. The percentile
+    search would then return ``inf``, which Starlette's JSONResponse refuses to
+    serialise (``allow_nan=False``), turning this endpoint into a 500 that
+    recurs on every poll of the Monitoring page.
+
+    When no finite bucket reaches the target, the largest finite bound is
+    reported instead: the true value is only known to be above it, and that
+    bound is the standard answer for a bucket-histogram estimate.
+    """
     if not buckets or total <= 0:
         return {}
-    buckets = sorted(buckets)
+    finite = sorted((le, cumulative) for le, cumulative in buckets if math.isfinite(le))
+    if not finite:
+        return {}
+    ceiling = finite[-1][0]
     out: dict[int, float] = {}
     for pct in (50, 90, 95, 99):
         target = total * pct / 100.0
-        for le, cumulative in buckets:
+        for le, cumulative in finite:
             if cumulative >= target:
                 out[pct] = le
                 break
+        else:
+            out[pct] = ceiling
     return out
 
 
@@ -182,7 +201,10 @@ async def prometheus_summary(_: object = Depends(require_admin)):
 
     durations: dict[str, float] = {}
     for (method, endpoint), buckets in by_route.items():
-        total = buckets[-1][1] if buckets else 0.0
+        # Highest cumulative count wins, which is the observation count. Taking
+        # it by value rather than by position does not depend on the +Inf bucket
+        # happening to sort last.
+        total = max((cumulative for _, cumulative in buckets), default=0.0)
         for pct, value in _histogram_percentiles(buckets, total).items():
             durations[f"{method} {endpoint} (p{pct})"] = round(value, 4)
 

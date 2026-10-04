@@ -23,6 +23,7 @@ Navigation strategy:
 
 import asyncio
 import contextvars
+import httpx
 import io
 import json
 import logging
@@ -62,8 +63,12 @@ SUPPORTED_LANGUAGES = ETHIOPIC_LANGUAGES | {
 }
 from app.pipeline.schemas import CrawlRequest, ParsedItem, ParsedItemData
 from app.services.content_fingerprint_service import generate_fingerprint
+from app.services.content_ingestion_service import ContentIngestionService, ContentKind
 from app.services.link_extraction_service import LinkExtractionService
-from app.common.utils.minio_naming import parsed_name, raw_name
+from app.services.raw_object_store import RawObjectStore, RawObjectRef, record_raw_metadata
+
+RAW_STORE = RawObjectStore()
+from app.common.utils.minio_naming import parsed_name, raw_name, raw_suffix, site_from_url
 from app.services.portal_handler import (
     PortalHandler,
     PortalConfig,
@@ -88,8 +93,10 @@ from workers.common import (
     fail_job_from_message,
     owns_message,
     shared_proxy_manager,
+    wait_while_paused as _wait_while_paused,
 )
 from workers.health import HealthServer
+from workers.metrics import WorkerMetrics
 
 # Optional: audio solver for reCAPTCHA v2
 try:
@@ -263,6 +270,155 @@ def _get_camoufox_webgl_config(
 
 
 # =========================================================================
+# Camoufox Browser Binary Readiness
+# =========================================================================
+# The `camoufox` Python package and its browser binary are fetched separately:
+# installing the package downloads no browser. The browser is baked into the
+# image (and repaired by docker-entrypoint.sh at container start), so the
+# worker only has to *verify* it here. A missing browser must never be fixed by
+# downloading one inside a job: the download takes minutes, it is charged to
+# the job's page budget, and on a container that restarts mid-download it can
+# never converge — which is exactly how a job ends up dying on
+# "page budget exceeded" with no usable output.
+CAMOUFOX_REPAIR_TIMEOUT_SECONDS: float = float(
+    os.getenv("CAMOUFOX_REPAIR_TIMEOUT_SECONDS", "120")
+)
+_camoufox_probe_failed: bool = False
+_camoufox_repair_attempted: bool = False
+_camoufox_repair_lock: asyncio.Lock | None = None
+
+# Wall-clock deadline of the message currently being processed, or None when
+# called outside a message task. Used to keep optional work (such as a browser
+# repair) from consuming the page budget the job still needs.
+_message_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "deep_message_deadline", default=None
+)
+
+
+def camoufox_browser_path() -> str | None:
+    """Path to the installed Camoufox browser, or None when it is missing.
+
+    Asks the package itself, with ``download_if_missing=False`` so the probe
+    can never trigger an implicit multi-hundred-megabyte download. Any CLI
+    based check is unreliable: `camoufox version` prints a rich table and
+    `camoufox fetch` exits 0 even when it installs nothing.
+    """
+    global _camoufox_probe_failed
+    if not HAS_CAMOUFOX:
+        return None
+    try:
+        from camoufox.pkgman import camoufox_path
+
+        return str(camoufox_path(download_if_missing=False))
+    except FileNotFoundError as exc:
+        logger.debug("Camoufox browser not installed: %s", exc)
+        return None
+    except Exception as exc:
+        # Unlike "not installed", this is a broken install: log it once.
+        if not _camoufox_probe_failed:
+            _camoufox_probe_failed = True
+            logger.warning("Camoufox browser probe failed: %s", exc)
+        return None
+
+
+async def ensure_camoufox_browser(job_id: str = "startup") -> bool:
+    """Verify the Camoufox browser, repairing it at most once per process.
+
+    Returns True when a usable browser is present. The repair is serialized
+    behind a lock (concurrent jobs must not race two downloads), attempted only
+    once per process, and hard-capped so it can never be the reason a job sits
+    until its page budget expires.
+    """
+    global _camoufox_repair_attempted, _camoufox_repair_lock
+
+    if camoufox_browser_path() is not None:
+        return True
+    if not HAS_CAMOUFOX:
+        return False
+
+    if _camoufox_repair_lock is None:
+        _camoufox_repair_lock = asyncio.Lock()
+
+    async with _camoufox_repair_lock:
+        # Another task may have repaired it while we waited for the lock.
+        if camoufox_browser_path() is not None:
+            return True
+        if _camoufox_repair_attempted:
+            logger.warning(
+                "[%s] Camoufox browser still missing — repair already attempted "
+                "in this process; skipping",
+                job_id,
+            )
+            return False
+        _camoufox_repair_attempted = True
+
+        logger.warning(
+            "[%s] Camoufox browser binary missing — running `camoufox fetch` "
+            "once (cap %.0fs). The image should bake this in; if this keeps "
+            "happening, rebuild the deep-worker image",
+            job_id,
+            CAMOUFOX_REPAIR_TIMEOUT_SECONDS,
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "camoufox",
+                "fetch",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, fetch_stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=CAMOUFOX_REPAIR_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.error(
+                    "[%s] `camoufox fetch` exceeded %.0fs and was killed",
+                    job_id,
+                    CAMOUFOX_REPAIR_TIMEOUT_SECONDS,
+                )
+                return False
+            if (fetch_stderr or b"").strip():
+                logger.debug(
+                    "[%s] camoufox fetch stderr: %s",
+                    job_id,
+                    fetch_stderr.decode(errors="replace")[:500],
+                )
+        except FileNotFoundError:
+            logger.error(
+                "[%s] camoufox CLI not found — the package is missing from this "
+                "image; Cloudflare fallback stays disabled",
+                job_id,
+            )
+            return False
+        except Exception as exc:
+            logger.error("[%s] camoufox fetch failed: %s", job_id, exc)
+            return False
+
+    # `camoufox fetch` exits 0 even when it installs nothing, so trust only the
+    # probe — never the exit code.
+    browser_path = camoufox_browser_path()
+    if browser_path is None:
+        logger.error(
+            "[%s] Camoufox browser still missing after `camoufox fetch` — "
+            "Cloudflare fallback stays disabled for this process",
+            job_id,
+        )
+        return False
+    logger.info("[%s] Camoufox browser ready at %s", job_id, browser_path)
+    return True
+
+
+def _remaining_message_budget() -> float | None:
+    """Seconds left in the current message's page budget, or None if unknown."""
+    deadline = _message_deadline.get()
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+# =========================================================================
 # Cloudflare Challenge Detection
 # =========================================================================
 
@@ -291,6 +447,21 @@ _CF_CHALLENGE_FAILURE_MARKERS: list[str] = [
     "challenge-error-text",
 ]
 
+# Markers that appear ONLY while the interstitial is being served, in every
+# interface language. These are the ones safe to gate storage on.
+#
+# "challenges.cloudflare.com" is deliberately NOT here: it is also the Turnstile
+# widget API host, so a perfectly real logged-in page that embeds a Turnstile
+# box (scrapingcourse.com/dashboard does exactly this) matches it. Verified
+# against both pages: the interstitial carries _cf_chl_opt (7x) and
+# /cdn-cgi/challenge-platform/ (2x); the real dashboard carries neither, only
+# the Turnstile host once.
+_CF_CHALLENGE_STRONG_MARKERS: list[str] = [
+    "_cf_chl_opt",
+    "/cdn-cgi/challenge-platform/",
+    "cf-chl-platform",
+]
+
 
 async def _is_cloudflare_challenge(page: Page) -> bool:
     """Returns True if the current page is a Cloudflare challenge page."""
@@ -315,9 +486,22 @@ async def _is_cloudflare_challenge(page: Page) -> bool:
         # screen, whose body text no longer matches the primary markers.
         # Treating the title as a signal prevents the solver from declaring
         # victory while the page is still mid-verification.
+        #
+        # Localized too: Camoufox randomizes the browser locale per attempt, so
+        # an English-only check reports "no challenge" on a de-DE interstitial
+        # and the solver waits out its whole budget on a page it never clears.
         if page_title:
             title_lower = page_title.lower()
-            for marker in ("just a moment", "attention required"):
+            for marker in (
+                "just a moment",
+                "attention required",
+                "nur einen moment",
+                "un instant",
+                "un momento",
+                "attendi solo un momento",
+                "een moment",
+                "checking your site",
+            ):
                 if marker in title_lower:
                     return True
 
@@ -354,6 +538,74 @@ def _html_has_cloudflare_challenge(html: str) -> bool:
         return False
     lowered = html.lower()
     return any(marker.lower() in lowered for marker in _CF_CHALLENGE_MARKERS)
+
+
+def _html_is_challenge_interstitial(html: str) -> bool:
+    """Whether captured HTML is the interstitial itself — safe to fail on.
+
+    Uses only the language-independent strong markers, so it is correct no
+    matter which locale the browser presented, and does not fire on real pages
+    that merely embed a Cloudflare Turnstile widget.
+    """
+    if not html:
+        return False
+    lowered = html.lower()
+    return any(marker.lower() in lowered for marker in _CF_CHALLENGE_STRONG_MARKERS)
+
+
+def _html_is_still_challenge_page(html: str) -> bool:
+    """Return whether captured HTML is still a Cloudflare challenge
+    interstitial — including the transitional post-verification screen
+    ("Verification successful. Waiting for … to respond") that never
+    reloads and must never be stored as page content."""
+    if _html_has_cloudflare_challenge(html):
+        return True
+    if not html:
+        return False
+    lowered = html.lower()
+    # Only the two textual success markers — "cf-chl-cc-t" can appear in
+    # scripts on normal pages.
+    return any(
+        marker.lower() in lowered
+        for marker in _CF_CHALLENGE_SUCCESS_MARKERS[:2]
+    )
+
+
+async def _cf_verification_success_stuck(page: Page) -> bool:
+    """True when Cloudflare verification has already PASSED but the
+    interstitial is stuck and never reloads itself.
+
+    The managed challenge flow ends with "Verification successful.
+    Waiting for <host> to respond" and a *client-side redirect*. Behind
+    some proxies / HTTP configs that redirect never fires, so the page
+    sits on the success screen forever. Detection lets us force a reload
+    instead of polling a dead page until the patience budget expires.
+
+    Two signals. The cookies are checked first because they are
+    locale-independent: `cf_clearance` / `cf-chl-cc-t` are set by Cloudflare on
+    a genuine pass regardless of the interface language, whereas the visible
+    "Verification successful" banner is translated (a de-DE profile shows
+    "Überprüfung erfolgreich") and the English text match silently misses it.
+    """
+    try:
+        cookies = await page.context.cookies()
+        for cookie in cookies or []:
+            if cookie.get("name") in ("cf_clearance", "cf-chl-cc-t"):
+                return True
+    except Exception:
+        # Cookie access can be denied on some contexts; fall through to text.
+        pass
+    try:
+        text = await page.evaluate(
+            "() => (document.body?.innerText || '').substring(0, 2000)"
+        )
+        lowered = (text or "").lower()
+        return any(
+            marker.lower() in lowered
+            for marker in _CF_CHALLENGE_SUCCESS_MARKERS[:2]
+        )
+    except Exception:
+        return False
 
 
 async def _wait_for_challenge_resolution(
@@ -611,6 +863,76 @@ class DeepWorker:
         self.captcha_solver: UniversalCaptchaSolver = UniversalCaptchaSolver()
         self.camoufox_authenticated = False
         self.camoufox_portal_data: dict[str, object] = {}
+        # Most-recent navigation error per job_id. _navigate_and_solve has no
+        # payload in scope, so it stashes the error here for process_job to
+        # pick up; keyed so concurrent messages don't clobber each other.
+        self._navigation_errors: dict[str, str] = {}
+
+    # -- Camoufox launch hardening -------------------------------------------
+
+    @staticmethod
+    def _camoufox_env() -> dict[str, str]:
+        """Extra environment for headful Camoufox inside a container.
+
+        Two classic container failure modes:
+          1. "Sandbox: CanCreateUserNamespace() clone() failure: EPERM" —
+             Firefox's sandbox needs unprivileged user namespaces, which
+             Docker's default seccomp/apparmor blocks. MOZ_DISABLE_CONTENT_SANDBOX
+             disables that sandbox (the outer Docker isolation still applies).
+          2. "Error: cannot open display: :99" — Xvfb is not ready, DISPLAY is
+             wrong, or the Xauthority is missing. _xvfb_ensure() fixes all three
+             before we ever launch the browser.
+        """
+        env = {
+            "MOZ_DISABLE_CONTENT_SANDBOX": "1",
+            "MOZ_DISABLE_RDD_SANDBOX": "1",
+            "MOZ_DISABLE_GPU_SANDBOX": "1",
+            "MOZ_HEADLESS": "0",
+        }
+        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/0/bus"
+        return env
+
+    @staticmethod
+    async def _xvfb_ensure(job_id: str) -> None:
+        """Make sure an X server is reachable before a headful launch.
+
+        If the container entrypoint's Xvfb died (or was never started because
+        the process runs standalone), start a dedicated display for this
+        worker process. This is idempotent and cheap when Xvfb is healthy.
+        """
+        display = os.environ.get("DISPLAY", ":99")
+        x_socket = f"/tmp/.X11-unix/X{display.lstrip(':')}"
+        x_lock = f"/tmp/.X{display.lstrip(':')}-lock"
+        if os.path.exists(x_socket):
+            return  # healthy
+        logger.warning(
+            "[%s] X socket %s missing — attempting Xvfb recovery …", job_id, x_socket,
+        )
+        try:
+            os.makedirs("/tmp/.X11-unix", exist_ok=True)
+            for stale in (x_lock, x_socket):
+                try:
+                    os.unlink(stale)
+                except FileNotFoundError:
+                    pass
+            proc = await asyncio.create_subprocess_exec(
+                "Xvfb", display, "-screen", "0", "1920x1080x24", "-ac",
+                "+extension", "GLX", "+render", "-noreset",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            # Give Xvfb a moment to create its socket.
+            for _ in range(30):
+                await asyncio.sleep(0.2)
+                if os.path.exists(x_socket):
+                    logger.info("[%s] Xvfb recovery OK on %s (pid=%d)", job_id, display, proc.pid)
+                    return
+            logger.error("[%s] Xvfb recovery FAILED — display %s still unavailable", job_id, display)
+        except FileNotFoundError:
+            logger.error("[%s] Xvfb binary not found — headful Camoufox cannot run", job_id)
+        except Exception as exc:
+            logger.warning("[%s] Xvfb recovery error: %s", job_id, exc)
 
     # -- Authentication ------------------------------------------------------
 
@@ -764,11 +1086,10 @@ class DeepWorker:
                     "[%s] fallback navigation also failed: %s", job_id, fallback_err
                 )
                 # Return empty — caller handles the failure. The nav error is
-                # surfaced via the payload so process_job can fail this site
-                # with a real reason instead of reporting a fake HTTP 200.
-                payload["_navigation_error"] = (
-                    f"Navigation failed: {fallback_err}"
-                )
+                # stashed on self (this method has no payload in scope) so
+                # process_job can fail this site with a real reason instead of
+                # reporting a fake HTTP 200.
+                self._navigation_errors[job_id] = f"Navigation failed: {fallback_err}"
                 return None, ""
 
         # --- Stage 2: Ensure the DOM is at least parsed ---
@@ -799,14 +1120,54 @@ class DeepWorker:
                 logger.info("[%s] Cloudflare challenge cleared after solver", job_id)
                 await publish_job_stage(job_id=job_id, url=url, stage="challenge", state="passed", detail="Cloudflare challenge cleared")
             else:
+                # Many sites (DDoS-guard wait screens, “Verification successful.
+                # Waiting for … to respond” interstitials) resolve on their own
+                # given a few seconds — a fixed 5s sleep gave up too early and
+                # captured the interstitial as if it were the page. Poll until
+                # the challenge clears (or the patience budget is spent).
                 logger.info("[%s] Challenge still present after solver — waiting for auto-resolve", job_id)
-                await asyncio.sleep(5.0)
+                _resolve_deadline = time.monotonic() + 15.0
+                _stuck_success_reloaded = False
+                while time.monotonic() < _resolve_deadline:
+                    await asyncio.sleep(3.0)
+                    if not await _is_cloudflare_challenge(page):
+                        logger.info("[%s] Challenge auto-resolved during wait", job_id)
+                        await publish_job_stage(job_id=job_id, url=url, stage="challenge", state="passed", detail="Challenge cleared (auto-resolve)")
+                        break
+                    # Transitional success screen: the body shows "Verification
+                    # successful. Waiting for … to respond" — verification has
+                    # ALREADY passed, but the title stays "Just a moment..." so
+                    # _is_cloudflare_challenge never turns False while the
+                    # client-side redirect sits unfired. Polling a dead page is
+                    # pointless: force one reload (cf_clearance is already in
+                    # the jar, so the reload passes straight through).
+                    if not _stuck_success_reloaded and await _cf_verification_success_stuck(page):
+                        _stuck_success_reloaded = True
+                        logger.info(
+                            "[%s] Verification passed but redirect never fired — forcing reload",
+                            job_id,
+                        )
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                            await asyncio.sleep(2.0)
+                        except Exception as reload_err:
+                            logger.warning("[%s] Stuck-success reload failed: %s", job_id, reload_err)
+                        if not await _is_cloudflare_challenge(page):
+                            logger.info("[%s] Challenge cleared after stuck-success reload", job_id)
+                            await publish_job_stage(job_id=job_id, url=url, stage="challenge", state="passed", detail="Challenge cleared (stuck-success reload)")
+                            break
+                else:
+                    logger.info("[%s] Challenge did not auto-resolve within patience budget", job_id)
 
         # --- Stage 5: Wait for JS-rendered content to settle ---
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            logger.debug("[%s] networkidle timed out — proceeding with current DOM", job_id)
+        # Skip the long settle when we already know the page is a challenge
+        # interstitial that never cleared — polling above already gave it time.
+        _still_interstitial = await _is_cloudflare_challenge(page)
+        if not _still_interstitial:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                logger.debug("[%s] networkidle timed out — proceeding with current DOM", job_id)
 
         # Wait for visible text to appear (catches SPAs that render after networkidle)
         try:
@@ -832,6 +1193,45 @@ class DeepWorker:
 
         # --- Camoufox fallback: if Patchright couldn't clear Cloudflare ---
         still_challenge = await _is_cloudflare_challenge(page)
+        # Last-chance Patchright recovery: verification may have passed right
+        # at the end of the patience window with cf_clearance already in the
+        # jar, but the interstitial never navigated away. One re-navigation
+        # is far cheaper than burning ~3 minutes of Camoufox fingerprint
+        # attempts against a challenge we already solved.
+        if still_challenge:
+            try:
+                _pr_cookies = await page.context.cookies()
+            except Exception:
+                _pr_cookies = []
+            if any(c.get("name") == "cf_clearance" for c in _pr_cookies):
+                logger.info(
+                    "[%s] cf_clearance present in Patchright cookie jar — "
+                    "re-navigating once before Camoufox fallback",
+                    job_id,
+                )
+                try:
+                    await page.goto(
+                        url, wait_until="domcontentloaded", timeout=timeout_ms,
+                    )
+                    await asyncio.sleep(3.0)
+                    still_challenge = await _is_cloudflare_challenge(page)
+                    if not still_challenge:
+                        logger.info(
+                            "[%s] Challenge cleared via cf_clearance re-navigation",
+                            job_id,
+                        )
+                        await publish_job_stage(
+                            job_id=job_id, url=url, stage="challenge",
+                            state="passed",
+                            detail="Challenge cleared (cf_clearance re-navigation)",
+                        )
+                        content = await page.content()
+                except Exception as renavig_err:
+                    logger.warning(
+                        "[%s] cf_clearance re-navigation failed: %s",
+                        job_id, renavig_err,
+                    )
+                    still_challenge = await _is_cloudflare_challenge(page)
         if still_challenge and HAS_CAMOUFOX:
             logger.info(
                 "[%s] Patchright unable to clear Cloudflare — trying Camoufox fallback",
@@ -845,7 +1245,10 @@ class DeepWorker:
                 # page — flag it loudly so downstream never mistakes it for a
                 # successful Camoufox capture (response=None normally means
                 # "Camoufox cleared the challenge").
-                if response is None and _html_has_cloudflare_challenge(content):
+                # _html_is_still_challenge_page also catches the transitional
+                # "Verification successful. Waiting for … to respond" screen
+                # that used to slip past the marker check and get stored.
+                if response is None and _html_is_still_challenge_page(content):
                     logger.error(
                         "[%s] Camoufox fallback FAILED — content is still the "
                         "challenge interstitial; job will be failed, not stored.",
@@ -912,12 +1315,44 @@ class DeepWorker:
                 detail=f"Camoufox stealth browser attempt {attempt + 1}/{max_retries}",
             )
 
-            try:                    # Access AsyncCamoufox via sys.modules at call time so
+            # Hard cap per attempt: 75s covers launch + 60s poll + settle.
+            # Without this, a single slow attempt can exhaust the 240s budget.
+            _attempt_cap = 75.0
+            # Hoisted so the finally block can always restore env vars,
+            # even when asyncio.timeout fires before _cam_env is applied.
+            _orig_environ: dict[str, str | None] = {}
+            try:
+                async with asyncio.timeout(_attempt_cap):
+                    # Access AsyncCamoufox via sys.modules at call time so
                     # monkeypatching in tests (and runtime hot-swap) takes effect.
                     import sys as _sys
                     _cam_mod = _sys.modules.get("camoufox.async_api")
                     _AsyncCamoufox = getattr(_cam_mod, "AsyncCamoufox") if _cam_mod else AsyncCamoufox
 
+                    # Ensure a reachable X display before the headful launch —
+                    # "Error: cannot open display: :99" means Xvfb died or was
+                    # never started; recover instead of burning an attempt.
+                    # The container entrypoint and Dockerfile both set
+                    # DISPLAY=:99, so this guard only skips when a caller
+                    # deliberately unset it (e.g. a headless-only environment).
+                    if os.environ.get("DISPLAY"):
+                        await self._xvfb_ensure(job_id)
+
+                    _cam_env = self._camoufox_env()
+                    for _env_key, _env_val in _cam_env.items():
+                        _orig_environ[_env_key] = os.environ.get(_env_key)
+                        os.environ[_env_key] = _env_val
+
+                    # headless=False on purpose: Camoufox must run HEADFUL over the
+                    # container's own Xvfb display (DISPLAY=:99) instead of native
+                    # headless (headless=True), which is the mode anti-bot engines
+                    # flag. The visible window paints into the virtual framebuffer,
+                    # never onto the host screen. Camoufox's own headless="virtual"
+                    # is NOT used either: it spawns its own Xvfb whose framebuffer is
+                    # 1x1 px on Linux (daijro/camoufox#458), so the real
+                    # window/compositor and GL surface are degenerate even though
+                    # Camoufox still spoofs the JS-visible screen metrics. Our own
+                    # Xvfb is a true 1920x1080 display.
                     async with _AsyncCamoufox(
                         headless=False,
                         humanize=True,
@@ -944,25 +1379,73 @@ class DeepWorker:
                             )
                             continue
 
-                    # Wait for Cloudflare to clear inside Camoufox
-                    # Call _is_cloudflare_challenge directly (not via
-                    # _wait_for_challenge_resolution) so that patched mocks
-                    # and runtime hot-swaps are always respected.
+                        # Wait for Cloudflare to clear inside Camoufox
+                        # Call _is_cloudflare_challenge directly (not via
+                        # _wait_for_challenge_resolution) so that patched mocks
+                        # and runtime hot-swaps are always respected.
+                        #
+                        # Stuck-success handling: when the interstitial shows
+                        # "Verification successful. Waiting for … to respond"
+                        # but its client-side redirect never fires, the poll
+                        # would otherwise time out on a page that has ALREADY
+                        # passed verification. Force a reload to trigger the
+                        # redirect, and fall back to harvesting cf_clearance
+                        # straight from the cookie jar.
                         cf_cleared = False
                         _poll_elapsed = 0.0
                         _poll_interval = 1.0
-                        _max_poll = 25.0
+                        _max_poll = 60.0
                         while _poll_elapsed < _max_poll:
                             await asyncio.sleep(_poll_interval)
                             _poll_elapsed += _poll_interval
                             if not await _is_cloudflare_challenge(cf_page):
                                 cf_cleared = True
                                 break
+                            if _poll_elapsed >= 10.0 and await _cf_verification_success_stuck(cf_page):
+                                logger.info(
+                                    "[%s] Camoufox attempt %d: verification passed but "
+                                    "page stuck — forcing reload",
+                                    job_id, attempt + 1,
+                                )
+                                try:
+                                    await cf_page.reload(
+                                        wait_until="domcontentloaded",
+                                        timeout=timeout_ms,
+                                    )
+                                    await asyncio.sleep(2.0)
+                                except Exception as reload_err:
+                                    logger.warning(
+                                        "[%s] Camoufox stuck-state reload failed: %s",
+                                        job_id, reload_err,
+                                    )
+                                if not await _is_cloudflare_challenge(cf_page):
+                                    cf_cleared = True
+                                    break
 
                         if not cf_cleared:
+                            # Second chance: verification may have completed right
+                            # at the end of the poll window — if cf_clearance is
+                            # already in the cookie jar, treat the attempt as a
+                            # success instead of burning it.
+                            try:
+                                camoufox_cookies = await cf_page.context.cookies()
+                            except Exception:
+                                camoufox_cookies = []
+                            if any(
+                                c.get("name") == "cf_clearance" for c in camoufox_cookies
+                            ):
+                                logger.info(
+                                    "[%s] Camoufox attempt %d: cf_clearance present in "
+                                    "cookie jar despite stuck page — treating as cleared",
+                                    job_id, attempt + 1,
+                                )
+                                cf_cleared = True
+
+                        if not cf_cleared:
+                            _stuck = await _cf_verification_success_stuck(cf_page)
                             logger.warning(
-                                "[%s] Camoufox attempt %d still on challenge page",
-                                job_id, attempt + 1,
+                                "[%s] Camoufox attempt %d still on challenge page (stuck_success=%s)",
+                                job_id, attempt + 1, _stuck,
                             )
                             thin_content = await cf_page.content()
                             if len(thin_content) > len(best_content):
@@ -999,7 +1482,7 @@ class DeepWorker:
                                     job_id,
                                 )
 
-                    # Wait for content to settle
+                        # Wait for content to settle
                         try:
                             await cf_page.wait_for_load_state(
                                 "networkidle", timeout=15_000,
@@ -1011,14 +1494,14 @@ class DeepWorker:
                         camoufox_content = await cf_page.content()
                         camoufox_cookies = await cf_page.context.cookies()
 
-                    # Find cf_clearance cookie for transfer
+                        # Find cf_clearance cookie for transfer
                         clearance_cookie = next(
                             (cookie for cookie in camoufox_cookies if cookie.get("name") == "cf_clearance"),
                             None,
                         )
 
                         if clearance_cookie:
-                        # Transfer cookies to Patchright and re-navigate
+                            # Transfer cookies to Patchright and re-navigate
                             logger.info(
                                 "[%s] Transferring cf_clearance cookie to Patchright",
                                 job_id,
@@ -1036,7 +1519,7 @@ class DeepWorker:
                                 best_response = response
                                 continue
 
-                        # Re-navigate with Patchright using the transferred cookie
+                            # Re-navigate with Patchright using the transferred cookie
                             try:
                                 renav_response = await patchright_page.goto(
                                     url, wait_until="domcontentloaded",
@@ -1065,19 +1548,68 @@ class DeepWorker:
                                     job_id, renav_err,
                                 )
 
-                    # No clearance cookie or re-nav failed — use Camoufox content
-                        best_content = camoufox_content
+                        # No clearance cookie or re-nav failed — use Camoufox content.
                         # Camoufox content is captured from a successful page;
                         # the initial Patchright response may still be 403.
+                        best_content = camoufox_content
                         best_response = None
                         break
+
+            except TimeoutError:
+                logger.warning(
+                    "[%s] Camoufox attempt %d exceeded %.0fs cap — moving to next attempt",
+                    job_id, attempt + 1, _attempt_cap,
+                )
+                continue
 
             except Exception as cam_err:
                 logger.error(
                     "[%s] Camoufox attempt %d error: %s",
                     job_id, attempt + 1, cam_err,
                 )
+                _cam_err = str(cam_err)
+
+                # A missing browser binary is repaired at container/worker
+                # start, never here: fetching a browser takes minutes and is
+                # charged to THIS job's page budget, which is how a crawl ends
+                # on "page budget exceeded" with nothing stored. Only repair
+                # when the job can clearly afford it.
+                if "not installed" in _cam_err or "not found in cache" in _cam_err:
+                    remaining = _remaining_message_budget()
+                    if remaining is not None and remaining <= (
+                        CAMOUFOX_REPAIR_TIMEOUT_SECONDS + 30.0
+                    ):
+                        logger.error(
+                            "[%s] Camoufox browser missing and only %.0fs of the "
+                            "page budget left — skipping the stealth fallback "
+                            "instead of spending the budget on a browser download",
+                            job_id,
+                            remaining,
+                        )
+                        break
+                    if not await ensure_camoufox_browser(job_id):
+                        break
+                    logger.info(
+                        "[%s] Camoufox browser repaired — retrying stealth fallback",
+                        job_id,
+                    )
+                    continue
+
+                # Environment failures (no X display, sandbox EPERM): retrying
+                # with a fresh fingerprint cannot fix a broken container, but
+                # the Xvfb/D-Bus recovery above may have healed it — allow ONE
+                # retry, then stop.
+                if "cannot open display" in _cam_err and attempt >= 1:
+                    break
                 continue
+
+            finally:
+                # Restore any env vars we overrode for the Camoufox launch.
+                for _env_key, _env_val in _orig_environ.items():
+                    if _env_val is None:
+                        os.environ.pop(_env_key, None)
+                    else:
+                        os.environ[_env_key] = _env_val
 
         return best_response, best_content
 
@@ -1127,6 +1659,9 @@ class DeepWorker:
             response, content = await self._navigate_and_solve(
                 page, url, job_id, timeout_ms, credentials, portal_config
             )
+            # Pick up the navigation error (if any) stashed by
+            # _navigate_and_solve BEFORE the retry loop below can overwrite it.
+            navigation_error: str | None = self._navigation_errors.pop(job_id, None)
             # A None response with substantial content is the explicit signal
             # that the content came from the successful Camoufox fallback.
             used_camoufox_content = response is None and len(content) > 500
@@ -1136,8 +1671,6 @@ class DeepWorker:
             # a FAILED fetch, not a success. Treating it as HTTP 200 made the
             # UI show the site as green "Passed" even though nothing was ever
             # loaded (the onion-link bug).
-            raw_nav_error = payload.get("_navigation_error")
-            navigation_error: str | None = str(raw_nav_error) if raw_nav_error else None
             if response is not None:
                 status_code = int(response.status)
             elif used_camoufox_content:
@@ -1172,7 +1705,9 @@ class DeepWorker:
                     )
                 except Exception as retry_err:
                     logger.error("[%s] Retry navigation failed: %s", job_id, retry_err)
-                    payload["_navigation_error"] = f"Retry navigation failed: {retry_err}"
+                    self._navigation_errors[job_id] = (
+                        f"Retry navigation failed: {retry_err}"
+                    )
                     break
                 await self._humanize(page)
                 await asyncio.sleep(4.0)
@@ -1549,6 +2084,181 @@ async def save_to_minio(
 # Message Processing
 # =========================================================================
 
+# =========================================================================
+# Non-HTML content (PDF / DOCX / audio)
+# =========================================================================
+
+_DEEP_INGEST_HTTP: httpx.AsyncClient | None = None
+_DEEP_INGEST_TOR: httpx.AsyncClient | None = None
+
+
+def _ingest_client(is_onion: bool) -> httpx.AsyncClient:
+    """Cached client for binary ingestion (Tor for .onion, plain otherwise).
+
+    Reuses the shared Tor client builder so dark targets go through the same
+    Tor configuration as the dark worker rather than a bespoke one.
+    """
+    global _DEEP_INGEST_HTTP, _DEEP_INGEST_TOR
+    if is_onion:
+        if _DEEP_INGEST_TOR is None:
+            from app.services.tor_http_client import build_tor_http_client
+
+            _DEEP_INGEST_TOR = build_tor_http_client(
+                proxy_url=settings.tor_proxy_url,
+                max_connections=4,
+                connect_timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+                read_timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+                write_timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+                pool_timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+            )
+        return _DEEP_INGEST_TOR
+    if _DEEP_INGEST_HTTP is None:
+        _DEEP_INGEST_HTTP = httpx.AsyncClient(
+            headers=ContentIngestionService.ingestion_headers(),
+            follow_redirects=True,
+            timeout=settings.INGESTION_FETCH_TIMEOUT_SECONDS,
+            trust_env=False,
+        )
+    return _DEEP_INGEST_HTTP
+
+
+async def process_non_html_content(
+    producer: AIOKafkaProducer,
+    request: CrawlRequest,
+    item_id: str,
+    kind: ContentKind,
+) -> None:
+    """Ingest PDF/DOCX/audio without starting a browser.
+
+    PDF/DOCX are converted by the shared ContentIngestionService and emitted as
+    a ParsedItem (deep's existing contract — it publishes crawl.parsed
+    directly). Audio is handed off to the transcribe-worker, exactly as
+    surface/dark do.
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    _host = (_urlparse(request.url).hostname or "").lower()
+    is_onion = _host.endswith((".onion", ".i2p"))
+    network = "dark" if is_onion else "surface"
+
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="fetching", state="active",
+        item_id=item_id, detail=f"non_html:{kind.value}",
+    )
+
+    if kind is ContentKind.AUDIO:
+        handed_off = await ContentIngestionService.hand_off_audio(
+            producer,
+            job_id=request.job_id,
+            item_id=item_id,
+            url=request.url,
+            language=request.language,
+            worker_type=WORKER_TYPE,
+            network=network,
+        )
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            "audio_handoff", "passed" if handed_off else "failed", request.retry_count,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished",
+            state="passed" if handed_off else "failed", item_id=item_id,
+            detail="audio handed off for transcription",
+        )
+        return
+
+    try:
+        ingestion = await ContentIngestionService.fetch_and_extract(
+            _ingest_client(is_onion), request.url
+        )
+    except Exception as exc:
+        logger.warning("[%s] Non-HTML ingestion failed for %s: %s", request.job_id, request.url, exc)
+        await pg_client.record_crawl_log(
+            request.job_id, item_id, request.url, WORKER_TYPE,
+            f"ingest_{kind.value}_failed", "failed", request.retry_count,
+        )
+        await publish_job_stage(
+            job_id=request.job_id, url=request.url, stage="site_finished", state="failed",
+            item_id=item_id, detail=f"{kind.value} ingestion failed",
+        )
+        return
+
+    extracted_text = ingestion.text
+    detected_language = detect_language_from_text(extracted_text, request.language)
+
+    # Folder layout: <site>/<JobID>_<ItemID>.<ext>, so the Storage page can
+    # list one site with a prefix instead of scanning the whole bucket. The raw
+    # object holds the ORIGINAL bytes (a real .pdf/.docx) — storing the text we
+    # just extracted under a .html name meant the raw bucket held no raw
+    # anything, and re-reading the file meant re-fetching it from the origin.
+    site = site_from_url(request.url)
+    raw_ref = await RAW_STORE.store(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        payload=ingestion.raw_bytes,
+        content_type=ingestion.content_type,
+        site=site,
+    )
+    parsed_object = parsed_name(WORKER_TYPE, request.job_id, item_id, site)
+    raw_object = raw_ref.object_name if raw_ref else raw_name(
+        WORKER_TYPE, request.job_id, item_id, site, raw_suffix(
+            url=ingestion.final_url, content_type=ingestion.content_type,
+            payload=ingestion.raw_bytes,
+        )
+    )
+
+    parsed_data = ParsedItemData(
+        extracted_text=extracted_text,
+        character_count=len(extracted_text),
+        original_status_code=ingestion.status_code,
+        detected_language=detected_language,
+        payload_size_bytes=ingestion.payload_size_bytes,
+        requested_language=request.language,
+        content_kind=ingestion.kind.value,
+    )
+    parsed_item = ParsedItem(
+        job_id=request.job_id,
+        item_id=item_id,
+        url=ingestion.final_url,
+        worker=WORKER_TYPE,
+        language=detected_language,
+        data=parsed_data.model_dump(),
+        status="completed",
+    )
+    parsed_bytes = parsed_item.model_dump_json().encode("utf-8")
+    await save_to_minio(PARSED_BUCKET, parsed_object, parsed_bytes)
+    await pg_client.system_pool.execute(
+        "UPDATE parsed_items SET raw_html_path = $1, parsed_json_path = $2 WHERE item_id = $3",
+        raw_ref.path if raw_ref else f"s3://{RAW_BUCKET}/{raw_object}",
+        f"s3://{PARSED_BUCKET}/{parsed_object}",
+        item_id,
+    )
+    if raw_ref is not None:
+        await record_raw_metadata(item_id, raw_ref)
+    await producer.send_and_wait(
+        PRODUCE_TOPIC, value=parsed_bytes, key=request.job_id.encode("utf-8")
+    )
+    await pg_client.record_crawl_log(
+        request.job_id, item_id, ingestion.final_url, WORKER_TYPE,
+        f"{ingestion.kind.value}_extracted", "completed", request.retry_count,
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="parsing", state="passed",
+        item_id=item_id,
+        detail=f"{ingestion.kind.value} extracted ({ingestion.payload_size_bytes} bytes)",
+    )
+    await publish_job_stage(
+        job_id=request.job_id, url=request.url, stage="site_finished", state="passed",
+        item_id=item_id, detail=f"{ingestion.kind.value} extracted",
+    )
+    logger.info(
+        "[%s] Extracted %s for %s (%d chars)",
+        request.job_id, ingestion.kind.value, request.url, len(extracted_text),
+    )
+
+
 async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> None:
     """Processes a single crawl request through the browser rendering pipeline."""
     try:
@@ -1562,7 +2272,29 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
         return
 
     if request.worker_type != WORKER_TYPE:
+        logger.debug(
+            "Skipping job %s — worker_type='%s' != '%s'",
+            request.job_id, request.worker_type, WORKER_TYPE,
+        )
         return
+
+    # --- Pause gate ---
+    # Wait rather than skip: discarding the message would lose this page.
+    await _wait_while_paused(request.job_id)
+
+    # --- Dedup: skip jobs already completed (prevents re-processing on worker restart)
+    # Mirrors surface/dark: with auto_offset_reset="earliest" a restarted worker
+    # replays every message, so finished jobs must be skipped without re-rendering.
+    try:
+        existing_job = await pg_client.get_job(request.job_id)
+        if existing_job and existing_job["status"] in ("completed", "failed", "skipped"):
+            logger.info(
+                "Skipping already-%s job %s for %s (depth=%d) — no re-render",
+                existing_job["status"], request.job_id, request.url, request.depth,
+            )
+            return
+    except Exception as dedup_err:
+        logger.debug("Job status check failed (non-fatal): %s", dedup_err)
 
     if _browser_context is None:
         logger.error(
@@ -1613,6 +2345,15 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
     )
 
     _is_dark_web = any(_hostname.endswith(s) for s in (".onion", ".i2p", ".loki", ".zeronet"))
+
+    # --- Multi-format content: PDF / DOCX / audio are not rendered HTML ---
+    # A browser is pointless for a binary payload, so this is handled by the
+    # same shared ingestion service surface/dark use, before any browser work.
+    _content_kind = ContentIngestionService.classify_url(request.url)
+    if _content_kind is not ContentKind.HTML:
+        await process_non_html_content(producer, request, item_id, _content_kind)
+        return
+
     _job_context = _browser_context
 
     if _is_dark_web and shared_proxy_manager.is_active:
@@ -1943,15 +2684,26 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
 
     # A captured challenge interstitial is NOT article content. Persisting it
     # would store "Just a moment..." as a parsed item, so fail the job instead.
-    # We check the *visible text* for interstitial phrases (not raw-HTML
-    # structural markers) so thin login pages that legitimately embed a
-    # Turnstile widget are not misclassified.
-    # NOTE: no length cap here. Challenge pages include long help text ("Why is
-    # this verification taking longer?", "What to do next?", ...) that can push
-    # them well past 500 chars — the earlier cap let an 813-char interstitial
-    # through and got published as a completed item. The title check below
-    # guards against false positives from pages that legitimately quote these
-    # phrases, since a real interstitial always ships the challenge <title>.
+    #
+    # Two independent signals, because neither is sufficient alone:
+    #
+    #  - Structural (locale-independent). The challenge page ships the Turnstile
+    #    runtime and the challenge-platform script. Those are present only while
+    #    the challenge is actually running, in every language, which matters
+    #    because Camoufox randomizes the browser locale: on a de-DE profile the
+    #    interstitial is titled "Nur einen Moment…" and every English text
+    #    marker can be absent or translated.
+    #  - Textual (English). Used when the structural markers are gone but the
+    #    visible text still reads like an interstitial.
+    #
+    # The English-only title veto below is deliberately NOT applied to the
+    # structural signal: requiring an English challenge title let a localized
+    # interstitial through and published it as a completed item.
+    _structural_challenge = _html_is_challenge_interstitial(html)
+
+    # NOTE: no length cap on the text check. Challenge pages include long help
+    # text ("Why is this verification taking longer?", ...) that pushes them well
+    # past 500 chars — the earlier cap let an 813-char interstitial through.
     _text_lower = (extracted_text or "").lower()
     _interstitial = any(
         marker in _text_lower
@@ -1962,18 +2714,35 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
             "checking your browser",
             "enable javascript and cookies to continue",
             "why is this verification taking longer",
+            # Localized Cloudflare interstitial titles. Camoufox picks the
+            # browser locale per attempt, so an English-only title check is not
+            # a reliable "this is a real page" signal.
+            "nur einen moment",
+            "un instant",
+            "un momento",
+            "attendi solo un momento",
+            "een moment",
+            "只需片刻",
         )
     )
-    if _interstitial:
+    if _interstitial and not _structural_challenge:
         _title_lower = (title or "").lower()
-        _challenge_title = (
-            "just a moment" in _title_lower
-            or "attention required" in _title_lower
-            or "one more step" in _title_lower
+        _challenge_title = any(
+            marker in _title_lower
+            for marker in (
+                "just a moment",
+                "attention required",
+                "one more step",
+                "nur einen moment",
+                "un instant",
+                "un momento",
+                "attendi solo un momento",
+                "een moment",
+            )
         )
         # The <title> on a challenge page is always the interstitial boilerplate
-        # ("Just a moment..." etc.) — require it to avoid misclassifying an
-        # article that merely quotes these phrases in its body text.
+        # — require it to avoid misclassifying an article that merely quotes
+        # these phrases in its body text.
         if not _challenge_title:
             logger.warning(
                 "[%s] Interstitial marker found in text but page title %r is not "
@@ -1981,6 +2750,18 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
                 request.job_id, title,
             )
             _interstitial = False
+
+    if _structural_challenge:
+        # The challenge runtime is still on the page, whatever language it is
+        # rendered in. This wins over the title veto above.
+        _interstitial = True
+        logger.error(
+            "[%s] Captured HTML still carries the Cloudflare challenge runtime "
+            "(_cf_chl_opt / challenges.cloudflare.com) — this is the interstitial, "
+            "not article content (title was %r).",
+            request.job_id, title,
+        )
+
     if _interstitial:
         logger.error(
             "[%s] Captured page is still a Cloudflare challenge interstitial after "
@@ -2084,8 +2865,9 @@ async def process_request(producer: AIOKafkaProducer, message_value: bytes) -> N
             logger.debug("Fingerprint storage failed (non-fatal): %s", fp_err)
 
     # --- Upload raw HTML and parsed JSON to MinIO (consistent naming) ---
-    raw_object = raw_name(WORKER_TYPE, request.job_id, resolved_item_id)
-    parsed_object = parsed_name(WORKER_TYPE, request.job_id, resolved_item_id)
+    site = site_from_url(request.url)
+    raw_object = raw_name(WORKER_TYPE, request.job_id, resolved_item_id, site)
+    parsed_object = parsed_name(WORKER_TYPE, request.job_id, resolved_item_id, site)
 
     await save_to_minio(RAW_BUCKET, raw_object, html.encode("utf-8"), "text/html; charset=utf-8")
 
@@ -2191,6 +2973,17 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
     """
     failed_reason: str | None = None
     async with _semaphore:
+        # Publish this message's page-budget deadline so optional work (such as
+        # a Camoufox browser repair) can tell how much time the job has left
+        # instead of silently spending the whole budget on itself.
+        deadline_token = _message_deadline.set(
+            time.monotonic() + settings.DEEP_MESSAGE_BUDGET_SECONDS
+        )
+        # Tag the async context with the job id so third-party/browser log lines
+        # without an explicit [JOBxxx] marker still stream to that job's console
+        # (mirrors surface/dark, which set the tag for the whole request).
+        _ctx_job_id, _ = extract_job_context(message_value)
+        job_tag_token = set_current_job_id(_ctx_job_id) if _ctx_job_id else None
         try:
             await asyncio.wait_for(
                 process_request(producer, message_value),
@@ -2227,6 +3020,9 @@ async def process_message_safely(producer: AIOKafkaProducer, message_value: byte
                     failed_reason,
                 )
         finally:
+            _message_deadline.reset(deadline_token)
+            if job_tag_token is not None:
+                reset_current_job_id(job_tag_token)
             await complete_job_task_from_message(
                 message_value,
                 worker_type=WORKER_TYPE,
@@ -2354,6 +3150,10 @@ async def main() -> None:
         port=int(os.getenv("HEALTH_PORT", "8080")),
     )
     await health_server.start()
+    # Metrics server matching surface/dark: exposes consumed-count so the
+    # monitoring dashboard sees the deep worker like every other worker.
+    metrics = WorkerMetrics(worker_name="deep", topic=CONSUME_TOPIC)
+    await metrics.start()
 
     # Stream any [JOBxxx]-tagged log line to the UI console over Redis pub/sub.
     install_job_log_relay()
@@ -2403,6 +3203,22 @@ async def main() -> None:
         logger.error("Browser launch failed — worker cannot process jobs. Error: %s", exc)
         raise
 
+    # --- Step 4: Camoufox fallback browser ---
+    # Verified before the worker accepts traffic so a missing browser is
+    # reported once at startup instead of surfacing inside a job as an opaque
+    # "page budget exceeded" after a doomed download.
+    if HAS_CAMOUFOX:
+        if await ensure_camoufox_browser("startup"):
+            logger.info("Camoufox stealth fallback ready (%s).", camoufox_browser_path())
+        else:
+            logger.warning(
+                "Camoufox stealth fallback UNAVAILABLE — Cloudflare challenges "
+                "Patchright cannot clear will fail. Rebuild the deep-worker image "
+                "so the browser is baked in."
+            )
+    else:
+        logger.warning("Camoufox package not importable — stealth fallback disabled.")
+
     logger.info(
         "Deep worker ONLINE — listening on topic '%s' (group=%s, concurrency=%d).",
         CONSUME_TOPIC,
@@ -2440,6 +3256,7 @@ async def main() -> None:
 
     try:
         async for msg in consumer:
+            metrics.record_consumed()
             task_ctx = contextvars.copy_context()
             task = asyncio.create_task(process_message_safely(producer, msg.value), context=task_ctx)
             tasks.add(task)
@@ -2452,6 +3269,7 @@ async def main() -> None:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await metrics.stop()
         await consumer.stop()
         await producer.stop()
         await shutdown_browser()

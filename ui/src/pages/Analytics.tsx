@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import type { FormEvent } from "react"
 import { useNavigate } from "react-router-dom"
+import { SelectFilter } from "../components/SelectFilter"
+import { useAutoRefresh } from "../useAutoRefresh"
 import {
-  Activity,
   BarChart3,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   ClipboardCheck,
   Loader2,
   Network,
-  RefreshCw,
   ShieldAlert,
 } from "lucide-react"
 import { api, ApiError } from "../api"
@@ -23,12 +25,22 @@ import type {
   EntitySummaryResponse,
   EvaluationResponse,
   MetricsResponse,
-  PerformanceResponse,
   ThreatAnalyticsResponse,
   ThreatRecentRow,
 } from "../types"
-import { cn, formatNumber } from "../utils"
-import { CopyButton, ErrorBanner, LoadingBlock, PageHeader, WorkerBadge } from "../components/ui"
+import { cn, formatNumber, humanize } from "../utils"
+import {
+  CopyButton,
+  ErrorBanner,
+  LoadingBlock,
+  Msg,
+  PageHeader,
+} from "../components/ui"
+
+/** Percentage for a 0..1 ratio, or "--" when the backend has no value. */
+function pct(v: number | null | undefined): string {
+  return v === null || v === undefined ? "--" : `${(v * 100).toFixed(1)}%`
+}
 
 const DIMENSIONS = [
   { key: "source_type", title: "Source type", tone: "bg-sky-500" },
@@ -42,17 +54,6 @@ const SEVERITY_STYLES: Record<number, string> = {
   3: "border border-amber-500/40 bg-amber-500/10 text-amber-500",
   4: "border border-orange-500/40 bg-orange-500/10 text-orange-500",
   5: "border border-rose-500/40 bg-rose-500/10 text-rose-500",
-}
-
-function pct(v: number | null | undefined): string {
-  return v === null || v === undefined ? "--" : `${(v * 100).toFixed(1)}%`
-}
-
-function formatBytes(bytes: number | null): string {
-  if (bytes === null || Number.isNaN(bytes)) return "--"
-  if (bytes < 1024) return `${Math.round(bytes)} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
 function MetricBar({ value, tone }: { value: number | null; tone: string }) {
@@ -80,6 +81,17 @@ function SeverityBadge({ severity }: { severity: number }) {
   )
 }
 
+type AnalyticsSection = "threats" | "entities"
+
+/** Section switcher, top right of the page header. */
+const ANALYTICS_SECTIONS: { key: AnalyticsSection; label: string }[] = [
+  { key: "threats", label: "Threat analytics" },
+  { key: "entities", label: "Entity intelligence" },
+]
+
+/** Rows per page in the flagged-content list. */
+const THREAT_PAGE_SIZE = 50
+
 export default function Analytics() {
   const { session } = useAuth()
   const navigate = useNavigate()
@@ -92,15 +104,21 @@ export default function Analytics() {
   const [threatsLoading, setThreatsLoading] = useState(true)
   const [threatsError, setThreatsError] = useState<string | null>(null)
 
+  // Which single section to render. The page used to stack all of them, which
+  // meant a lot of scrolling before reaching any one.
+  const [section, setSection] = useState<AnalyticsSection>("threats")
+  // Server-side paging for the flagged-content list.
+  const [threatPage, setThreatPage] = useState(0)
+  const [filterCategory, setFilterCategory] = useState("")
+  const [filterSeverity, setFilterSeverity] = useState("")
+  const [filterSource, setFilterSource] = useState("")
+
   const [entities, setEntities] = useState<EntitySummaryResponse | null>(null)
   const [entitiesLoading, setEntitiesLoading] = useState(true)
   const [entitiesError, setEntitiesError] = useState<string | null>(null)
   const [mentions, setMentions] = useState<EntityMentionsResponse | null>(null)
   const [mentionsLoading, setMentionsLoading] = useState(false)
 
-  const [performance, setPerformance] = useState<PerformanceResponse | null>(null)
-  const [perfLoading, setPerfLoading] = useState(true)
-  const [perfError, setPerfError] = useState<string | null>(null)
 
   const [itemId, setItemId] = useState("")
   const [jobId, setJobId] = useState("")
@@ -132,7 +150,15 @@ export default function Analytics() {
   const loadThreats = useCallback(async () => {
     setThreatsLoading(true)
     try {
-      setThreats(await api.getThreatAnalytics())
+      setThreats(
+        await api.getThreatAnalytics({
+          offset: threatPage * THREAT_PAGE_SIZE,
+          limit: THREAT_PAGE_SIZE,
+          category: filterCategory || undefined,
+          severity: filterSeverity ? Number(filterSeverity) : undefined,
+          source_type: filterSource || undefined,
+        }),
+      )
       setThreatsError(null)
     } catch (e) {
       setThreatsError(
@@ -146,7 +172,7 @@ export default function Analytics() {
     } finally {
       setThreatsLoading(false)
     }
-  }, [])
+  }, [threatPage, filterCategory, filterSeverity, filterSource])
 
   const loadEntities = useCallback(async () => {
     setEntitiesLoading(true)
@@ -178,31 +204,19 @@ export default function Analytics() {
     }
   }, [])
 
-  const loadPerformance = useCallback(async () => {
-    setPerfLoading(true)
-    try {
-      setPerformance(await api.getPerformance())
-      setPerfError(null)
-    } catch (e) {
-      setPerfError(
-        e instanceof ApiError && e.status === 503
-          ? "Analytics database unavailable - is ClickHouse running?"
-          : e instanceof Error
-            ? e.message
-            : "Failed to load system performance",
-      )
-      setPerformance(null)
-    } finally {
-      setPerfLoading(false)
-    }
-  }, [])
 
   useEffect(() => {
     void loadMetrics()
-    void loadThreats()
-    void loadPerformance()
-    void loadEntities()
-  }, [loadMetrics, loadThreats, loadPerformance, loadEntities])
+    // Only fetch the section on screen. The old page loaded everything on
+    // mount, which is most of the reason it felt slow.
+    if (section === "threats") void loadThreats()
+    if (section === "entities") void loadEntities()
+  }, [loadMetrics, loadThreats, loadEntities, section])
+
+  // Refresh the visible section every 5s; no manual refresh button anywhere.
+  useAutoRefresh({ load: loadThreats, enabled: section === "threats" })
+  useAutoRefresh({ load: loadEntities, enabled: section === "entities" })
+  useAutoRefresh({ load: loadMetrics })
 
   useEffect(() => {
     setEvaluatedBy(session?.user.username ?? "")
@@ -214,11 +228,11 @@ export default function Analytics() {
     setSuccess(null)
 
     if (!itemId.trim() || !jobId.trim() || !evaluatedBy.trim()) {
-      setFormError("Item ID, Job ID and evaluator name are required.")
+      setFormError("Fill in Item ID, Job ID and evaluator name.")
       return
     }
     if (!sourceType || !topic || !category) {
-      setFormError("Please select expected source type, topic and category.")
+      setFormError("Choose the source type, topic and category.")
       return
     }
 
@@ -240,20 +254,13 @@ export default function Analytics() {
           "No model analysis found for this item/job pair. The llm-worker must analyze it first.",
         )
       } else if (err instanceof ApiError && err.status === 503) {
-        setFormError("Analytics database unavailable - is ClickHouse running?")
+        setFormError("Reports are unavailable right now. Try again soon.")
       } else {
-        setFormError(err instanceof Error ? err.message : "Failed to record evaluation")
+        setFormError(err instanceof Error ? err.message : "Could not save this.")
       }
     } finally {
       setSubmitting(false)
     }
-  }
-
-  const refreshAll = () => {
-    void loadMetrics()
-    void loadThreats()
-    void loadPerformance()
-    void loadEntities()
   }
 
   const fillEvaluation = (row: ThreatRecentRow) => {
@@ -273,15 +280,78 @@ export default function Analytics() {
     ? Math.max(1, ...threats.by_severity.map((s) => s.count))
     : 1
 
+  // Filter options come from the facets the endpoint returns, so the dropdowns
+  // only ever offer values that are actually present.
+  const categoryOptions = useMemo(
+    () => [
+      { value: "", label: "All" },
+      ...(threats?.categories ?? []).map((c) => ({ value: c, label: humanize(c) })),
+    ],
+    [threats],
+  )
+  const sourceOptions = useMemo(
+    () => [
+      { value: "", label: "All" },
+      ...(threats?.sources ?? []).map((s) => ({ value: s, label: humanize(s) })),
+    ],
+    [threats],
+  )
+  const severityOptions = useMemo(() => {
+    const counts = new Map(
+      (threats?.by_severity ?? []).map((s) => [String(s.severity), s.count]),
+    )
+    return [
+      { value: "", label: "All" },
+      ...[1, 2, 3, 4, 5].map((level) => ({
+        value: String(level),
+        label: `Level ${level}`,
+        count: counts.get(String(level)) ?? 0,
+      })),
+    ]
+  }, [threats])
+
+  // Any filter change restarts at page 1: a page-5 offset applied to a newly
+  // narrowed result set would show the middle of the filtered rows and read as
+  // "the filter deleted my data".
+  const applyFilter = (
+    setter: (v: string) => void,
+  ) => (value: string) => {
+    setter(value)
+    setThreatPage(0)
+  }
+
+  const threatTotal = threats?.total ?? 0
+  const threatFrom = threatTotal === 0 ? 0 : threatPage * THREAT_PAGE_SIZE + 1
+  const threatTo = threatPage * THREAT_PAGE_SIZE + (threats?.recent.length ?? 0)
+
   return (
     <div>
       <PageHeader
         title="Analytics & evaluation"
         actions={
-          <button type="button" className="btn-secondary" onClick={refreshAll}>
-            <RefreshCw className="h-4 w-4" />
-            Refresh all
-          </button>
+          <div
+            className="flex rounded-lg border border-slate-800 bg-slate-900/60 p-1"
+            role="tablist"
+            aria-label="Analytics section"
+          >
+            {ANALYTICS_SECTIONS.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                role="tab"
+                aria-selected={section === s.key}
+                onClick={() => setSection(s.key)}
+                className={cn(
+                  "cursor-pointer rounded-md px-3 py-1.5 text-xs font-medium transition",
+                  section === s.key
+                    ? "bg-sky-500/20 text-sky-400"
+                    : "text-slate-400 hover:text-slate-200",
+                )}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
         }
       />
 
@@ -328,11 +398,36 @@ export default function Analytics() {
               );
             })}
           </div>
+          <p className="mb-2 text-xs text-slate-600">
+            Based on{" "}
+            <span className="font-medium text-slate-400">
+              {metrics.coverage?.labeled_items ?? 0}
+            </span>{" "}
+            human-labelled item
+            {(metrics.coverage?.labeled_items ?? 0) === 1 ? "" : "s"} out of{" "}
+            {(metrics.coverage?.total_analyzed_items ?? 0).toLocaleString()} analysed
+            {metrics.coverage?.labeled_items ? (
+              <>
+                {" "}
+                ({" "}
+                {(
+                  ((metrics.coverage.labeled_items /
+                    Math.max(metrics.coverage.total_analyzed_items, 1)) *
+                  100
+                ).toFixed(1)
+                )}
+                % sampled )
+              </>
+            ) : (
+              " — label some items above to get a first reading."
+            )}
+          </p>
           <p className="mb-8 text-xs text-slate-600">{metrics.note}</p>
         </>
       ) : null}
 
       {/* ---------------- Threat intelligence ---------------- */}
+      {section === "threats" && (
       <section className="mb-10">
         <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
           <ShieldAlert className="h-5 w-5 text-rose-400" />
@@ -360,7 +455,10 @@ export default function Analytics() {
           ) : (
             <>
               <div className="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
-                <div className="card p-5">
+                {/* justify-center: this card is one short number next to a much
+                    taller severity chart, so it keeps the shared height without
+                    leaving its value stranded at the top of an empty box. */}
+                <div className="card flex flex-col justify-center p-5">
                   <p className="text-[11px] tracking-wider text-slate-500 uppercase">
                     Total classified items
                   </p>
@@ -402,7 +500,7 @@ export default function Analytics() {
                 </div>
               </div>
 
-              <div className="card overflow-x-auto p-0">
+              <div className="card table-scroll p-0">
                 <table className="w-full min-w-[720px] text-left text-sm">
                   <thead>
                     <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
@@ -413,10 +511,10 @@ export default function Analytics() {
                   <tbody>
                     {threats.by_category.map((c) => (
                       <tr key={c.category} className="border-b border-slate-800/60 last:border-0">
-                        <td className="px-4 py-2.5 capitalize text-slate-200">
+                        <td data-label="Category" className="px-4 py-2.5 capitalize text-slate-200">
                           {c.category.replace(/_/g, " ")}
                         </td>
-                        <td className="px-4 py-2.5 tabular-nums text-slate-300">
+                        <td data-label="Items" className="px-4 py-2.5 tabular-nums text-slate-300">
                           {formatNumber(c.count)}
                         </td>
                       </tr>
@@ -425,12 +523,68 @@ export default function Analytics() {
                 </table>
               </div>
 
-              <div className="card mt-6 overflow-x-auto p-0">
-                <div className="flex items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
-                  <span className="text-sm font-semibold text-slate-200">Recent flagged content</span>
+              <div className="card mt-6 table-scroll p-0">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
+                  <span className="text-sm font-semibold text-slate-200">Flagged content</span>
                   <span className="text-[11px] text-slate-500">
                     Click a row to view parsed content, or Evaluate to fill the form below
                   </span>
+                </div>
+
+                {/* Filters + paging. One dropdown each, no apply button. */}
+                <div className="flex flex-wrap items-center gap-2 border-b border-slate-800/60 px-4 py-2.5">
+                  <SelectFilter
+                    label="Category"
+                    value={filterCategory}
+                    options={categoryOptions}
+                    onChange={applyFilter(setFilterCategory)}
+                    className="w-44"
+                    allLabel="All"
+                  />
+                  <SelectFilter
+                    label="Severity"
+                    value={filterSeverity}
+                    options={severityOptions}
+                    onChange={applyFilter(setFilterSeverity)}
+                    className="w-36"
+                    allLabel="All"
+                  />
+                  <SelectFilter
+                    label="Source"
+                    value={filterSource}
+                    options={sourceOptions}
+                    onChange={applyFilter(setFilterSource)}
+                    className="w-36"
+                    allLabel="All"
+                  />
+
+                  <div className="ml-auto flex items-center gap-2">
+                    <span className="text-[11px] tabular-nums text-slate-500">
+                      {threatTotal === 0
+                        ? "No matching items"
+                        : `Showing ${formatNumber(threatFrom)}-${formatNumber(threatTo)} of ${formatNumber(threatTotal)}`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setThreatPage((p) => Math.max(0, p - 1))}
+                      disabled={threatPage === 0}
+                      className="btn-secondary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                      title="Previous page"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                      Prev
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setThreatPage((p) => p + 1)}
+                      disabled={!threats?.has_more}
+                      className="btn-secondary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                      title="Next page"
+                    >
+                      Next
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 </div>
                 <table className="w-full min-w-[900px] text-left text-sm">
                   <thead>
@@ -452,20 +606,20 @@ export default function Analytics() {
                         title="View parsed content in storage"
                         className="cursor-pointer border-b border-slate-800/60 last:border-0 hover:bg-slate-900/40"
                       >
-                        <td className="px-4 py-2.5">
+                        <td data-label="Item" className="px-4 py-2.5">
                           <span className="font-mono text-xs text-sky-600">{row.item_id}</span>
                         </td>
-                        <td className="px-4 py-2.5 capitalize text-slate-200">
+                        <td data-label="Category" className="px-4 py-2.5 capitalize text-slate-200">
                           {row.category.replace(/_/g, " ")}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td data-label="Severity" className="px-4 py-2.5">
                           <SeverityBadge severity={row.severity} />
                         </td>
-                        <td className="px-4 py-2.5 capitalize text-slate-300">{row.source_type}</td>
-                        <td className="max-w-56 truncate px-4 py-2.5 font-mono text-xs text-slate-400" title={row.url}>
+                        <td data-label="Source" className="px-4 py-2.5 capitalize text-slate-300">{row.source_type}</td>
+                        <td data-label="URL" className="max-w-56 truncate px-4 py-2.5 font-mono text-xs text-slate-400" title={row.url}>
                           {row.url}
                         </td>
-                        <td className="max-w-72 px-4 py-2.5 text-xs text-slate-300" title={row.summary}>
+                        <td data-label="Summary" className="max-w-72 px-4 py-2.5 text-xs text-slate-300" title={row.summary}>
                           {row.summary.length > 120 ? `${row.summary.slice(0, 120)}...` : row.summary}
                         </td>
                         <td className="px-4 py-2.5 text-right">
@@ -490,16 +644,18 @@ export default function Analytics() {
           )
         ) : null}
       </section>
+      )}
 
       {/* ---------------- Entity intelligence ---------------- */}
+      {section === "entities" && (
       <section className="mb-10">
         <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
           <Network className="h-5 w-5 text-sky-400" />
           Entity intelligence
         </h2>
         <p className="mb-4 text-xs leading-relaxed text-slate-500">
-          People, hosts, IPs and emails extracted by the LLM worker across all analyzed content.
-          Click an entity to pivot: every analyzed page mentioning it.
+          People, hosts, IPs and emails found in the analyzed pages. Click one to see every
+          page it appears on.
         </p>
 
         {entitiesError && (
@@ -515,7 +671,7 @@ export default function Analytics() {
             No entities extracted yet - they appear after the llm-worker analyzes content.
           </div>
         ) : entities ? (
-          <div className="card overflow-x-auto p-0">
+          <div className="card table-scroll p-0">
             <table className="w-full min-w-[720px] text-left text-sm">
               <thead>
                 <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
@@ -533,14 +689,14 @@ export default function Analytics() {
                     title={`Find every page mentioning "${e.entity}"`}
                     className="cursor-pointer border-b border-slate-800/60 last:border-0 hover:bg-slate-900/40"
                   >
-                    <td className="px-4 py-2.5 font-mono text-xs break-all text-sky-300">{e.entity}</td>
-                    <td className="px-4 py-2.5">
+                    <td data-label="Entity" className="px-4 py-2.5 font-mono text-xs break-all text-sky-300">{e.entity}</td>
+                    <td data-label="Type" className="px-4 py-2.5">
                       <span className="rounded-full border border-slate-700 px-2 py-0.5 text-[11px] text-slate-400 capitalize">
                         {e.entity_type}
                       </span>
                     </td>
-                    <td className="px-4 py-2.5 tabular-nums text-slate-300">{formatNumber(e.occurrences)}</td>
-                    <td className="max-w-72 px-4 py-2.5 font-mono text-[11px] text-slate-500">
+                    <td data-label="Pages" className="px-4 py-2.5 tabular-nums text-slate-300">{formatNumber(e.occurrences)}</td>
+                    <td data-label="Sample sources" className="max-w-72 px-4 py-2.5 font-mono text-[11px] text-slate-500">
                       {e.sample_urls.length ? e.sample_urls[0] : "--"}
                     </td>
                   </tr>
@@ -553,7 +709,7 @@ export default function Analytics() {
         {mentionsLoading && <LoadingBlock label={`Searching mentions of "${mentions?.entity ?? ""}"...`} />}
 
         {mentions && !mentionsLoading && (
-          <div className="card mt-4 overflow-x-auto p-0">
+          <div className="card mt-4 table-scroll p-0">
             <div className="flex items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
               <span className="text-sm font-semibold text-slate-200">
                 Pages mentioning <span className="font-mono text-sky-300">{mentions.entity}</span>
@@ -579,12 +735,12 @@ export default function Analytics() {
                       onClick={() => navigate(`/jobs/${m.job_id}/articles?itemId=${encodeURIComponent(m.item_id)}`)}
                       className="cursor-pointer border-b border-slate-800/60 last:border-0 hover:bg-slate-900/40"
                     >
-                      <td className="px-4 py-2.5 font-mono text-xs text-sky-600">{m.item_id}</td>
-                      <td className="px-4 py-2.5 capitalize text-slate-200">{m.category.replace(/_/g, " ")}</td>
-                      <td className="px-4 py-2.5">
+                      <td data-label="Item" className="px-4 py-2.5 font-mono text-xs text-sky-600">{m.item_id}</td>
+                      <td data-label="Category" className="px-4 py-2.5 capitalize text-slate-200">{m.category.replace(/_/g, " ")}</td>
+                      <td data-label="Severity" className="px-4 py-2.5">
                         <SeverityBadge severity={m.severity} />
                       </td>
-                      <td className="max-w-72 truncate px-4 py-2.5 font-mono text-xs text-slate-400" title={m.url}>
+                      <td data-label="URL" className="max-w-72 truncate px-4 py-2.5 font-mono text-xs text-slate-400" title={m.url}>
                         {m.url}
                       </td>
                     </tr>
@@ -595,172 +751,18 @@ export default function Analytics() {
           </div>
         )}
       </section>
-
-      {/* ---------------- System performance / latency ---------------- */}
-      <section className="mb-10">
-        <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
-          <Activity className="h-5 w-5 text-emerald-400" />
-          System performance
-        </h2>
-        <p className="mb-4 text-xs leading-relaxed text-slate-500">
-          Crawler fetch latency and reliability per worker from ClickHouse{" "}
-          <code className="font-mono">crawler_performance</code>.
-        </p>
-
-        {perfError && (
-          <div className="mb-4">
-            <ErrorBanner message={perfError} onRetry={() => void loadPerformance()} />
-          </div>
-        )}
-
-        {perfLoading && !performance ? (
-          <LoadingBlock label="Loading system performance..." />
-        ) : performance ? (
-          performance.overall.requests === 0 ? (
-            <div className="card p-8 text-center text-sm text-slate-500">
-              No crawl attempts recorded yet - latency metrics appear after workers start fetching.
-            </div>
-          ) : (
-            <>
-              <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
-                <div className="card p-5">
-                  <p className="text-[11px] tracking-wider text-slate-500 uppercase">Requests</p>
-                  <p className="mt-2 text-3xl font-bold tracking-tight text-slate-50">
-                    {formatNumber(performance.overall.requests)}
-                  </p>
-                </div>
-                <div className="card p-5">
-                  <p className="text-[11px] tracking-wider text-slate-500 uppercase">Avg latency</p>
-                  <p className="mt-2 text-3xl font-bold tracking-tight text-slate-50">
-                    {performance.overall.avg_latency_ms === null
-                      ? "--"
-                      : `${formatNumber(performance.overall.avg_latency_ms)} ms`}
-                  </p>
-                </div>
-                <div className="card p-5">
-                  <p className="text-[11px] tracking-wider text-slate-500 uppercase">P95 latency</p>
-                  <p className="mt-2 text-3xl font-bold tracking-tight text-slate-50">
-                    {performance.overall.p95_latency_ms === null
-                      ? "--"
-                      : `${formatNumber(performance.overall.p95_latency_ms)} ms`}
-                  </p>
-                </div>
-                <div className="card p-5">
-                  <p className="text-[11px] tracking-wider text-slate-500 uppercase">Error rate</p>
-                  <p className="mt-2 text-3xl font-bold tracking-tight text-slate-50">
-                    {pct(performance.overall.error_rate)}
-                  </p>
-                </div>
-              </div>
-
-              <div className="rounded-xl border border-slate-800 bg-[#050b08] overflow-x-auto p-0">
-                <div className="border-b border-slate-800 px-4 py-3 text-sm font-semibold text-slate-200">
-                  Latency per worker
-                </div>
-                <table className="w-full min-w-[760px] text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
-                      <th className="px-4 py-3 font-medium">Worker</th>
-                      <th className="px-4 py-3 font-medium">Requests</th>
-                      <th className="px-4 py-3 font-medium">Avg latency</th>
-                      <th className="px-4 py-3 font-medium">P95</th>
-                      <th className="px-4 py-3 font-medium">Max</th>
-                      <th className="px-4 py-3 font-medium">Retries</th>
-                      <th className="px-4 py-3 font-medium">Error rate</th>
-                      <th className="px-4 py-3 font-medium">Avg payload</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {performance.workers.map((w) => {
-                      const isDark = w.worker.toLowerCase() === "dark";
-                      return (
-                        <tr
-                          key={w.worker}
-                          className={cn(
-                            "border-b border-slate-800/60 last:border-0 hover:bg-slate-800/40",
-                            isDark && "ring-2 ring-zinc-500/30 bg-zinc-900/40",
-                          )}
-                        >
-                          <td className="px-4 py-2.5">
-                            <WorkerBadge worker={w.worker} />
-                          </td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-400">{formatNumber(w.requests)}</td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-100">
-                            {w.avg_latency_ms === null ? "--" : `${formatNumber(w.avg_latency_ms)} ms`}
-                          </td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-400">
-                            {w.p95_latency_ms === null ? "--" : `${formatNumber(w.p95_latency_ms)} ms`}
-                          </td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-400">
-                            {w.max_latency_ms === null ? "--" : `${formatNumber(w.max_latency_ms)} ms`}
-                          </td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-400">{formatNumber(w.retries)}</td>
-                          <td className="px-4 py-2.5 tabular-nums text-slate-400">{pct(w.error_rate)}</td>
-                          <td className="px-4 py-2.5 text-slate-400">{formatBytes(w.avg_payload_bytes)}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="card mt-6 overflow-x-auto p-0">
-                <div className="border-b border-slate-800 px-4 py-3 text-sm font-semibold text-slate-200">
-                  Recent attempts
-                </div>
-                <table className="w-full min-w-[720px] text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-500 uppercase">
-                      <th className="px-4 py-3 font-medium">Job</th>
-                      <th className="px-4 py-3 font-medium">Worker</th>
-                      <th className="px-4 py-3 font-medium">Status code</th>
-                      <th className="px-4 py-3 font-medium">Latency</th>
-                      <th className="px-4 py-3 font-medium">Retries</th>
-                      <th className="px-4 py-3 font-medium">Payload</th>
-                      <th className="px-4 py-3 font-medium">When</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {performance.recent_attempts.map((a, i) => (
-                      <tr key={`${a.job_id}-${i}`} className="border-b border-slate-800/60 last:border-0">
-                        <td className="px-4 py-2.5 font-mono text-xs text-sky-600">{a.job_id}</td>
-                        <td className="px-4 py-2.5">
-                          <WorkerBadge worker={a.worker} />
-                        </td>
-                        <td className="px-4 py-2.5">
-                          <span
-                            className={cn(
-                              "font-mono text-xs",
-                              a.status_code >= 400 ? "text-rose-400" : "text-emerald-400",
-                            )}
-                          >
-                            {a.status_code || "-"}
-                          </span>
-                        </td>
-                        <td className="px-4 py-2.5 tabular-nums text-slate-300">{formatNumber(a.latency_ms)} ms</td>
-                        <td className="px-4 py-2.5 tabular-nums text-slate-300">{a.retry_count}</td>
-                        <td className="px-4 py-2.5 text-slate-300">{formatBytes(a.payload_size_bytes)}</td>
-                        <td className="px-4 py-2.5 text-xs whitespace-nowrap text-slate-400">{a.created_at}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )
-        ) : null}
-      </section>
+      )}
 
       {/* ---------------- Human evaluation form ---------------- */}
+      {section === "threats" && (
       <div id="human-evaluation" className="card max-w-3xl p-6">
         <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
           <ClipboardCheck className="h-5 w-5 text-sky-400" />
           Submit a human evaluation
         </h2>
         <p className="mb-6 text-xs leading-relaxed text-slate-500">
-          Record what you believe the correct label should have been. It is compared against the
-          LLM's stored prediction in ClickHouse (<code className="font-mono">model_evaluations</code>)
-          and feeds the accuracy / macro-F1 metrics above.
+          Enter the label you believe is correct. We compare it with the model's answer to
+          measure accuracy.
         </p>
 
         <form onSubmit={(e) => void submitEvaluation(e)} className="space-y-5">
@@ -863,21 +865,14 @@ export default function Analytics() {
             </div>
           </div>
 
-          {formError && (
-            <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm break-words text-rose-200">
-              {formError}
-            </div>
-          )}
+          {formError && <Msg tone="error" className="text-sm">{formError}</Msg>}
 
           {success && (
-            <div className="flex flex-col gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <p className="flex items-center gap-2 text-sm text-emerald-200">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
-                Evaluation recorded:
-                <span className="font-mono">{success.evaluation_id.slice(0, 8)}</span>
-              </p>
+            <Msg tone="success" className="items-center text-sm sm:justify-between">
+              <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden />
+              <span className="min-w-0 flex-1">Saved.</span>
               <CopyButton value={success.evaluation_id} label="Copy ID" />
-            </div>
+            </Msg>
           )}
 
           <button type="submit" className="btn-primary min-w-48" disabled={submitting}>
@@ -890,6 +885,7 @@ export default function Analytics() {
           </button>
         </form>
       </div>
+      )}
     </div>
   )
 }

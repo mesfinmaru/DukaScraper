@@ -96,6 +96,7 @@ class ClickHouseManager:
                         entities Array(String),
                         summary String,
                         language LowCardinality(String),
+                        analysis_source LowCardinality(String) DEFAULT 'llm',
                         llm_model String,
                         llm_score Nullable(Float32),
                         created_at DateTime DEFAULT now()
@@ -126,6 +127,12 @@ class ClickHouseManager:
                 )
                 self.client.command(
                     "ALTER TABLE duka_scraper.intelligence_analytics MODIFY COLUMN llm_score Nullable(Float32)"
+                )
+                # Added after the first release: without it a heuristic fallback
+                # is indistinguishable from a real model output.
+                self.client.command(
+                    "ALTER TABLE duka_scraper.intelligence_analytics "
+                    "ADD COLUMN IF NOT EXISTS analysis_source LowCardinality(String) DEFAULT 'llm' AFTER language"
                 )
                 self.client.command(
                     """

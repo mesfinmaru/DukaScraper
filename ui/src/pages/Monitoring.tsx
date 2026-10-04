@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { ReactNode } from "react"
 import {
   Activity,
@@ -7,9 +7,9 @@ import {
   Gauge,
   Loader2,
   Radio,
-  RefreshCw,
 } from "lucide-react"
 import { api, ApiError } from "../api"
+import PerformancePanel from "../components/PerformancePanel"
 import {
   ErrorBanner,
   LoadingBlock,
@@ -17,6 +17,7 @@ import {
 } from "../components/ui"
 import type { MonitoringHealthResponse, MonitoringUrlsResponse, PrometheusMetricsResponse } from "../types"
 import { cn } from "../utils"
+import { useAutoRefresh } from "../useAutoRefresh"
 
 const SERVICE_ICONS: Record<string, typeof Database> = {
   postgres: Database,
@@ -41,26 +42,36 @@ const DEFAULT_URLS: MonitoringUrlsResponse = {
 
 type EmbedTab = { key: string; label: string; embedUrl: string; openUrl: string }
 
-const EMBED_TABS = (base: string): EmbedTab[] => [
+/**
+ * Embeds go through the API's proxy (`/api/v1/monitoring/{tool}/...`) rather
+ * than straight at Grafana/Prometheus.
+ *
+ * Grafana 13 sets `X-Frame-Options: deny` unconditionally and no longer honours
+ * the `allow_embedding` setting, so pointing an iframe at :3000 is refused by
+ * the browser with ERR_BLOCKED_BY_RESPONSE - the frame stays permanently blank.
+ * The proxy strips the header. `token` is the short-lived embed token, because
+ * an <iframe> cannot send an Authorization header.
+ */
+const EMBED_TABS = (proxy: string, token: string): EmbedTab[] => [
   {
     key: "overview",
     label: "Overview",
-    embedUrl: `${base}/d/duka-overview?orgId=1&refresh=30s&kiosk`,
-    openUrl: `${base}/d/duka-overview?orgId=1`,
+    embedUrl: `${proxy}/grafana/d/duka-overview?orgId=1&refresh=30s&kiosk&token=${token}`,
+    openUrl: `${proxy}/grafana/d/duka-overview?orgId=1&token=${token}`,
   },
 ]
 
-const promGraphUrl = (base: string) => {
+const promGraphUrl = (proxy: string, token: string) => {
   const expr = encodeURIComponent(
     'sum(rate(duka_http_requests_total{job="duka-api"}[5m]))',
   )
-  return `${base}/graph?g0.expr=${expr}&g0.tab=0&g0.stacked=1&g0.range_input=2h`
+  return `${proxy}/prometheus/graph?g0.expr=${expr}&g0.tab=0&g0.stacked=1&g0.range_input=2h&token=${token}`
 }
 
-const PROMETHEUS_TABS = (base: string): EmbedTab[] => [
-  { key: "traffic", label: "Traffic", embedUrl: promGraphUrl(base), openUrl: promGraphUrl(base) },
-  { key: "targets", label: "Targets", embedUrl: `${base}/targets`, openUrl: `${base}/targets` },
-  { key: "alerts", label: "Alerts", embedUrl: `${base}/alerts`, openUrl: `${base}/alerts` },
+const PROMETHEUS_TABS = (proxy: string, token: string): EmbedTab[] => [
+  { key: "traffic", label: "Traffic", embedUrl: promGraphUrl(proxy, token), openUrl: promGraphUrl(proxy, token) },
+  { key: "targets", label: "Targets", embedUrl: `${proxy}/prometheus/targets?token=${token}`, openUrl: `${proxy}/prometheus/targets?token=${token}` },
+  { key: "alerts", label: "Alerts", embedUrl: `${proxy}/prometheus/alerts?token=${token}`, openUrl: `${proxy}/prometheus/alerts?token=${token}` },
 ]
 
 const ACCENTS = {
@@ -169,8 +180,8 @@ function EmbedSection({
 
       <p className="mt-3 flex items-center gap-2 text-xs text-slate-600">
         <Loader2 className="h-3 w-3" />
-        If the iframe stays blank, run `docker compose up -d grafana` and make sure
-        GF_ALLOW_EMBEDDING=true is set (already configured in docker-compose.yml).
+        Embedded through the API proxy, which strips the framing headers Grafana
+        sets. If a frame stays blank, check that the tool container is running.
       </p>
     </section>
   )
@@ -205,6 +216,39 @@ export default function Monitoring() {
   const [promTab, setPromTab] = useState<string | null>(null)
   const [promMetrics, setPromMetrics] = useState<PrometheusMetricsResponse | null>(null)
   const [promLoading, setPromLoading] = useState(false)
+  // Short-lived token that lets the <iframe> authenticate: an iframe cannot
+  // send an Authorization header, so it rides in the query string instead.
+  const [embedToken, setEmbedToken] = useState<string>("")
+  const tokenTimer = useRef<number | null>(null)
+
+  /**
+   * Fetch the embed token on its own schedule, NOT inside the 5s poll.
+   *
+   * The token is part of every iframe `src`, so re-minting it on each poll
+   * changes the src and makes React tear down and re-create the frame. That
+   * reloads the whole dashboard every few seconds, aborts every in-flight
+   * request (ERR_ABORTED in the network log), and defeats the `refresh=30s`
+   * the dashboard itself is configured with.
+   *
+   * Instead the token is minted once and refreshed only when it is close to
+   * expiring, which is rare enough to be invisible.
+   */
+  const refreshEmbedToken = useCallback(async () => {
+    try {
+      const { token, expires_in } = await api.getMonitoringEmbedToken()
+      setEmbedToken(token)
+      // Renew at 80% of the token's life: enough margin for a slow dashboard
+      // load to finish before the token it was rendered with expires.
+      tokenTimer.current = window.setTimeout(
+        () => void refreshEmbedToken(),
+        Math.max(30_000, (expires_in * 0.8) * 1000),
+      )
+    } catch {
+      // Without a token the embeds cannot load; retry shortly rather than
+      // leaving the page permanently broken.
+      tokenTimer.current = window.setTimeout(() => void refreshEmbedToken(), 15_000)
+    }
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -233,10 +277,6 @@ export default function Monitoring() {
 
     setHealth(healthData)
     setUrls(urlsData)
-    setGrafanaTabs(EMBED_TABS(urlsData.grafana))
-    setPromTabs(PROMETHEUS_TABS(urlsData.prometheus))
-    setGrafanaTab((prev) => prev ?? EMBED_TABS(urlsData.grafana)[0]?.key ?? null)
-    setPromTab((prev) => prev ?? PROMETHEUS_TABS(urlsData.prometheus)[0]?.key ?? null)
     setLoading(false)
 
     // Load Prometheus metrics
@@ -255,17 +295,36 @@ export default function Monitoring() {
     void load()
   }, [load])
 
+  // The token has its own lifetime, deliberately outside the poll loop.
+  useEffect(() => {
+    void refreshEmbedToken()
+    return () => {
+      if (tokenTimer.current) window.clearTimeout(tokenTimer.current)
+    }
+  }, [refreshEmbedToken])
+
+  // Build the embed URLs from the token. Deps are [embedToken] only, so the
+  // tabs (and therefore every iframe `src`) keep a stable identity between
+  // polls and the frames are never torn down.
+  const proxy = api.monitoringProxyBase()
+  const gfTabs = useMemo(() => EMBED_TABS(proxy, embedToken), [proxy, embedToken])
+  const pmTabs = useMemo(() => PROMETHEUS_TABS(proxy, embedToken), [proxy, embedToken])
+
+  useEffect(() => {
+    setGrafanaTabs(gfTabs)
+    setPromTabs(pmTabs)
+    setGrafanaTab((prev) => prev ?? gfTabs[0]?.key ?? null)
+    setPromTab((prev) => prev ?? pmTabs[0]?.key ?? null)
+  }, [gfTabs, pmTabs])
+
+  // Service health changes on its own; poll rather than ask the user to.
+  useAutoRefresh({ load })
+
   return (
     <div>
       <PageHeader
         title="Monitoring"
-        description="Live health of the DukaScraper infrastructure and embedded Grafana / Prometheus views."
-        actions={
-          <button type="button" className="btn-secondary" onClick={() => void load()}>
-            <RefreshCw className="h-4 w-4" />
-            Refresh
-          </button>
-        }
+        description="Live status of every service, plus charts and alerts."
       />
 
       {error && (
@@ -343,7 +402,7 @@ export default function Monitoring() {
               <p className="mt-3 text-xs text-slate-600">
                 {health.healthy}/{health.total} services healthy
                 {health.unhealthy > 0 && (
-                  <span className="text-rose-500"> · {health.unhealthy} unhealthy</span>
+                  <span className="text-rose-400"> · {health.unhealthy} down</span>
                 )}
               </p>
             )}
@@ -440,8 +499,7 @@ export default function Monitoring() {
 
                 {/* Request totals by path/status */}
                 <div>
-                  <h3 className="mb-2 text-sm font-medium text-slate-300">Request totals (since startup)</h3>
-                  <div className="overflow-x-auto">
+                  <h3 className="mb-2 text-sm font-medium text-slate-300">Request totals (since startup)</h3>                    <div className="table-scroll">
                     <table className="w-full min-w-[700px]">
                       <thead className="border-b border-slate-800 bg-slate-950">
                         <tr>
@@ -461,9 +519,9 @@ export default function Monitoring() {
                             const [, method, path, status] = match
                             return (
                               <tr key={key} className="hover:bg-slate-800/40">
-                                <td className="px-4 py-2 font-mono text-xs text-slate-300">{method}</td>
-                                <td className="px-4 py-2 font-mono text-xs text-slate-400 truncate max-w-[300px]">{path}</td>
-                                <td className="px-4 py-2">
+                                <td data-label="Method" className="px-4 py-2 font-mono text-xs text-slate-300">{method}</td>
+                                <td data-label="Path" className="px-4 py-2 font-mono text-xs text-slate-400 truncate max-w-[300px]">{path}</td>
+                                <td data-label="Status" className="px-4 py-2">
                                   <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
                                     status.startsWith("2") ? "bg-emerald-500/10 text-emerald-500" :
                                     status.startsWith("4") ? "bg-amber-500/10 text-amber-500" :
@@ -472,7 +530,7 @@ export default function Monitoring() {
                                     {status}
                                   </span>
                                 </td>
-                                <td className="px-4 py-2 text-right font-mono text-sm text-slate-200">{value.toLocaleString()}</td>
+                                <td data-label="Count" className="px-4 py-2 text-right font-mono text-sm text-slate-200">{value.toLocaleString()}</td>
                               </tr>
                             )
                           })}
@@ -486,8 +544,7 @@ export default function Monitoring() {
 
                 {/* Request latency percentiles */}
                 <div>
-                  <h3 className="mb-2 text-sm font-medium text-slate-300">Request latency (seconds)</h3>
-                  <div className="overflow-x-auto">
+                  <h3 className="mb-2 text-sm font-medium text-slate-300">Request latency (seconds)</h3>                    <div className="table-scroll">
                     <table className="w-full min-w-[600px]">
                       <thead className="border-b border-slate-800 bg-slate-950">
                         <tr>
@@ -507,10 +564,10 @@ export default function Monitoring() {
                             const [, method, path, percentile] = match
                             return (
                               <tr key={key} className="hover:bg-slate-800/40">
-                                <td className="px-4 py-2 font-mono text-xs text-slate-300">{method}</td>
-                                <td className="px-4 py-2 font-mono text-xs text-slate-400 truncate max-w-[300px]">{path}</td>
-                                <td className="px-4 py-2 text-slate-300">p{percentile}</td>
-                                <td className="px-4 py-2 text-right font-mono text-sm text-slate-200">{value.toFixed(4)}</td>
+                                <td data-label="Method" className="px-4 py-2 font-mono text-xs text-slate-300">{method}</td>
+                                <td data-label="Path" className="px-4 py-2 font-mono text-xs text-slate-400 truncate max-w-[300px]">{path}</td>
+                                <td data-label="Percentile" className="px-4 py-2 text-slate-300">p{percentile}</td>
+                                <td data-label="Value (s)" className="px-4 py-2 text-right font-mono text-sm text-slate-200">{value.toFixed(4)}</td>
                               </tr>
                             )
                           })}
@@ -527,6 +584,19 @@ export default function Monitoring() {
                 <p>Failed to load Prometheus metrics. Check admin access.</p>
               </div>
             ) : null}
+          </section>
+
+          {/* Crawler latency/reliability. Moved here from Analytics, where it
+              sat under three unrelated sections and was hard to find. */}
+          <section className="mb-8">
+            <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-slate-100">
+              <Activity className="h-5 w-5 text-emerald-400" />
+              System performance
+            </h2>
+            <p className="mb-4 text-xs leading-relaxed text-slate-500">
+              How fast each crawler worker fetches pages, and how often it fails.
+            </p>
+            <PerformancePanel />
           </section>
         </>
       )}
